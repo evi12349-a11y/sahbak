@@ -183,7 +183,7 @@ def process_message(text, user_id):
         return handle_context(text, user_id)
     
     # Parse intent
-    if any(word in text for word in ['יומן', 'פגישה', 'אירוע', 'תור', 'פגישה']):
+    if any(word in text for word in ['יומן', 'פגישה', 'אירוע', 'תור', 'תוסיף', 'הוסף', 'קבע', 'תזמן', 'זמן', 'לפגוש', 'לקבוע', 'הכנס']):
         return process_calendar(text)
     
     # Check for amount (expense/income)
@@ -348,8 +348,9 @@ def process_calendar(text):
     
     # Parse title - remove command words
     title = text
-    for word in ['יומן', 'פגישה', 'אירוע', 'תור', 'תוסיף', 'הוסף', 'קבע']:
-        title = title.replace(word, '').strip()
+    for word in ['ליומן', 'יומן', 'פגישה', 'אירוע', 'תור', 'תוסיף', 'הוסף',
+             'קבע', 'תקבע', 'לקבוע', 'תזמן', 'הכנס', 'הקרוב', 'הבא', 'לי']:
+    title = title.replace(word, '').strip()
     
     # Parse date/time
     now = datetime.now()
@@ -365,8 +366,8 @@ def process_calendar(text):
     for day_name, weekday in day_names.items():
         if day_name in text:
             days_ahead = weekday - now.weekday()
-            if days_ahead <= 0:
-                days_ahead += 7
+        if days_ahead < 0:
+            days_ahead += 7
             start_time = now + timedelta(days=days_ahead)
             break
     
@@ -376,7 +377,8 @@ def process_calendar(text):
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
     else:
-        time_match = re.search(r'\s(\d{1,2})\s', text)
+    # נחפש במיוחד "בשעה 8" או "שעה 8" כדי לא לבלבל עם תאריך
+        time_match = re.search(r'(?:בשעה|שעה)\s*(\d{1,2})', text)
         if time_match:
             hour = int(time_match.group(1))
             minute = 0
