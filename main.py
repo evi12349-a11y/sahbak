@@ -350,7 +350,7 @@ def process_calendar(text):
     title = text
     for word in ['ליומן', 'יומן', 'פגישה', 'אירוע', 'תור', 'תוסיף', 'הוסף',
              'קבע', 'תקבע', 'לקבוע', 'תזמן', 'הכנס', 'הקרוב', 'הבא', 'לי']:
-    title = title.replace(word, '').strip()
+        title = title.replace(word, '').strip()
     
     # Parse date/time
     now = datetime.now()
