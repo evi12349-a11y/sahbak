@@ -9,11 +9,7 @@ from googleapiclient.discovery import build
 import hmac
 import hashlib
 import sqlite3
-Flask==3.0.3
-requests==2.32.2
-google-api-python-client==2.131.0
-google-auth==2.29.0
-app = Flask(__name__)
+
 
 # Environment variables
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
