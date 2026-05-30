@@ -21,7 +21,7 @@ CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
 APP_SECRET = os.getenv('APP_SECRET')
 
 # DB File
-DB_FILE = 'sahbak.db'
+DB_FILE = '/app/data/sahbak.db'
 
 # Categories & Task Mapping
 BUDGET_CATEGORIES = {
