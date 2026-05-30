@@ -20,7 +20,7 @@ GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
 CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
 APP_SECRET = os.getenv('APP_SECRET')
 
-# DB File
+# DB File (מחובר ל-Volume הקבוע ב-Railway)
 DB_FILE = '/app/data/sahbak.db'
 
 # Categories & Task Mapping
@@ -63,6 +63,9 @@ TASK_QUADRANTS_EMOJI = {
 
 
 def init_db():
+    # מוודא שהתיקייה קיימת (למקרה שהרצנו מקומית או שהווליום עוד לא נטען)
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -321,7 +324,7 @@ def extract_event_fields(text):
     clean = re.sub(r'ב(?:מיקום|מקום)\s+.+$', '', clean)
     clean = re.sub(r'\s+', ' ', clean).strip()
 
-    title = clean if clean else 'אירוע מסהבאק'
+    title = clean if clean else 'אירוע מסחבק'
     return title, location
 
 
@@ -684,7 +687,7 @@ def get_detailed_budget():
 
 def get_welcome_message():
     return (
-        '👋 שלום! אני *סהבאק* - העוזר האישי שלך\n\n'
+        '👋 שלום! אני *סחבק* - העוזר האישי שלך\n\n'
         '📅 *יומן*: "תור לרופא ביום ראשון בשעה 09:15"\n'
         '💰 *הוצאות*: "59 שקל ארוחה"\n'
         '✅ *משימות*: "תוסיף משימה" או "סיימתי משימה"\n'
@@ -694,7 +697,7 @@ def get_welcome_message():
 
 def get_help_menu():
     return (
-        '🤖 *תפריט עזרה - סהבאק*\n\n'
+        '🤖 *תפריט עזרה - סחבק*\n\n'
         '*משימות* ✅\n'
         '• "משימה" / "תוסיף משימה"\n'
         '• "סיימתי משימה" (כדי למחוק משימה מהרשימה)\n'
