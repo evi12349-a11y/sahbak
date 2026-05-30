@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import os
 import json
@@ -24,7 +23,7 @@ APP_SECRET = os.getenv('APP_SECRET')
 # DB File
 DB_FILE = 'sahbak.db'
 
-# Categories
+# Categories & Task Mapping
 BUDGET_CATEGORIES = {
     'דיור': '🏠',
     'רכב': '🚗',
@@ -37,7 +36,7 @@ BUDGET_CATEGORIES = {
     'הכנסה': '💰'
 }
 
-BUDGET_LIMITS = {
+DEFAULT_BUDGET_LIMITS = {
     'דיור': 5000,
     'רכב': 2000,
     'נופש': 1500,
@@ -48,7 +47,14 @@ BUDGET_LIMITS = {
     'קניות': 1000
 }
 
-TASK_QUADRANTS = {
+TASK_COLOR_MAP = {
+    'אדום': 'חשוב דחוף',
+    'צהוב': 'חשוב לא דחוף',
+    'כתום': 'דחוף לא חשוב',
+    'ירוק': 'לא דחוף לא חשוב'
+}
+
+TASK_QUADRANTS_EMOJI = {
     'חשוב דחוף': '🔴',
     'חשוב לא דחוף': '🟡',
     'דחוף לא חשוב': '🟠',
@@ -87,7 +93,20 @@ def init_db():
             context_json TEXT
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS budget_limits (
+            category TEXT PRIMARY KEY,
+            amount REAL
+        )
+    ''')
     
+    # Initialize default limits if table is empty
+    cursor.execute('SELECT COUNT(*) FROM budget_limits')
+    if cursor.fetchone()[0] == 0:
+        for cat, limit in DEFAULT_BUDGET_LIMITS.items():
+            cursor.execute('INSERT INTO budget_limits (category, amount) VALUES (?, ?)', (cat, limit))
+            
     conn.commit()
     conn.close()
 
@@ -95,6 +114,7 @@ def init_db():
 init_db()
 
 
+# --- Database Helpers ---
 def get_user_context(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -125,6 +145,26 @@ def delete_user_context(user_id):
     conn.close()
 
 
+def get_budget_limit(category):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT amount FROM budget_limits WHERE category = ?', (category,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def set_budget_limit(category, amount):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO budget_limits (category, amount)
+        VALUES (?, ?)
+    ''', (category, amount))
+    conn.commit()
+    conn.close()
+
+
 def add_expense(category, amount, date, description, user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -137,30 +177,30 @@ def add_expense(category, amount, date, description, user_id):
 
 
 def get_category_total_spent(category):
+    current_month = datetime.now().strftime('%Y-%m')
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT SUM(ABS(amount)) FROM budget WHERE category = ? AND amount < 0', (category,))
+    cursor.execute('''
+        SELECT SUM(ABS(amount)) FROM budget 
+        WHERE category = ? AND amount < 0 AND strftime('%Y-%m', date) = ?
+    ''', (category, current_month))
     row = cursor.fetchone()
     conn.close()
     return row[0] if row[0] else 0
 
 
 def get_all_budget_summary():
+    current_month = datetime.now().strftime('%Y-%m')
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT category, SUM(amount) FROM budget GROUP BY category')
+    cursor.execute('''
+        SELECT category, SUM(amount) FROM budget 
+        WHERE strftime('%Y-%m', date) = ?
+        GROUP BY category
+    ''', (current_month,))
     rows = cursor.fetchall()
     conn.close()
     return rows
-
-
-def get_budget_entries_count():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM budget')
-    row = cursor.fetchone()
-    conn.close()
-    return row[0]
 
 
 def add_task(quadrant, description):
@@ -174,13 +214,23 @@ def add_task(quadrant, description):
     conn.close()
 
 
-def get_active_tasks_by_quadrant(quadrant):
+def get_active_tasks():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT description FROM tasks WHERE quadrant = ? AND completed = 0', (quadrant,))
+    cursor.execute('SELECT id, quadrant, description FROM tasks WHERE completed = 0 ORDER BY id ASC')
     rows = cursor.fetchall()
     conn.close()
-    return [row[0] for row in rows]
+    return rows
+
+
+def mark_task_completed(task_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE tasks SET completed = 1 WHERE id = ?', (task_id,))
+    changes = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return changes > 0
 
 
 def get_tasks_completion_stats():
@@ -194,6 +244,7 @@ def get_tasks_completion_stats():
     return completed, total
 
 
+# --- Logic Helpers ---
 def verify_meta_signature(raw_body, signature_header):
     if not APP_SECRET or not signature_header:
         return False
@@ -207,17 +258,8 @@ def verify_meta_signature(raw_body, signature_header):
 
 def parse_hebrew_datetime(text):
     now = datetime.now()
-
-    day_names = {
-        'ראשון': 6,
-        'שני': 0,
-        'שלישי': 1,
-        'רביעי': 2,
-        'חמישי': 3,
-        'שישי': 4,
-        'שבת': 5
-    }
-
+    day_names = {'ראשון': 6, 'שני': 0, 'שלישי': 1, 'רביעי': 2, 'חמישי': 3, 'שישי': 4, 'שבת': 5}
+    
     date_match = re.search(r'(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?', text)
     time_match = re.search(r'(?:בשעה|שעה)?\s*(\d{1,2}):(\d{2})', text)
     hour_only_match = re.search(r'(?:בשעה|שעה)\s*(\d{1,2})\b', text)
@@ -230,15 +272,13 @@ def parse_hebrew_datetime(text):
         month = int(date_match.group(2))
         year_raw = date_match.group(3)
         year = int(year_raw) if year_raw else now.year
-        if year < 100:
-            year += 2000
+        if year < 100: year += 2000
         target = target.replace(year=year, month=month, day=day)
     else:
         for day_name, weekday in day_names.items():
             if f'ביום {day_name}' in text or f'{day_name}' in text:
                 days_ahead = weekday - now.weekday()
-                if days_ahead < 0:
-                    days_ahead += 7
+                if days_ahead < 0: days_ahead += 7
                 target = now + timedelta(days=days_ahead)
                 is_weekday_parsed = True
                 break
@@ -286,36 +326,26 @@ def extract_event_fields(text):
 
 
 def get_calendar_service():
-    if not GOOGLE_CREDENTIALS:
-        return None
+    if not GOOGLE_CREDENTIALS: return None
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
         credentials = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/calendar']
+            creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
         )
-        service = build('calendar', 'v3', credentials=credentials)
-        return service
+        return build('calendar', 'v3', credentials=credentials)
     except Exception as e:
         print(f'Calendar service error: {e}')
         return None
 
 
+# --- WhatsApp Connectors ---
 def send_whatsapp_message(to, message):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         return {'ok': False, 'error': 'WHATSAPP_NOT_CONFIGURED'}
 
     url = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
-    headers = {
-        'Authorization': f'Bearer {WHATSAPP_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    data = {
-        'messaging_product': 'whatsapp',
-        'to': to,
-        'type': 'text',
-        'text': {'body': message}
-    }
+    headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}', 'Content-Type': 'application/json'}
+    data = {'messaging_product': 'whatsapp', 'to': to, 'type': 'text', 'text': {'body': message}}
 
     try:
         resp = http_requests.post(url, headers=headers, json=data, timeout=10)
@@ -326,55 +356,11 @@ def send_whatsapp_message(to, message):
         return {'ok': False, 'error': str(e)}
 
 
-def send_interactive_buttons(to, body_text, buttons):
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        return {'ok': False, 'error': 'WHATSAPP_NOT_CONFIGURED'}
-
-    url = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
-    headers = {
-        'Authorization': f'Bearer {WHATSAPP_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-
-    button_list = []
-    for i, btn in enumerate(buttons[:3]):
-        button_list.append({
-            'type': 'reply',
-            'reply': {
-                'id': f'btn_{i}_{btn[:10]}',
-                'title': btn[:20]
-            }
-        })
-
-    data = {
-        'messaging_product': 'whatsapp',
-        'recipient_type': 'individual',
-        'to': to,
-        'type': 'interactive',
-        'interactive': {
-            'type': 'button',
-            'body': {'text': body_text[:1024]},
-            'action': {'buttons': button_list}
-        }
-    }
-
-    try:
-        resp = http_requests.post(url, headers=headers, json=data, timeout=10)
-        resp.raise_for_status()
-        return {'ok': True, 'response': resp.json()}
-    except Exception:
-        fallback = body_text + '\n\n' + '\n'.join([f'{i + 1}. {b}' for i, b in enumerate(buttons[:3])])
-        return send_whatsapp_message(to, fallback)
-
-
+# --- Flask Routes ---
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
-    mode = request.args.get('hub.mode')
-    token = request.args.get('hub.verify_token')
-    challenge = request.args.get('hub.challenge')
-
-    if mode == 'subscribe' and token == VERIFY_TOKEN:
-        return challenge, 200
+    if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
+        return request.args.get('hub.challenge'), 200
     return 'Forbidden', 403
 
 
@@ -387,8 +373,7 @@ def webhook():
         return jsonify({'error': 'invalid signature'}), 403
 
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({'status': 'ignored', 'reason': 'empty json'}), 200
+    if not data: return jsonify({'status': 'ignored', 'reason': 'empty json'}), 200
 
     try:
         entry = data.get('entry', [])[0]
@@ -406,16 +391,11 @@ def webhook():
         elif message.get('type') == 'text':
             text = message.get('text', {}).get('body', '')
         else:
-            send_whatsapp_message(from_number, 'כרגע אני תומך רק בהודעות טקסט וכפתורים.')
-            return jsonify({'status': 'ignored', 'reason': 'unsupported message type'}), 200
+            send_whatsapp_message(from_number, 'כרגע אני תומך רק בהודעות טקסט.')
+            return jsonify({'status': 'ignored'}), 200
 
         response = process_message(text, from_number)
-
-        if isinstance(response, dict) and 'buttons' in response:
-            send_interactive_buttons(from_number, response['text'], response['buttons'])
-        else:
-            send_whatsapp_message(from_number, response)
-
+        send_whatsapp_message(from_number, response)
         return jsonify({'status': 'ok'}), 200
 
     except Exception as e:
@@ -423,47 +403,137 @@ def webhook():
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
 
+# --- Core Logic ---
 def process_message(text, user_id):
     text = text.strip()
 
+    # 1. State Machine (Conversational Context)
     context = get_user_context(user_id)
     if context:
-        if text == 'ביטול':
+        if text in ['ביטול', 'בטל']:
             delete_user_context(user_id)
-            return 'בוטל. אפשר להתחיל מחדש 🙂'
+            return 'הפעולה בוטלה. אפשר להתחיל מחדש 🙂'
         return handle_context(text, user_id)
 
-    if any(word in text for word in ['יומן', 'פגישה', 'אירוע', 'תור', 'תוסיף', 'הוסף', 'קבע', 'תזמן', 'זמן', 'לפגוש', 'לקבוע', 'הכנס']):
+    # 2. Cancel Global
+    if text in ['ביטול', 'בטל']:
+        return 'אין פעולה פתוחה לביטול.'
+
+    # 3. Budget Limits Settings
+    limit_match = re.search(r'הגדר\s*תקציב\s*([א-ת]+)\s*(\d+)', text)
+    if limit_match:
+        category = limit_match.group(1)
+        amount = int(limit_match.group(2))
+        if category in BUDGET_CATEGORIES:
+            set_budget_limit(category, amount)
+            return f'✅ תקרת התקציב לקטגוריית {category} עודכנה ל-{amount} ש"ח.'
+        return f'❌ לא מצאתי קטגוריה בשם "{category}". הקטגוריות הן: {", ".join(BUDGET_CATEGORIES.keys())}'
+
+    # 4. Task Marking as Done
+    if re.search(r'(סיימתי|בוצע|הושלם)\s*(משימה)?', text):
+        active_tasks = get_active_tasks()
+        if not active_tasks:
+            return '📝 אין משימות פתוחות לסיים!'
+        
+        msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
+        for task_id, quad, desc in active_tasks:
+            emoji = TASK_QUADRANTS_EMOJI.get(quad, '📌')
+            msg += f'{task_id}. {emoji} {desc[:40]}...\n'
+            
+        set_user_context(user_id, {'type': 'complete_task'})
+        return msg
+
+    # 5. Add Task (Wizard Step 1)
+    if re.search(r'\b(משימה|תוסיף משימה|תזכיר לי)\b', text):
+        set_user_context(user_id, {'type': 'add_task_color'})
+        return (
+            '📝 בוא נוסיף משימה. איזה **צבע** היא?\n\n'
+            '🔴 אדום - חשוב ודחוף\n'
+            '🟡 צהוב - חשוב, לא דחוף\n'
+            '🟠 כתום - דחוף, לא חשוב\n'
+            '🟢 ירוק - לא דחוף, לא חשוב\n\n'
+            '(שלח לי את הצבע, למשל: "אדום")'
+        )
+
+    # 6. Calendar
+    if any(word in text for word in ['יומן', 'פגישה', 'אירוע', 'תור', 'קבע', 'תזמן', 'לקבוע']):
         return process_calendar(text)
 
+    # 7. Budget Entry
     amount_match = re.search(r'(\d+)', text)
-    if amount_match and not any(word in text for word in ['משימה', 'רבע']):
+    if amount_match:
         return handle_amount_entry(text, user_id)
 
-    if any(word in text for word in ['משימה', 'חשוב', 'דחוף']):
-        return handle_task_entry(text, user_id)
-
+    # 8. Reports
     if 'סטטוס משימות' in text or 'רשימת משימות' in text:
         return get_task_status()
-
-    if 'סטטוס כלכלי' in text or 'מאזן' in text:
+    if 'סטטוס כלכלי' in text or 'מאזן' in text or 'תקציב' in text:
         return get_detailed_budget()
-
     if 'עזרה' in text or 'תפריט' in text:
         return get_help_menu()
 
     return get_welcome_message()
 
 
-def get_welcome_message():
-    return '''👋 שלום! אני *סהבאק* - העוזר האישי שלך\n\n📅 *יומן*: "תור לרופא ביום ראשון 31/5 בשעה 09:15"\n💰 *הוצאות*: "59 שקל ארוחה" (אשאל לאיזו קטגוריה)\n✅ *משימות*: "משימה חשובה ודחופה תרגיל בית 6"\n📊 *דוחות*: "סטטוס כלכלי" או "סטטוס משימות"\n\nמה תרצה לעשות?'''
+def handle_context(text, user_id):
+    context = get_user_context(user_id)
 
+    # Flow: Add Budget Category
+    if context['type'] == 'budget':
+        category = None
+        for cat in BUDGET_CATEGORIES.keys():
+            if cat in text:
+                category = cat
+                break
+        if not category:
+            return '❌ לא זיהיתי קטגוריה. שלח שם תקין (למשל: מזון, דיור) או "ביטול".'
+            
+        result = finalize_expense(context['amount'], category, context['description'], user_id)
+        delete_user_context(user_id)
+        return result
 
-def get_help_menu():
-    menu = '''🤖 *תפריט עזרה - סהבאק*\n\n*ניהול יומן* 📅\n• תור לרופא ביום [תאריך] [שעה]\n• פגישה עם [שם] ב[מקום] [תאריך]\n\n*ניהול תקציב* 💰\n• [סכום] שקל [תיאור]\n• הכנסה [סכום]\n• סטטוס כלכלי\n\n*ניהול משימות* ✅\n• משימה חשובה ודחופה [תיאור]\n• משימה חשובה [תיאור]\n• סטטוס משימות\n\n*קטגוריות תקציב:*\n'''
-    for cat, emoji in BUDGET_CATEGORIES.items():
-        menu += f'{emoji} {cat}\n'
-    return menu
+    # Flow: Add Task - Step 1 (Color Selection)
+    if context['type'] == 'add_task_color':
+        selected_quadrant = None
+        for color_name, quad_name in TASK_COLOR_MAP.items():
+            if color_name in text:
+                selected_quadrant = quad_name
+                break
+                
+        if not selected_quadrant:
+            return '❌ לא זיהיתי את הצבע. אנא בחר: אדום, צהוב, כתום, או ירוק (או "ביטול").'
+            
+        set_user_context(user_id, {
+            'type': 'add_task_desc',
+            'quadrant': selected_quadrant
+        })
+        emoji = TASK_QUADRANTS_EMOJI[selected_quadrant]
+        return f'מצוין ({emoji} {selected_quadrant}).\nמה המשימה בפועל?'
+
+    # Flow: Add Task - Step 2 (Description)
+    if context['type'] == 'add_task_desc':
+        quadrant = context['quadrant']
+        add_task(quadrant, text)
+        delete_user_context(user_id)
+        emoji = TASK_QUADRANTS_EMOJI[quadrant]
+        return f'✅ המשימה נשמרה בהצלחה!\n{emoji} {quadrant}\n{text}'
+
+    # Flow: Complete Task
+    if context['type'] == 'complete_task':
+        match = re.search(r'(\d+)', text)
+        if not match:
+            return '❌ אנא שלח רק את **המספר** של המשימה שסיימת (או "ביטול").'
+            
+        task_id = int(match.group(1))
+        success = mark_task_completed(task_id)
+        if success:
+            delete_user_context(user_id)
+            return f'🎉 מעולה! משימה מספר {task_id} סומנה כהושלמה.'
+        else:
+            return f'❌ לא מצאתי משימה פתוחה עם המספר {task_id}. נסה שוב.'
+
+    delete_user_context(user_id)
+    return 'משהו השתבש עם הפעולה. בוטל.'
 
 
 def handle_amount_entry(text, user_id):
@@ -486,63 +556,7 @@ def handle_amount_entry(text, user_id):
     })
 
     category_list = '\n'.join([f'{emoji} {cat}' for cat, emoji in BUDGET_CATEGORIES.items()])
-    return f'רשמתי {amount} ש"ח\n\n📂 לאיזו קטגוריה?\n\n{category_list}\n\n(שלח את שם הקטגוריה)'
-
-
-def handle_task_entry(text, user_id):
-    quadrant = None
-    for q in TASK_QUADRANTS.keys():
-        if all(word in text for word in q.split()):
-            quadrant = q
-            break
-
-    if quadrant:
-        return finalize_task(quadrant, text)
-
-    set_user_context(user_id, {
-        'type': 'task',
-        'description': text
-    })
-
-    quadrant_list = '\n'.join([f'{emoji} {q}' for q, emoji in TASK_QUADRANTS.items()])
-    return f'📝 באיזה רבע למשימה הזו?\n\n{quadrant_list}\n\n(שלח את הרבע הרצוי)'
-
-
-def handle_context(text, user_id):
-    context = get_user_context(user_id)
-    if not context:
-        return 'משהו השתבש. נסה שוב!'
-
-    if context['type'] == 'budget':
-        category = None
-        for cat in BUDGET_CATEGORIES.keys():
-            if cat in text:
-                category = cat
-                break
-
-        if not category:
-            return 'לא זיהיתי קטגוריה. נסה שוב או שלח "ביטול"'
-
-        result = finalize_expense(context['amount'], category, context['description'], user_id)
-        delete_user_context(user_id)
-        return result
-
-    if context['type'] == 'task':
-        quadrant = None
-        for q in TASK_QUADRANTS.keys():
-            if q in text or all(word in text for word in q.split()):
-                quadrant = q
-                break
-
-        if not quadrant:
-            return 'לא זיהיתי רבע. נסה שוב או שלח "ביטול"'
-
-        result = finalize_task(quadrant, context['description'])
-        delete_user_context(user_id)
-        return result
-
-    delete_user_context(user_id)
-    return 'משהו השתבש. נסה שוב!'
+    return f'רשמתי {amount} ש"ח\n\n📂 לאיזו קטגוריה לשייך?\n\n{category_list}\n\n(שלח את שם הקטגוריה)'
 
 
 def finalize_expense(amount, category, description, user_id):
@@ -550,47 +564,34 @@ def finalize_expense(amount, category, description, user_id):
     add_expense(category, amount if is_income else -amount, datetime.now().isoformat(), description, user_id)
     emoji = BUDGET_CATEGORIES.get(category, '💵')
 
-    if not is_income and category in BUDGET_LIMITS:
+    if not is_income:
         total_spent = get_category_total_spent(category)
-        limit = BUDGET_LIMITS[category]
-        remaining = limit - total_spent
-
-        if remaining < 0:
-            warning = f'\n\n⚠️ חרגת מהתקציב ב-{abs(remaining)} ש"ח!'
-        elif remaining < limit * 0.2:
-            warning = f'\n\n⚠️ נותרו רק {remaining} ש"ח בקטגוריה זו'
+        limit = get_budget_limit(category)
+        
+        if limit > 0:
+            remaining = limit - total_spent
+            if remaining < 0:
+                warning = f'\n\n⚠️ חרגת מהתקציב החודשי ב-{abs(remaining)} ש"ח!'
+            elif remaining < limit * 0.2:
+                warning = f'\n\n⚠️ נותרו רק {remaining} ש"ח בקטגוריה זו לחודש הנוכחי'
+            else:
+                warning = f'\nנותרו {remaining} ש"ח (החודש)'
         else:
-            warning = f'\nנותרו {remaining} ש"ח'
+            warning = ''
     else:
         warning = ''
 
     return f'✅ נרשם!\n{emoji} {category}: {amount} ש"ח{warning}'
 
 
-def finalize_task(quadrant, description):
-    add_task(quadrant, description)
-    emoji = TASK_QUADRANTS[quadrant]
-    return f'✅ משימה נוספה\n{emoji} {quadrant}\n{description}'
-
-
 def process_calendar(text):
     service = get_calendar_service()
     if not service:
-        return (
-            '❌ Google Calendar לא מחובר.\n'
-            'בדוק שיש GOOGLE_CREDENTIALS, וששיתפת את היומן שלך עם כתובת המייל של ה-service account '
-            'ונתת הרשאת Make changes to events.'
-        )
+        return '❌ Google Calendar לא מחובר או חסר תוקף הרשאות.'
 
     start_time, error = parse_hebrew_datetime(text)
     if error:
-        return (
-            f'❌ {error}\n'
-            'שלח כך:\n'
-            '• "פגישה עם דני ביום ראשון בשעה 09:15"\n'
-            '• "תור לרופא 31/05 בשעה 14:00"\n'
-            '• "פגישה צוות 31/05/2026 בשעה 16:30 במיקום עזריאלי תל אביב"'
-        )
+        return f'❌ {error}\nלדוגמה: "פגישת צוות ביום ראשון בשעה 09:15"'
 
     title, location = extract_event_fields(text)
     end_time = start_time + timedelta(hours=1)
@@ -600,56 +601,51 @@ def process_calendar(text):
         'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
         'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
     }
-
-    if location:
-        event['location'] = location
+    if location: event['location'] = location
 
     try:
         created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        return (
-            f'📅 האירוע נוצר בהצלחה!\n'
-            f'כותרת: {title}\n'
-            f'מיקום: {location if location else "ללא מיקום"}\n'
-            f'זמן: {start_time.strftime("%d/%m/%Y %H:%M")}\n'
-            f'קישור: {created.get("htmlLink", "לא זמין")}'
-        )
+        link = created.get("htmlLink", "לא זמין")
+        return (f'📅 האירוע נוצר בהצלחה!\nכותרת: {title}\n'
+                f'זמן: {start_time.strftime("%d/%m/%Y %H:%M")}\nקישור: {link}')
     except Exception as e:
         print(f'Calendar error: {e}')
-        return (
-            f'❌ לא הצלחתי ליצור אירוע ביומן.\n'
-            f'סיבה: {str(e)}\n'
-            'בדוק שה-CALENDAR_ID נכון, שה-service account שותף ליומן, '
-            'וש-Calendar API מופעל בפרויקט Google Cloud.'
-        )
+        return f'❌ שגיאה ביצירת אירוע. בדוק שהיומן המוגדר פתוח לעריכה מול ה-Service Account.'
 
 
 def get_task_status():
     completed, total = get_tasks_completion_stats()
-    if total == 0:
-        return '📝 אין משימות ברשימה'
+    active_tasks = get_active_tasks()
+    
+    if not active_tasks:
+        return f'📝 אין משימות פתוחות ברשימה.\n✅ {completed}/{total} משימות הושלמו היסטורית.'
 
-    status = '*📋 סטטוס משימות*\n\n'
+    status = '*📋 סטטוס משימות פתוחות*\n\n'
+    
+    # Group by quadrant
+    grouped = {q: [] for q in TASK_QUADRANTS_EMOJI.keys()}
+    for task_id, quad, desc in active_tasks:
+        grouped[quad].append((task_id, desc))
 
-    for quadrant, emoji in TASK_QUADRANTS.items():
-        tasks_in_quad = get_active_tasks_by_quadrant(quadrant)
+    for quadrant, emoji in TASK_QUADRANTS_EMOJI.items():
+        tasks_in_quad = grouped[quadrant]
         if tasks_in_quad:
             status += f'{emoji} *{quadrant}* ({len(tasks_in_quad)})\n'
-            for task_desc in tasks_in_quad[:5]:
-                desc = task_desc[:50]
-                status += f'  • {desc}\n'
+            for task_id, desc in tasks_in_quad:
+                status += f'  • [משימה {task_id}]: {desc[:50]}\n'
             status += '\n'
 
-    status += f'\n✅ {completed}/{total} משימות הושלמו'
-
+    status += f'\n(לסיום משימה כתוב "סיימתי משימה")'
     return status
 
 
 def get_detailed_budget():
     summary = get_all_budget_summary()
     if not summary:
-        return '💰 אין רשומות תקציב'
+        return '💰 אין רשומות תקציב לחודש הנוכחי.'
 
-    report = '*💰 סטטוס כלכלי*\n\n'
+    current_month_str = datetime.now().strftime("%m/%Y")
+    report = f'*💰 סטטוס כלכלי (חודש {current_month_str})*\n\n'
 
     total_income = 0
     total_expenses = 0
@@ -662,52 +658,56 @@ def get_detailed_budget():
             report += f'{emoji} *{category}*: +{cat_total} ש"ח\n'
         else:
             total_expenses += abs(cat_total)
-            limit = BUDGET_LIMITS.get(category, 0)
-            if limit:
+            limit = get_budget_limit(category)
+            
+            if limit > 0:
                 percentage = min((abs(cat_total) / limit) * 100, 100)
                 filled = min(int(percentage / 10), 10)
                 bar = '█' * filled + '░' * (10 - filled)
-                report += f'{emoji} *{category}*: {abs(cat_total)}/{limit} ש"ח\n{bar} {int(percentage)}%\n\n'
+                report += f'{emoji} *{category}*: {abs(cat_total)}/{int(limit)} ש"ח\n{bar} {int(percentage)}%\n\n'
             else:
                 report += f'{emoji} *{category}*: {abs(cat_total)} ש"ח\n\n'
 
     balance = total_income - total_expenses
-
     report += '━━━━━━━━━━━━━━━\n'
     report += f'💵 הכנסות: {total_income} ש"ח\n'
     report += f'💸 הוצאות: {total_expenses} ש"ח\n'
     report += '━━━━━━━━━━━━━━━\n'
 
     if balance >= 0:
-        report += f'✅ *מאזן*: +{balance} ש"ח'
+        report += f'✅ *מאזן חודשי*: +{balance} ש"ח'
     else:
-        report += f'⚠️ *גרעון*: {balance} ש"ח'
+        report += f'⚠️ *גרעון חודשי*: {balance} ש"ח'
 
     return report
 
 
-@app.route('/health', methods=['GET'])
-def health():
-    calendar_ok = False
-    calendar_error = None
+def get_welcome_message():
+    return (
+        '👋 שלום! אני *סהבאק* - העוזר האישי שלך\n\n'
+        '📅 *יומן*: "תור לרופא ביום ראשון בשעה 09:15"\n'
+        '💰 *הוצאות*: "59 שקל ארוחה"\n'
+        '✅ *משימות*: "תוסיף משימה" או "סיימתי משימה"\n'
+        '📊 *דוחות*: "סטטוס כלכלי" או "סטטוס משימות"\n\n'
+        'מה תרצה לעשות?'
+    )
 
-    service = get_calendar_service()
-    if service:
-        try:
-            service.calendars().get(calendarId=CALENDAR_ID).execute()
-            calendar_ok = True
-        except Exception as e:
-            calendar_error = str(e)
-
-    return jsonify({
-        'status': 'healthy',
-        'service': 'sahbak',
-        'calendar': calendar_ok,
-        'calendar_id': CALENDAR_ID,
-        'calendar_error': calendar_error,
-        'budget_entries': get_budget_entries_count(),
-        'tasks': get_tasks_completion_stats()[1]
-    }), 200
+def get_help_menu():
+    return (
+        '🤖 *תפריט עזרה - סהבאק*\n\n'
+        '*משימות* ✅\n'
+        '• "משימה" / "תוסיף משימה"\n'
+        '• "סיימתי משימה" (כדי למחוק משימה מהרשימה)\n'
+        '• "סטטוס משימות"\n\n'
+        '*תקציב (מתאפס אוטומטית בכל חודש)* 💰\n'
+        '• "50 שקל דיור"\n'
+        '• "הגדר תקציב דיור 6000" (לעדכון התקרה)\n'
+        '• "סטטוס כלכלי"\n\n'
+        '*יומן* 📅\n'
+        '• "תור לרופא ביום שלישי בשעה 14:00"\n\n'
+        '*ביטול פעולה באמצע*\n'
+        '• תמיד אפשר לכתוב "ביטול"'
+    )
 
 
 if __name__ == '__main__':
