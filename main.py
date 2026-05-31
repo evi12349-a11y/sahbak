@@ -1,23 +1,38 @@
 """
 סחבק — WhatsApp Personal Assistant Bot
 Production-grade Flask server for Railway deployment.
+
+Stack:
+  • WhatsApp Cloud API (Meta Graph API)  — messaging
+  • Google Gemini (google-genai SDK)     — natural-language understanding
+  • Google Calendar API                  — event creation
+  • SQLite                               — budget / tasks / context storage
 """
+from __future__ import annotations  # makes type hints version-proof (3.9+)
 
 import os
-import json
 import re
+import json
 import hmac
-import hashlib
-import sqlite3
-import logging
 import base64
+import hashlib
+import logging
+import sqlite3
+import threading
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests as http_requests
 from flask import Flask, request, jsonify
+
+# Google Calendar (google-api-python-client + google-auth)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-import google.generativeai as genai
+
+# Gemini — new unified SDK. Replaces the deprecated `google-generativeai`
+# package (legacy SDK deprecated 2025-11-30).
+from google import genai
+from google.genai import types
 
 # ─────────────────────────────────────────────
 # Logging
@@ -34,18 +49,53 @@ logger = logging.getLogger('sahbak')
 # ─────────────────────────────────────────────
 app = Flask(__name__)
 
-VERIFY_TOKEN     = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
-WHATSAPP_TOKEN   = os.getenv('WHATSAPP_TOKEN')
-PHONE_NUMBER_ID  = os.getenv('PHONE_NUMBER_ID')
-GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID      = os.getenv('CALENDAR_ID', 'primary')
-APP_SECRET       = os.getenv('APP_SECRET')
-GEMINI_API_KEY   = os.getenv('GEMINI_API_KEY')
+VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
+WHATSAPP_TOKEN       = os.getenv('WHATSAPP_TOKEN')
+PHONE_NUMBER_ID      = os.getenv('PHONE_NUMBER_ID')
+GOOGLE_CREDENTIALS   = os.getenv('GOOGLE_CREDENTIALS')
+CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')
+APP_SECRET           = os.getenv('APP_SECRET')
+GEMINI_API_KEY       = os.getenv('GEMINI_API_KEY')
 
-DB_FILE = '/app/data/sahbak.db'
+GEMINI_MODEL         = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+WHATSAPP_API_VERSION = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
+TIMEZONE_NAME        = os.getenv('TIMEZONE', 'Asia/Jerusalem')
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# DB path defaults to ./data/sahbak.db (works locally AND on Railway).
+# To survive redeploys on Railway, attach a Volume and point DB_PATH at its
+# mount path, e.g. DB_PATH=/app/data/sahbak.db
+DB_FILE = os.getenv('DB_PATH', os.path.join('data', 'sahbak.db'))
+
+# Gemini client (constructing it makes no network call, so module-level is fine)
+_genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+def get_genai_client():
+    return _genai_client
+
+
+# ─────────────────────────────────────────────
+# Time — single source of truth for "now"
+# ─────────────────────────────────────────────
+# Railway containers run in UTC. A naive datetime.now() there makes "tomorrow
+# at 9", the budget's current month, and task timestamps all 2–3 hours off from
+# Israel — which silently lands events/expenses on the wrong day or month.
+# Everything below goes through now_local() instead.
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
+except Exception:
+    logger.warning('Could not load timezone "%s" (is the "tzdata" package '
+                   'installed?). Falling back to system local time.', TIMEZONE_NAME)
+    LOCAL_TZ = None
+
+# Hebrew weekday names, indexed by datetime.weekday() (Monday=0 … Sunday=6).
+HEB_WEEKDAYS = ['שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת', 'ראשון']
+
+
+def now_local() -> datetime:
+    """Timezone-aware current time (Israel by default)."""
+    return datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.now()
+
 
 # ─────────────────────────────────────────────
 # Constants
@@ -74,12 +124,28 @@ SUPPORTED_AUDIO_TYPES  = {'audio'}
 SUPPORTED_DOC_TYPES    = {'document'}
 MEDIA_TYPES            = SUPPORTED_IMAGE_TYPES | SUPPORTED_AUDIO_TYPES | SUPPORTED_DOC_TYPES
 
+# WhatsApp hard limit for a single text message body
+WHATSAPP_TEXT_LIMIT = 4096
+# Gemini inline-request size guard (~20MB ceiling; stay safely under it)
+MAX_MEDIA_BYTES = 18 * 1024 * 1024
+
+
 # ─────────────────────────────────────────────
 # Database
 # ─────────────────────────────────────────────
+def _connect() -> sqlite3.Connection:
+    # timeout reduces "database is locked" under concurrent webhooks
+    return sqlite3.connect(DB_FILE, timeout=10)
+
+
 def init_db() -> None:
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    with sqlite3.connect(DB_FILE) as conn:
+    db_dir = os.path.dirname(DB_FILE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    with _connect() as conn:
+        # WAL = concurrent readers + a single writer; far fewer "database is
+        # locked" errors now that webhooks are handled on background threads.
+        conn.execute('PRAGMA journal_mode=WAL')
         c = conn.cursor()
         c.executescript('''
             CREATE TABLE IF NOT EXISTS budget (
@@ -109,25 +175,49 @@ def init_db() -> None:
                 category TEXT PRIMARY KEY,
                 amount   REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                message_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
         ''')
         # Seed default limits only on first run
         c.execute('SELECT COUNT(*) FROM budget_limits')
         if c.fetchone()[0] == 0:
             c.executemany(
                 'INSERT INTO budget_limits (category, amount) VALUES (?, ?)',
-                DEFAULT_BUDGET_LIMITS.items()
+                list(DEFAULT_BUDGET_LIMITS.items())
             )
         conn.commit()
     logger.info('Database initialised at %s', DB_FILE)
 
 
-init_db()
+def mark_message_seen(message_id: str) -> bool:
+    """Record a WhatsApp message id. Returns True if it is new (first time seen).
+
+    WhatsApp delivers webhooks at-least-once, so the same message can arrive
+    several times. We persist ids to avoid double-processing (e.g. logging the
+    same expense twice).
+    """
+    if not message_id:
+        return True
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO processed_messages (message_id, created_at) VALUES (?, ?)',
+                (message_id, now_local().isoformat())
+            )
+            conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        logger.exception('Dedup check failed for %s', message_id)
+        return True  # fail open: better a rare duplicate than a dropped message
 
 
 # ── Context helpers ──────────────────────────
 
 def get_user_context(user_id: str) -> dict | None:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         row = conn.execute(
             'SELECT context_json FROM contexts WHERE user_id = ?', (user_id,)
         ).fetchone()
@@ -135,7 +225,7 @@ def get_user_context(user_id: str) -> dict | None:
 
 
 def set_user_context(user_id: str, context: dict) -> None:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         conn.execute(
             'INSERT OR REPLACE INTO contexts (user_id, context_json) VALUES (?, ?)',
             (user_id, json.dumps(context))
@@ -144,7 +234,7 @@ def set_user_context(user_id: str, context: dict) -> None:
 
 
 def delete_user_context(user_id: str) -> None:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         conn.execute('DELETE FROM contexts WHERE user_id = ?', (user_id,))
         conn.commit()
 
@@ -152,7 +242,7 @@ def delete_user_context(user_id: str) -> None:
 # ── Budget helpers ───────────────────────────
 
 def get_budget_limit(category: str) -> float:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         row = conn.execute(
             'SELECT amount FROM budget_limits WHERE category = ?', (category,)
         ).fetchone()
@@ -160,7 +250,7 @@ def get_budget_limit(category: str) -> float:
 
 
 def set_budget_limit(category: str, amount: float) -> None:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         conn.execute(
             'INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)',
             (category, amount)
@@ -168,11 +258,17 @@ def set_budget_limit(category: str, amount: float) -> None:
         conn.commit()
 
 
+def get_all_budget_limits() -> dict:
+    with _connect() as conn:
+        rows = conn.execute('SELECT category, amount FROM budget_limits').fetchall()
+    return {cat: amt for cat, amt in rows}
+
+
 def add_expense(category: str, amount: float, date: str,
                 description: str, user_id: str) -> None:
     # Store only the date portion (YYYY-MM-DD) so strftime queries work reliably
     date_only = date[:10]
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         conn.execute(
             'INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)',
             (category, amount, date_only, description, user_id)
@@ -181,8 +277,8 @@ def add_expense(category: str, amount: float, date: str,
 
 
 def get_category_total_spent(category: str, user_id: str) -> float:
-    current_month = datetime.now().strftime('%Y-%m')
-    with sqlite3.connect(DB_FILE) as conn:
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
         row = conn.execute(
             """SELECT SUM(ABS(amount))
                FROM budget
@@ -196,8 +292,8 @@ def get_category_total_spent(category: str, user_id: str) -> float:
 
 
 def get_all_budget_summary(user_id: str) -> list[tuple]:
-    current_month = datetime.now().strftime('%Y-%m')
-    with sqlite3.connect(DB_FILE) as conn:
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
         rows = conn.execute(
             """SELECT category, SUM(amount)
                FROM budget
@@ -212,16 +308,16 @@ def get_all_budget_summary(user_id: str) -> list[tuple]:
 # ── Task helpers ─────────────────────────────
 
 def add_task(quadrant: str, description: str, user_id: str) -> None:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         conn.execute(
             'INSERT INTO tasks (quadrant, description, created_at, completed, user_id) VALUES (?, ?, ?, 0, ?)',
-            (quadrant, description, datetime.now().isoformat(), user_id)
+            (quadrant, description, now_local().isoformat(), user_id)
         )
         conn.commit()
 
 
 def get_active_tasks(user_id: str) -> list[tuple]:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         rows = conn.execute(
             'SELECT id, quadrant, description FROM tasks WHERE completed = 0 AND user_id = ? ORDER BY id ASC',
             (user_id,)
@@ -230,7 +326,7 @@ def get_active_tasks(user_id: str) -> list[tuple]:
 
 
 def mark_task_completed(task_id: int, user_id: str) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             'UPDATE tasks SET completed = 1 WHERE id = ? AND user_id = ? AND completed = 0',
             (task_id, user_id)
@@ -240,10 +336,15 @@ def mark_task_completed(task_id: int, user_id: str) -> bool:
 
 
 def get_tasks_completion_stats(user_id: str) -> tuple[int, int]:
-    with sqlite3.connect(DB_FILE) as conn:
+    """Completion stats for the CURRENT month only, so the ratio stays meaningful."""
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
         row = conn.execute(
-            'SELECT SUM(completed), COUNT(*) FROM tasks WHERE user_id = ?',
-            (user_id,)
+            """SELECT SUM(completed), COUNT(*)
+               FROM tasks
+               WHERE user_id = ?
+                 AND strftime('%Y-%m', created_at) = ?""",
+            (user_id, current_month)
         ).fetchone()
     completed = row[0] if row[0] else 0
     total     = row[1] if row[1] else 0
@@ -262,7 +363,9 @@ def get_calendar_service():
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
         )
-        return build('calendar', 'v3', credentials=credentials)
+        # cache_discovery=False avoids a noisy warning + file cache on
+        # read-only / serverless filesystems.
+        return build('calendar', 'v3', credentials=credentials, cache_discovery=False)
     except Exception:
         logger.exception('Failed to build calendar service')
         return None
@@ -299,16 +402,16 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
 
 
 # ─────────────────────────────────────────────
-# AI — Gemini
+# AI — Gemini (google-genai SDK)
 # ─────────────────────────────────────────────
-
-_GEMINI_MODEL = 'gemini-2.0-flash'
 
 def analyze_with_ai(text: str) -> dict:
     """Parse a free-form Hebrew message into a structured action dict."""
-    if not GEMINI_API_KEY:
+    client = get_genai_client()
+    if not client:
         return {'action': 'unknown', 'reply': 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'}
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    now_str = now_local().strftime('%Y-%m-%d %H:%M')
     prompt = f"""
 אתה עוזר אישי חכם בוואטסאפ שנקרא "סחבק". תפקידך לנתח משפטים חופשיים של משתמש ולהמיר אותם לפעולות במערכת.
 תאריך ושעה נוכחיים: {now_str}
@@ -329,13 +432,22 @@ def analyze_with_ai(text: str) -> dict:
 
 4. {{"action": "unknown", "reply": "תשובה קצרה וידידותית בעברית"}}
 """
+    raw = ''
     try:
-        model    = genai.GenerativeModel(_GEMINI_MODEL)
-        response = model.generate_content(prompt)
-        raw      = response.text.strip()
-        # Strip any accidental markdown fences
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json',  # forces valid JSON output
+                temperature=0.2,
+            ),
+        )
+        raw = (response.text or '').strip()
+        # Defensive: strip any accidental markdown fences
         raw = re.sub(r'^```(?:json)?\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw).strip()
+        if not raw:
+            return {'action': 'unknown', 'reply': 'סליחה, לא הצלחתי להבין. נסח אחרת?'}
         return json.loads(raw)
     except json.JSONDecodeError:
         logger.warning('AI returned non-JSON: %s', raw[:200])
@@ -345,44 +457,68 @@ def analyze_with_ai(text: str) -> dict:
         return {'action': 'unknown', 'reply': 'שגיאה זמנית בשרתי AI. נסה שוב עוד רגע.'}
 
 
-def describe_media_with_ai(media_type: str, mime_type: str, media_data: bytes | None,
-                            caption: str) -> str:
-    """Use Gemini to describe/transcribe non-text media content."""
-    if not GEMINI_API_KEY:
+def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: str) -> str:
+    client = get_genai_client()
+    if not client or not image_data:
         return 'שלח הודעת טקסט כדי שאוכל לעזור לך 😊'
-
     try:
-        model = genai.GenerativeModel(_GEMINI_MODEL)
-
-        if media_type == 'image' and media_data:
-            image_part = {'mime_type': mime_type, 'data': base64.b64encode(media_data).decode()}
-            prompt_parts = [
-                image_part,
-                'תאר את התמונה הזו בעברית בקצרה. אם יש בה טקסט, ציין אותו. היה ממוקד ומועיל.'
-            ]
-            if caption:
-                prompt_parts.append(f'הערת המשתמש: {caption}')
-            response = model.generate_content(prompt_parts)
-            return f'📷 *תיאור התמונה:*\n{response.text.strip()}'
-
-        if media_type == 'audio':
-            return (
-                '🎤 קיבלתי הודעה קולית, אך עדיין לא מסוגל לתמלל שמע.\n'
-                'שלח את ההודעה כטקסט ואשמח לעזור!'
-            )
-
-        if media_type == 'document':
-            doc_name = caption or 'מסמך'
-            return (
-                f'📄 קיבלתי מסמך: *{doc_name}*\n'
-                'כרגע אני לא יכול לקרוא קבצים מצורפים.\n'
-                'אם תרצה עזרה עם תוכנו — העתק את הטקסט ושלח אותו ישירות.'
-            )
-
+        contents = [
+            'תאר את התמונה הזו בעברית בקצרה. אם יש בה טקסט, ציין אותו. היה ממוקד ומועיל.',
+            types.Part.from_bytes(data=image_data, mime_type=mime_type or 'image/jpeg'),
+        ]
+        if caption:
+            contents.append(f'הערת המשתמש: {caption}')
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        out = (response.text or '').strip()
+        return f'📷 *תיאור התמונה:*\n{out}' if out else 'לא הצלחתי לנתח את התמונה.'
     except Exception:
-        logger.exception('Media description failed')
+        logger.exception('Image description failed')
+        return 'לא הצלחתי לעבד את התמונה. שלח הודעת טקסט ואעזור לך 😊'
 
-    return 'לא הצלחתי לעבד את הקובץ. שלח הודעת טקסט ואעזור לך 😊'
+
+def transcribe_audio_with_ai(audio_data: bytes | None, mime_type: str) -> str | None:
+    client = get_genai_client()
+    if not client or not audio_data:
+        return None
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                'תמלל את ההקלטה הבאה לעברית. החזר אך ורק את הטקסט המתומלל, ללא הסברים.',
+                types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/ogg'),
+            ],
+        )
+        out = (response.text or '').strip()
+        return out or None
+    except Exception:
+        logger.exception('Audio transcription failed')
+        return None
+
+
+def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename: str) -> str:
+    client = get_genai_client()
+    name = filename or 'מסמך'
+    if not client or not doc_data:
+        return (f'📄 קיבלתי מסמך: *{name}*\nכרגע אני לא יכול לקרוא אותו. '
+                'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
+    can_read = mime_type.startswith('application/pdf') or mime_type.startswith('text/')
+    if not can_read:
+        return (f'📄 קיבלתי מסמך: *{name}* ({mime_type or "סוג לא ידוע"}).\n'
+                'אני יכול לקרוא כרגע רק PDF או קובצי טקסט. '
+                'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                'סכם בקצרה בעברית את תוכן המסמך הבא, בנקודות עיקריות וברורות.',
+                types.Part.from_bytes(data=doc_data, mime_type=mime_type),
+            ],
+        )
+        out = (response.text or '').strip()
+        return f'📄 *סיכום — {name}:*\n{out}' if out else f'לא הצלחתי לסכם את {name}.'
+    except Exception:
+        logger.exception('Document summary failed')
+        return f'לא הצלחתי לקרוא את {name}. נסה לשלוח את הטקסט ישירות.'
 
 
 # ─────────────────────────────────────────────
@@ -391,9 +527,9 @@ def describe_media_with_ai(media_type: str, mime_type: str, media_data: bytes | 
 
 def send_whatsapp_message(to: str, message: str) -> bool:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        logger.error('WhatsApp credentials not configured')
+        logger.error('WhatsApp credentials not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)')
         return False
-    url     = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
+    url     = f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages'
     headers = {
         'Authorization': f'Bearer {WHATSAPP_TOKEN}',
         'Content-Type':  'application/json',
@@ -402,11 +538,16 @@ def send_whatsapp_message(to: str, message: str) -> bool:
         'messaging_product': 'whatsapp',
         'to':                to,
         'type':              'text',
-        'text':              {'body': message},
+        'text':              {'body': message[:WHATSAPP_TEXT_LIMIT]},
     }
     try:
-        resp = http_requests.post(url, headers=headers, json=payload, timeout=10)
-        resp.raise_for_status()
+        resp = http_requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code >= 400:
+            # Log Meta's actual error body — this is what you need to debug
+            # "the bot isn't replying" (expired token, number not allow-listed,
+            # 24-hour window closed, etc.)
+            logger.error('WhatsApp send failed (%s): %s', resp.status_code, resp.text[:500])
+            return False
         return True
     except Exception:
         logger.exception('Failed to send WhatsApp message to %s', to)
@@ -421,8 +562,8 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
     try:
         # Step 1: get media URL
         meta = http_requests.get(
-            f'https://graph.facebook.com/v19.0/{media_id}',
-            headers=headers, timeout=10
+            f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}',
+            headers=headers, timeout=15
         )
         meta.raise_for_status()
         meta_json = meta.json()
@@ -430,7 +571,7 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         mime_type  = meta_json.get('mime_type', 'application/octet-stream')
         if not media_url:
             return None, mime_type
-        # Step 2: download actual bytes
+        # Step 2: download actual bytes (the CDN URL also needs the auth header)
         media_resp = http_requests.get(media_url, headers=headers, timeout=30)
         media_resp.raise_for_status()
         return media_resp.content, mime_type
@@ -465,7 +606,7 @@ def process_message(text: str, user_id: str) -> str:
             delete_user_context(user_id)
             return 'הפעולה בוטלה ✅'
 
-        if context['type'] == 'complete_task':
+        if context.get('type') == 'complete_task':
             match = re.search(r'(\d+)', text)
             if not match:
                 return 'שלח רק את המספר של המשימה שסיימת (או "ביטול").'
@@ -521,7 +662,7 @@ def process_message(text: str, user_id: str) -> str:
         if cat not in BUDGET_CATEGORIES_HE:
             return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(BUDGET_CATEGORIES_HE)}'
         signed_amt = amt if cat == 'הכנסה' else -amt
-        add_expense(cat, signed_amt, datetime.now().isoformat(), desc, user_id)
+        add_expense(cat, signed_amt, now_local().isoformat(), desc, user_id)
         alert = ''
         if cat != 'הכנסה':
             limit = get_budget_limit(cat)
@@ -556,16 +697,37 @@ def process_message(text: str, user_id: str) -> str:
 
 def process_media_message(message: dict, user_id: str) -> str:
     """Handle non-text message types (image, audio, document)."""
-    msg_type = message.get('type', '')
-    media_obj = message.get(msg_type, {})
+    msg_type  = message.get('type', '')
+    media_obj = message.get(msg_type, {}) or {}
     media_id  = media_obj.get('id', '')
     caption   = media_obj.get('caption', '') or ''
 
-    media_data, mime_type = None, ''
-    if msg_type == 'image' and media_id:
+    media_data, mime_type = (None, '')
+    if media_id:
         media_data, mime_type = download_whatsapp_media(media_id)
 
-    return describe_media_with_ai(msg_type, mime_type, media_data, caption)
+    # Guard against oversized media (Gemini inline-request limit)
+    if media_data and len(media_data) > MAX_MEDIA_BYTES:
+        return 'הקובץ גדול מדי לעיבוד (מעל ~18MB). שלח גרסה קטנה יותר או את הטקסט ישירות.'
+
+    if msg_type == 'image':
+        return describe_image_with_ai(media_data, mime_type, caption)
+
+    if msg_type == 'audio':
+        transcript = transcribe_audio_with_ai(media_data, mime_type)
+        if not transcript:
+            return ('🎤 קיבלתי הקלטה אך לא הצלחתי לתמלל אותה.\n'
+                    'נסה שוב, או שלח את ההודעה כטקסט.')
+        # Route the transcription through the normal text pipeline so a voice
+        # note can create events, tasks and expenses exactly like typed text.
+        result = process_message(transcript, user_id)
+        return f'🎤 _שמעתי:_ "{transcript}"\n\n{result}'
+
+    if msg_type == 'document':
+        filename = media_obj.get('filename', '') or caption
+        return summarize_document_with_ai(media_data, mime_type, filename)
+
+    return 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, הקלטה או קובץ.'
 
 
 # ─────────────────────────────────────────────
@@ -597,7 +759,7 @@ def get_detailed_budget(user_id: str) -> str:
     summary = get_all_budget_summary(user_id)
     if not summary:
         return 'אין רשומות לחודש הנוכחי.'
-    month   = datetime.now().strftime('%m/%Y')
+    month   = now_local().strftime('%m/%Y')
     report  = f'*סטטוס כלכלי — {month}*\n\n'
     total_inc, total_exp = 0.0, 0.0
 
@@ -638,6 +800,7 @@ def get_welcome_message() -> str:
         '📅 *יומן:* "תקבע לי פגישה עם דני מחר ב-8"\n'
         '✅ *משימות:* "שים לי משימה דחופה לקנות חלב"\n'
         '💵 *תקציב:* "אכלתי המבורגר ב-70 שקל"\n\n'
+        'אפשר גם לשלוח לי *הקלטה קולית*, *תמונה* או *קובץ PDF* 🎤📷📄\n\n'
         'לדוחות ועזרה שלח *"תפריט"*'
     )
 
@@ -659,6 +822,26 @@ def get_help_menu() -> str:
 # ─────────────────────────────────────────────
 # Webhook Routes
 # ─────────────────────────────────────────────
+
+def _handle_message_safely(message: dict, from_number: str) -> None:
+    """Runs in a background thread: build the reply and send it."""
+    try:
+        msg_type = message.get('type', '')
+        if msg_type == 'text':
+            text     = message.get('text', {}).get('body', '').strip()
+            response = process_message(text, from_number) if text else get_welcome_message()
+        elif msg_type in MEDIA_TYPES:
+            response = process_media_message(message, from_number)
+        else:
+            response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, הקלטה או קובץ.'
+        send_whatsapp_message(from_number, response)
+    except Exception:
+        logger.exception('Failed to handle message from %s', from_number)
+        try:
+            send_whatsapp_message(from_number, 'אופס, משהו השתבש אצלי. נסה שוב עוד רגע 🙏')
+        except Exception:
+            logger.exception('Also failed to send error reply to %s', from_number)
+
 
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
@@ -686,27 +869,34 @@ def webhook():
         return jsonify({'status': 'ignored'}), 200
 
     try:
-        changes = data.get('entry', [{}])[0].get('changes', [{}])[0]
-        value   = changes.get('value', {})
-        if 'messages' not in value:
+        changes  = data.get('entry', [{}])[0].get('changes', [{}])[0]
+        value    = changes.get('value', {})
+        messages = value.get('messages')
+        if not messages:
+            # Delivery/read receipts ("statuses") and other events land here
             return jsonify({'status': 'ignored'}), 200
 
-        message     = value['messages'][0]
+        message     = messages[0]
         from_number = message.get('from', '')
-        msg_type    = message.get('type', '')
+        message_id  = message.get('id', '')
 
         if not from_number:
             return jsonify({'status': 'ignored'}), 200
 
-        if msg_type == 'text':
-            text     = message.get('text', {}).get('body', '').strip()
-            response = process_message(text, from_number) if text else get_welcome_message()
-        elif msg_type in MEDIA_TYPES:
-            response = process_media_message(message, from_number)
-        else:
-            response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, או קובץ.'
+        # Deduplicate — WhatsApp may deliver the same message more than once.
+        if not mark_message_seen(message_id):
+            logger.info('Duplicate message %s ignored', message_id)
+            return jsonify({'status': 'duplicate'}), 200
 
-        send_whatsapp_message(from_number, response)
+        # Process in the background so we ACK Meta within milliseconds.
+        # This prevents webhook timeouts (and the automatic re-delivery that
+        # follows) when Gemini / Calendar take a few seconds to respond.
+        threading.Thread(
+            target=_handle_message_safely,
+            args=(message, from_number),
+            daemon=True,
+        ).start()
+
         return jsonify({'status': 'ok'}), 200
 
     except (IndexError, KeyError) as exc:
@@ -714,7 +904,13 @@ def webhook():
         return jsonify({'status': 'ignored'}), 200
     except Exception:
         logger.exception('Unhandled webhook error')
-        return jsonify({'status': 'error'}), 500
+        # Still ACK with 200 so Meta does not retry in a loop.
+        return jsonify({'status': 'error'}), 200
+
+
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({'service': 'sahbak', 'status': 'running'}), 200
 
 
 @app.route('/health', methods=['GET'])
@@ -722,7 +918,8 @@ def health():
     """Simple health-check endpoint for Railway / uptime monitors."""
     return jsonify({
         'status':    'ok',
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': now_local().isoformat(),
+        'model':     GEMINI_MODEL,
         'gemini':    bool(GEMINI_API_KEY),
         'whatsapp':  bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
         'calendar':  bool(GOOGLE_CREDENTIALS),
@@ -730,9 +927,31 @@ def health():
 
 
 # ─────────────────────────────────────────────
-# Entry Point
+# Startup
+# ─────────────────────────────────────────────
+
+def _log_startup_config() -> None:
+    logger.info('סחבק starting — model=%s, whatsapp_api=%s', GEMINI_MODEL, WHATSAPP_API_VERSION)
+    missing = [name for name, val in {
+        'WHATSAPP_TOKEN':  WHATSAPP_TOKEN,
+        'PHONE_NUMBER_ID': PHONE_NUMBER_ID,
+        'GEMINI_API_KEY':  GEMINI_API_KEY,
+    }.items() if not val]
+    if missing:
+        logger.warning('Missing env vars (related features will be disabled): %s', ', '.join(missing))
+    if not APP_SECRET:
+        logger.warning('APP_SECRET not set — webhook signature verification is OFF')
+
+
+# Run at import time so it also executes under gunicorn (production).
+init_db()
+_log_startup_config()
+
+
+# ─────────────────────────────────────────────
+# Entry Point (local development only)
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     debug = os.getenv('FLASK_DEBUG', 'false').lower() in ('true', '1')
-    port  = int(os.getenv('PORT', 5000))
+    port  = int(os.getenv('PORT', '5000'))
     app.run(host='0.0.0.0', port=port, debug=debug)
