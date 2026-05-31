@@ -1,8 +1,13 @@
-flask==3.0.0
-requests==2.31.0
-google-api-python-client==2.108.0
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.0
-python-dotenv==1.0.0
-gunicorn==21.2.0
-google-generativeai
+# Web framework + production server
+flask>=3.0,<4.0
+gunicorn>=21.2.0
+
+# Gemini — new unified SDK (replaces the deprecated google-generativeai)
+google-genai>=1.0.0
+
+# Google Calendar
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
+# HTTP client (WhatsApp Cloud API)
+requests>=2.31.0
