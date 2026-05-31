@@ -1,183 +1,311 @@
+"""
+סחבק — WhatsApp Personal Assistant Bot
+Production-grade Flask server for Railway deployment.
+"""
 
-from flask import Flask, request, jsonify
-import os
-import jsonfrom flask import Flask, request, jsonify
 import os
 import json
 import re
-import requests as http_requests
-from datetime import datetime, timedelta
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import google.generativeai as genai
 import hmac
 import hashlib
 import sqlite3
+import logging
+import base64
+from datetime import datetime, timedelta
 
+import requests as http_requests
+from flask import Flask, request, jsonify
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import google.generativeai as genai
+
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+logger = logging.getLogger('sahbak')
+
+# ─────────────────────────────────────────────
+# App & Config
+# ─────────────────────────────────────────────
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
-WHATSAPP_TOKEN = os.getenv('WHATSAPP_TOKEN')
-PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
+VERIFY_TOKEN     = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
+WHATSAPP_TOKEN   = os.getenv('WHATSAPP_TOKEN')
+PHONE_NUMBER_ID  = os.getenv('PHONE_NUMBER_ID')
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
-APP_SECRET = os.getenv('APP_SECRET')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+CALENDAR_ID      = os.getenv('CALENDAR_ID', 'primary')
+APP_SECRET       = os.getenv('APP_SECRET')
+GEMINI_API_KEY   = os.getenv('GEMINI_API_KEY')
 
 DB_FILE = '/app/data/sahbak.db'
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-BUDGET_CATEGORIES = {'diyur': '🏠', 'rechev': '🚗', 'nofesh': '✈️', 'mazon': '🍔', 'briut': '💊', 'chinuch': '📚', 'biluim': '🎉', 'kniyot': '🛒', 'hachnasa': '💰'}
-BUDGET_CATEGORIES_HE = {'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️', 'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚', 'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰'}
-DEFAULT_BUDGET_LIMITS = {'דיור': 5000, 'רכב': 2000, 'נופש': 1500, 'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500, 'בילויים': 800, 'קניות': 1000}
-TASK_QUADRANTS_EMOJI = {'חשוב דחוף': '🔴', 'חשוב לא דחוף': '🟡', 'דחוף לא חשוב': '🟠', 'לא דחוף לא חשוב': '🟢'}
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+BUDGET_CATEGORIES_HE = {
+    'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️',
+    'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚',
+    'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰',
+}
 
-def init_db():
+DEFAULT_BUDGET_LIMITS = {
+    'דיור': 5000, 'רכב': 2000, 'נופש': 1500,
+    'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500,
+    'בילויים': 800, 'קניות': 1000,
+}
+
+TASK_QUADRANTS_EMOJI = {
+    'חשוב דחוף':        '🔴',
+    'חשוב לא דחוף':     '🟡',
+    'דחוף לא חשוב':     '🟠',
+    'לא דחוף לא חשוב':  '🟢',
+}
+
+SUPPORTED_IMAGE_TYPES  = {'image'}
+SUPPORTED_AUDIO_TYPES  = {'audio'}
+SUPPORTED_DOC_TYPES    = {'document'}
+MEDIA_TYPES            = SUPPORTED_IMAGE_TYPES | SUPPORTED_AUDIO_TYPES | SUPPORTED_DOC_TYPES
+
+# ─────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────
+def init_db() -> None:
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS budget (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT, amount REAL, date TEXT,
-            description TEXT, user_id TEXT)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            quadrant TEXT, description TEXT,
-            created_at TEXT, completed INTEGER DEFAULT 0)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS contexts (
-            user_id TEXT PRIMARY KEY, context_json TEXT)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS budget_limits (
-            category TEXT PRIMARY KEY, amount REAL)''')
-        cursor.execute('SELECT COUNT(*) FROM budget_limits')
-        if cursor.fetchone()[0] == 0:
-            for cat, limit in DEFAULT_BUDGET_LIMITS.items():
-                cursor.execute('INSERT INTO budget_limits (category, amount) VALUES (?, ?)', (cat, limit))
+        c = conn.cursor()
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS budget (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                category    TEXT    NOT NULL,
+                amount      REAL    NOT NULL,
+                date        TEXT    NOT NULL,
+                description TEXT,
+                user_id     TEXT    NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tasks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                quadrant    TEXT    NOT NULL,
+                description TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL,
+                completed   INTEGER NOT NULL DEFAULT 0,
+                user_id     TEXT    NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS contexts (
+                user_id      TEXT PRIMARY KEY,
+                context_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS budget_limits (
+                category TEXT PRIMARY KEY,
+                amount   REAL NOT NULL
+            );
+        ''')
+        # Seed default limits only on first run
+        c.execute('SELECT COUNT(*) FROM budget_limits')
+        if c.fetchone()[0] == 0:
+            c.executemany(
+                'INSERT INTO budget_limits (category, amount) VALUES (?, ?)',
+                DEFAULT_BUDGET_LIMITS.items()
+            )
         conn.commit()
+    logger.info('Database initialised at %s', DB_FILE)
+
 
 init_db()
 
-def get_user_context(user_id):
+
+# ── Context helpers ──────────────────────────
+
+def get_user_context(user_id: str) -> dict | None:
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT context_json FROM contexts WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
+        row = conn.execute(
+            'SELECT context_json FROM contexts WHERE user_id = ?', (user_id,)
+        ).fetchone()
     return json.loads(row[0]) if row else None
 
-def set_user_context(user_id, context):
+
+def set_user_context(user_id: str, context: dict) -> None:
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT OR REPLACE INTO contexts (user_id, context_json) VALUES (?, ?)',
-                     (user_id, json.dumps(context)))
+        conn.execute(
+            'INSERT OR REPLACE INTO contexts (user_id, context_json) VALUES (?, ?)',
+            (user_id, json.dumps(context))
+        )
         conn.commit()
 
-def delete_user_context(user_id):
+
+def delete_user_context(user_id: str) -> None:
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('DELETE FROM contexts WHERE user_id = ?', (user_id,))
         conn.commit()
 
-def get_budget_limit(category):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT amount FROM budget_limits WHERE category = ?', (category,))
-        row = cursor.fetchone()
-    return row[0] if row else 0
 
-def set_budget_limit(category, amount):
+# ── Budget helpers ───────────────────────────
+
+def get_budget_limit(category: str) -> float:
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)', (category, amount))
+        row = conn.execute(
+            'SELECT amount FROM budget_limits WHERE category = ?', (category,)
+        ).fetchone()
+    return row[0] if row else 0.0
+
+
+def set_budget_limit(category: str, amount: float) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)',
+            (category, amount)
+        )
         conn.commit()
 
-def add_expense(category, amount, date, description, user_id):
+
+def add_expense(category: str, amount: float, date: str,
+                description: str, user_id: str) -> None:
+    # Store only the date portion (YYYY-MM-DD) so strftime queries work reliably
+    date_only = date[:10]
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)',
-                     (category, amount, date, description, user_id))
+        conn.execute(
+            'INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)',
+            (category, amount, date_only, description, user_id)
+        )
         conn.commit()
 
-def get_category_total_spent(category, user_id):
+
+def get_category_total_spent(category: str, user_id: str) -> float:
     current_month = datetime.now().strftime('%Y-%m')
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT SUM(ABS(amount)) FROM budget WHERE category = ? AND amount < 0 AND user_id = ? AND strftime('%Y-%m', date) = ?",
-            (category, user_id, current_month))
-        row = cursor.fetchone()
-    return row[0] if row[0] else 0
+        row = conn.execute(
+            """SELECT SUM(ABS(amount))
+               FROM budget
+               WHERE category = ?
+                 AND amount < 0
+                 AND user_id = ?
+                 AND strftime('%Y-%m', date) = ?""",
+            (category, user_id, current_month)
+        ).fetchone()
+    return row[0] if row[0] else 0.0
 
-def get_all_budget_summary(user_id):
+
+def get_all_budget_summary(user_id: str) -> list[tuple]:
     current_month = datetime.now().strftime('%Y-%m')
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT category, SUM(amount) FROM budget WHERE strftime('%Y-%m', date) = ? AND user_id = ? GROUP BY category",
-            (current_month, user_id))
-        rows = cursor.fetchall()
+        rows = conn.execute(
+            """SELECT category, SUM(amount)
+               FROM budget
+               WHERE strftime('%Y-%m', date) = ?
+                 AND user_id = ?
+               GROUP BY category""",
+            (current_month, user_id)
+        ).fetchall()
     return rows
 
-def add_task(quadrant, description):
+
+# ── Task helpers ─────────────────────────────
+
+def add_task(quadrant: str, description: str, user_id: str) -> None:
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT INTO tasks (quadrant, description, created_at, completed) VALUES (?, ?, ?, 0)',
-                     (quadrant, description, datetime.now().isoformat()))
+        conn.execute(
+            'INSERT INTO tasks (quadrant, description, created_at, completed, user_id) VALUES (?, ?, ?, 0, ?)',
+            (quadrant, description, datetime.now().isoformat(), user_id)
+        )
         conn.commit()
 
-def get_active_tasks():
+
+def get_active_tasks(user_id: str) -> list[tuple]:
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, quadrant, description FROM tasks WHERE completed = 0 ORDER BY id ASC')
-        rows = cursor.fetchall()
+        rows = conn.execute(
+            'SELECT id, quadrant, description FROM tasks WHERE completed = 0 AND user_id = ? ORDER BY id ASC',
+            (user_id,)
+        ).fetchall()
     return rows
 
-def mark_task_completed(task_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('UPDATE tasks SET completed = 1 WHERE id = ?', (task_id,))
-        changes = cursor.rowcount
-        conn.commit()
-    return changes > 0
 
-def get_tasks_completion_stats():
+def mark_task_completed(task_id: int, user_id: str) -> bool:
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT SUM(completed), COUNT(*) FROM tasks')
-        row = cursor.fetchone()
+        cursor = conn.execute(
+            'UPDATE tasks SET completed = 1 WHERE id = ? AND user_id = ? AND completed = 0',
+            (task_id, user_id)
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_tasks_completion_stats(user_id: str) -> tuple[int, int]:
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute(
+            'SELECT SUM(completed), COUNT(*) FROM tasks WHERE user_id = ?',
+            (user_id,)
+        ).fetchone()
     completed = row[0] if row[0] else 0
-    total = row[1] if row[1] else 0
+    total     = row[1] if row[1] else 0
     return completed, total
+
+
+# ─────────────────────────────────────────────
+# Google Calendar
+# ─────────────────────────────────────────────
 
 def get_calendar_service():
     if not GOOGLE_CREDENTIALS:
         return None
     try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds_dict  = json.loads(GOOGLE_CREDENTIALS)
         credentials = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=['https://www.googleapis.com/auth/calendar'])
+            creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
+        )
         return build('calendar', 'v3', credentials=credentials)
-    except Exception as e:
-        print(f'Calendar service error: {e}')
+    except Exception:
+        logger.exception('Failed to build calendar service')
         return None
 
-def process_calendar_ai(title, start_time_iso, location):
+
+def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -> str:
     service = get_calendar_service()
     if not service:
         return 'שגיאת התחברות ליומן גוגל (בדוק Credentials).'
-    start_time = datetime.fromisoformat(start_time_iso)
+    try:
+        start_time = datetime.fromisoformat(start_time_iso)
+    except ValueError:
+        return f'תאריך לא תקין: {start_time_iso}'
     end_time = start_time + timedelta(hours=1)
-    event = {
+    event: dict = {
         'summary': title,
         'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-        'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
+        'end':   {'dateTime': end_time.isoformat(),   'timeZone': 'Asia/Jerusalem'},
     }
     if location:
         event['location'] = location
     try:
         created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        link = created.get('htmlLink', 'לא זמין')
-        return f'האירוע נוצר בהצלחה!\nכותרת: {title}\nזמן: {start_time.strftime("%d/%m/%Y %H:%M")}\nקישור: {link}'
-    except Exception as e:
-        print(f'Calendar error: {e}')
-        return 'שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם הבוט.'
+        link    = created.get('htmlLink', 'לא זמין')
+        return (
+            f'האירוע נוצר בהצלחה! 📅\n'
+            f'כותרת: {title}\n'
+            f'זמן: {start_time.strftime("%d/%m/%Y %H:%M")}\n'
+            f'קישור: {link}'
+        )
+    except Exception:
+        logger.exception('Calendar insert failed')
+        return 'שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם חשבון השירות.'
 
-def analyze_with_ai(text):
+
+# ─────────────────────────────────────────────
+# AI — Gemini
+# ─────────────────────────────────────────────
+
+_GEMINI_MODEL = 'gemini-2.0-flash'
+
+def analyze_with_ai(text: str) -> dict:
+    """Parse a free-form Hebrew message into a structured action dict."""
     if not GEMINI_API_KEY:
         return {'action': 'unknown', 'reply': 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'}
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -187,1037 +315,424 @@ def analyze_with_ai(text):
 
 נתח את המשפט הבא: "{text}"
 
-החזר אך ורק אובייקט JSON טהור ללא טקסט נוסף. התבניות האפשריות:
+החזר אך ורק אובייקט JSON טהור ללא טקסט נוסף, ללא בקשת json וללא ```.
+
+התבניות האפשריות:
 
 1. {{"action": "expense", "amount": 100, "category": "מזון", "description": "תיאור"}}
-   קטגוריות: דיור, רכב, נופש, מזון, בריאות, חינוך, בילויים, קניות, הכנסה
+   קטגוריות חוקיות בלבד: דיור, רכב, נופש, מזון, בריאות, חינוך, בילויים, קניות, הכנסה
 
 2. {{"action": "task", "quadrant": "חשוב דחוף", "description": "מה לעשות"}}
-   ערכי quadrant: חשוב דחוף, חשוב לא דחוף, דחוף לא חשוב, לא דחוף לא חשוב
+   ערכי quadrant חוקיים בלבד: חשוב דחוף, חשוב לא דחוף, דחוף לא חשוב, לא דחוף לא חשוב
 
 3. {{"action": "calendar", "title": "נושא", "start_time": "2026-06-01T09:00:00", "location": null}}
 
-4. {{"action": "unknown", "reply": "תשובה ידידותית בעברית"}}
+4. {{"action": "unknown", "reply": "תשובה קצרה וידידותית בעברית"}}
 """
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model    = genai.GenerativeModel(_GEMINI_MODEL)
         response = model.generate_content(prompt)
-        res_text = response.text.strip()
-        res_text = re.sub(r'^```(?:json)?\s*', '', res_text)
-        res_text = re.sub(r'\s*```$', '', res_text).strip()
-        try:
-            return json.loads(res_text)
-        except json.JSONDecodeError:
-            print(f'Failed to parse AI JSON: {res_text}')
-            return {'action': 'unknown', 'reply': 'סליחה, לא הצלחתי להבין. נסח אחרת?'}
-    except Exception as e:
-        print(f'Gemini API Error: {e}')
-        return {'action': 'unknown', 'reply': f'עומס על שרתי AI: {str(e)[:50]}...'}
+        raw      = response.text.strip()
+        # Strip any accidental markdown fences
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw).strip()
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning('AI returned non-JSON: %s', raw[:200])
+        return {'action': 'unknown', 'reply': 'סליחה, לא הצלחתי להבין. נסח אחרת?'}
+    except Exception:
+        logger.exception('Gemini API error')
+        return {'action': 'unknown', 'reply': 'שגיאה זמנית בשרתי AI. נסה שוב עוד רגע.'}
 
-def send_whatsapp_message(to, message):
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        return {'ok': False}
-    url = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
-    headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}', 'Content-Type': 'application/json'}
-    data = {'messaging_product': 'whatsapp', 'to': to, 'type': 'text', 'text': {'body': message}}
+
+def describe_media_with_ai(media_type: str, mime_type: str, media_data: bytes | None,
+                            caption: str) -> str:
+    """Use Gemini to describe/transcribe non-text media content."""
+    if not GEMINI_API_KEY:
+        return 'שלח הודעת טקסט כדי שאוכל לעזור לך 😊'
+
     try:
-        http_requests.post(url, headers=headers, json=data, timeout=10)
-        return {'ok': True}
-    except Exception as e:
-        print(f'WhatsApp send error to {to}: {e}')
-        return {'ok': False}
+        model = genai.GenerativeModel(_GEMINI_MODEL)
 
-def verify_meta_signature(raw_body, signature_header):
+        if media_type == 'image' and media_data:
+            image_part = {'mime_type': mime_type, 'data': base64.b64encode(media_data).decode()}
+            prompt_parts = [
+                image_part,
+                'תאר את התמונה הזו בעברית בקצרה. אם יש בה טקסט, ציין אותו. היה ממוקד ומועיל.'
+            ]
+            if caption:
+                prompt_parts.append(f'הערת המשתמש: {caption}')
+            response = model.generate_content(prompt_parts)
+            return f'📷 *תיאור התמונה:*\n{response.text.strip()}'
+
+        if media_type == 'audio':
+            return (
+                '🎤 קיבלתי הודעה קולית, אך עדיין לא מסוגל לתמלל שמע.\n'
+                'שלח את ההודעה כטקסט ואשמח לעזור!'
+            )
+
+        if media_type == 'document':
+            doc_name = caption or 'מסמך'
+            return (
+                f'📄 קיבלתי מסמך: *{doc_name}*\n'
+                'כרגע אני לא יכול לקרוא קבצים מצורפים.\n'
+                'אם תרצה עזרה עם תוכנו — העתק את הטקסט ושלח אותו ישירות.'
+            )
+
+    except Exception:
+        logger.exception('Media description failed')
+
+    return 'לא הצלחתי לעבד את הקובץ. שלח הודעת טקסט ואעזור לך 😊'
+
+
+# ─────────────────────────────────────────────
+# WhatsApp API
+# ─────────────────────────────────────────────
+
+def send_whatsapp_message(to: str, message: str) -> bool:
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        logger.error('WhatsApp credentials not configured')
+        return False
+    url     = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
+    headers = {
+        'Authorization': f'Bearer {WHATSAPP_TOKEN}',
+        'Content-Type':  'application/json',
+    }
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to':                to,
+        'type':              'text',
+        'text':              {'body': message},
+    }
+    try:
+        resp = http_requests.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception:
+        logger.exception('Failed to send WhatsApp message to %s', to)
+        return False
+
+
+def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
+    """Download media bytes from WhatsApp. Returns (data, mime_type)."""
+    if not WHATSAPP_TOKEN:
+        return None, ''
+    headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}'}
+    try:
+        # Step 1: get media URL
+        meta = http_requests.get(
+            f'https://graph.facebook.com/v19.0/{media_id}',
+            headers=headers, timeout=10
+        )
+        meta.raise_for_status()
+        meta_json = meta.json()
+        media_url  = meta_json.get('url', '')
+        mime_type  = meta_json.get('mime_type', 'application/octet-stream')
+        if not media_url:
+            return None, mime_type
+        # Step 2: download actual bytes
+        media_resp = http_requests.get(media_url, headers=headers, timeout=30)
+        media_resp.raise_for_status()
+        return media_resp.content, mime_type
+    except Exception:
+        logger.exception('Failed to download media %s', media_id)
+        return None, ''
+
+
+# ─────────────────────────────────────────────
+# Security
+# ─────────────────────────────────────────────
+
+def verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool:
     if not APP_SECRET or not signature_header:
         return False
-    mac = hmac.HMAC(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256)
+    mac      = hmac.new(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256)
     expected = 'sha256=' + mac.hexdigest()
     return hmac.compare_digest(expected, signature_header)
 
-@app.route('/webhook', methods=['GET'])
-def verify_webhook():
-    if (request.args.get('hub.mode') == 'subscribe' and
-            request.args.get('hub.verify_token') == VERIFY_TOKEN):
-        return request.args.get('hub.challenge'), 200
-    return 'Forbidden', 403
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    raw_body = request.get_data()
-    signature = request.headers.get('X-Hub-Signature-256')
-    if APP_SECRET and not verify_meta_signature(raw_body, signature):
-        return jsonify({'error': 'invalid signature'}), 403
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({'status': 'ignored'}), 200
-    try:
-        value = data.get('entry', [])[0].get('changes', [])[0].get('value', {})
-        if 'messages' not in value:
-            return jsonify({'status': 'ignored'}), 200
-        message = value['messages'][0]
-        from_number = message.get('from')
-        text = message.get('text', {}).get('body', '') if message.get('type') == 'text' else ''
-        if text:
-            response = process_message(text, from_number)
-            send_whatsapp_message(from_number, response)
-        return jsonify({'status': 'ok'}), 200
-    except Exception as e:
-        print(f'Webhook Error: {e}')
-        return jsonify({'status': 'error'}), 500
+# ─────────────────────────────────────────────
+# Message Processing
+# ─────────────────────────────────────────────
 
-def process_message(text, user_id):
+def process_message(text: str, user_id: str) -> str:
     text = text.strip()
 
+    # ── Multi-step context flow ──────────────
     context = get_user_context(user_id)
     if context:
-        if text in ['ביטול', 'בטל']:
+        if text in ('ביטול', 'בטל'):
             delete_user_context(user_id)
-            return 'הפעולה בוטלה. אפשר להתחיל מחדש.'
+            return 'הפעולה בוטלה ✅'
+
         if context['type'] == 'complete_task':
             match = re.search(r'(\d+)', text)
             if not match:
                 return 'שלח רק את המספר של המשימה שסיימת (או "ביטול").'
-            success = mark_task_completed(int(match.group(1)))
-            if success:
+            task_id = int(match.group(1))
+            if mark_task_completed(task_id, user_id):
                 delete_user_context(user_id)
-                return f'מעולה! משימה {match.group(1)} סומנה כהושלמה.'
-            return 'לא מצאתי משימה פתוחה עם המספר הזה.'
+                return f'מעולה! 🎉 משימה {task_id} סומנה כהושלמה.'
+            return 'לא מצאתי משימה פתוחה עם המספר הזה. נסה שוב (או "ביטול").'
 
-    if text in ['ביטול', 'בטל']:
+    if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
-    limit_match = re.search(r'הגדר\s*תקציב\s*([א-ת]+)\s*(\d+)', text)
+    # ── Quick commands ───────────────────────
+
+    # Set budget limit: "הגדר תקציב מזון 3000"
+    limit_match = re.search(r'הגדר\s*תקציב\s*([א-ת\s]+?)\s+(\d+)', text)
     if limit_match:
-        cat, amt = limit_match.group(1), int(limit_match.group(2))
+        cat = limit_match.group(1).strip()
+        amt = int(limit_match.group(2))
         if cat in BUDGET_CATEGORIES_HE:
             set_budget_limit(cat, amt)
-            return f'תקרת התקציב לקטגוריית {cat} עודכנה ל-{amt} ש"ח.'
-        return f'לא מצאתי קטגוריה בשם "{cat}".'
+            return f'✅ תקרת התקציב לקטגוריית *{cat}* עודכנה ל-{amt:,} ש"ח.'
+        return f'לא מצאתי קטגוריה בשם "{cat}".\nקטגוריות: {", ".join(BUDGET_CATEGORIES_HE)}'
 
+    # Complete task flow
     if re.search(r'(סיימתי|בוצע|הושלם)\s*(משימה)?', text):
-        active_tasks = get_active_tasks()
+        active_tasks = get_active_tasks(user_id)
         if not active_tasks:
-            return 'אין משימות פתוחות לסיים!'
-        msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
+            return 'אין משימות פתוחות לסיים! 🎉'
+        msg = '*איזו משימה סיימת? (שלח מספר)*\n\n'
         for task_id, quad, desc in active_tasks:
-            truncated = desc[:40] + ('...' if len(desc) > 40 else '')
-            msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {truncated}\n'
+            preview = desc[:40] + ('…' if len(desc) > 40 else '')
+            msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
         set_user_context(user_id, {'type': 'complete_task'})
         return msg
 
-    if 'סטטוס משימות' in text or 'רשימת משימות' in text:
-        return get_task_status()
-    if 'סטטוס כלכלי' in text or 'מאזן' in text or 'תקציב' in text:
+    if any(kw in text for kw in ('סטטוס משימות', 'רשימת משימות')):
+        return get_task_status(user_id)
+    if any(kw in text for kw in ('סטטוס כלכלי', 'מאזן', 'תקציב')):
         return get_detailed_budget(user_id)
-    if 'עזרה' in text or 'תפריט' in text:
+    if any(kw in text for kw in ('עזרה', 'תפריט')):
         return get_help_menu()
 
+    # ── AI routing ───────────────────────────
     ai_result = analyze_with_ai(text)
-    if not ai_result:
-        return 'המוח של סחבק לא הצליח לנתח את ההודעה. נסה שוב.'
 
     action = ai_result.get('action')
 
     if action == 'expense':
-        amt = ai_result.get('amount', 0)
-        cat = ai_result.get('category', '')
-        desc = ai_result.get('description', text)
+        amt  = float(ai_result.get('amount', 0))
+        cat  = ai_result.get('category', '')
+        desc = ai_result.get('description') or text
         if cat not in BUDGET_CATEGORIES_HE:
-            return f'קטגוריה לא חוקית ({cat}).'
-        add_expense(cat, -amt if cat != 'הכנסה' else amt, datetime.now().isoformat(), desc, user_id)
-        limit_txt = ''
-        if cat != 'הכנסה' and get_budget_limit(cat) > 0:
-            rem = get_budget_limit(cat) - get_category_total_spent(cat, user_id)
-            limit_txt = f'\nחרגת ב-{abs(rem)} ש"ח!' if rem < 0 else f'\nנותרו {rem} ש"ח (החודש)'
-        return f'נרשם!\n{BUDGET_CATEGORIES_HE.get(cat, "💵")} {cat}: {amt} ש"ח{limit_txt}'
+            return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(BUDGET_CATEGORIES_HE)}'
+        signed_amt = amt if cat == 'הכנסה' else -amt
+        add_expense(cat, signed_amt, datetime.now().isoformat(), desc, user_id)
+        alert = ''
+        if cat != 'הכנסה':
+            limit = get_budget_limit(cat)
+            if limit > 0:
+                spent = get_category_total_spent(cat, user_id)
+                rem   = limit - spent
+                alert = f'\n⚠️ חרגת ב-{abs(rem):,.0f} ש"ח!' if rem < 0 else f'\nנותרו {rem:,.0f} ש"ח החודש'
+        return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}*: {amt:,.0f} ש"ח{alert}'
 
-    elif action == 'task':
+    if action == 'task':
         quad = ai_result.get('quadrant', '')
-        desc = ai_result.get('description', text)
+        desc = ai_result.get('description') or text
         if quad not in TASK_QUADRANTS_EMOJI:
-            return f'סוג משימה לא חוקי ({quad}).'
-        add_task(quad, desc)
-        return f'משימה נוספה!\n{TASK_QUADRANTS_EMOJI[quad]} {quad}\n{desc}'
+            return f'סוג משימה לא חוקי: "{quad}".'
+        add_task(quad, desc, user_id)
+        return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
 
-    elif action == 'calendar':
-        title = ai_result.get('title', 'אירוע')
+    if action == 'calendar':
+        title          = ai_result.get('title') or 'אירוע'
         start_time_iso = ai_result.get('start_time')
         if not start_time_iso:
-            return 'חסר תאריך ושעה.'
+            return 'חסר תאריך ושעה לאירוע.'
         return process_calendar_ai(title, start_time_iso, ai_result.get('location'))
 
-    elif action == 'unknown':
-        return ai_result.get('reply', 'לא הבנתי. אפשר לנסח אחרת?')
-    else:
-        return get_welcome_message()
+    if action == 'unknown':
+        return ai_result.get('reply') or 'לא הבנתי. כתוב "תפריט" לרשימת הפקודות.'
 
-def get_task_status():
-    completed, total = get_tasks_completion_stats()
-    active_tasks = get_active_tasks()
+    # Fallback — should never reach here if AI behaves
+    logger.warning('Unexpected AI action "%s" for user %s', action, user_id)
+    return 'לא הצלחתי לעבד את הבקשה. נסה לנסח אחרת, או כתוב "תפריט".'
+
+
+def process_media_message(message: dict, user_id: str) -> str:
+    """Handle non-text message types (image, audio, document)."""
+    msg_type = message.get('type', '')
+    media_obj = message.get(msg_type, {})
+    media_id  = media_obj.get('id', '')
+    caption   = media_obj.get('caption', '') or ''
+
+    media_data, mime_type = None, ''
+    if msg_type == 'image' and media_id:
+        media_data, mime_type = download_whatsapp_media(media_id)
+
+    return describe_media_with_ai(msg_type, mime_type, media_data, caption)
+
+
+# ─────────────────────────────────────────────
+# Response Builders
+# ─────────────────────────────────────────────
+
+def get_task_status(user_id: str) -> str:
+    completed, total = get_tasks_completion_stats(user_id)
+    active_tasks     = get_active_tasks(user_id)
     if not active_tasks:
-        return f'אין משימות פתוחות.\n{completed}/{total} משימות הושלמו.'
-    status = '*משימות פתוחות*\n\n'
-    grouped = {q: [] for q in TASK_QUADRANTS_EMOJI.keys()}
+        return f'אין משימות פתוחות 🎉\n{completed}/{total} משימות הושלמו.'
+    grouped: dict[str, list] = {q: [] for q in TASK_QUADRANTS_EMOJI}
     for tid, quad, desc in active_tasks:
-        grouped[quad].append((tid, desc))
+        grouped.setdefault(quad, []).append((tid, desc))
+    status = '*משימות פתוחות*\n\n'
     for quad, emoji in TASK_QUADRANTS_EMOJI.items():
-        if grouped[quad]:
+        if grouped.get(quad):
             status += f'{emoji} *{quad}*\n'
             for tid, desc in grouped[quad]:
-                truncated = desc[:50] + ('...' if len(desc) > 50 else '')
-                status += f'  [{tid}]: {truncated}\n'
+                preview = desc[:50] + ('…' if len(desc) > 50 else '')
+                status += f'  [{tid}] {preview}\n'
             status += '\n'
-    return status + '(לסיום: "סיימתי משימה")'
+    status += f'סה"כ: {len(active_tasks)} פתוחות | {completed}/{total} הושלמו\n'
+    status += '(לסיום: שלח "סיימתי משימה")'
+    return status
 
-def get_detailed_budget(user_id):
+
+def get_detailed_budget(user_id: str) -> str:
     summary = get_all_budget_summary(user_id)
     if not summary:
         return 'אין רשומות לחודש הנוכחי.'
-    report = f'*סטטוס כלכלי ({datetime.now().strftime("%m/%Y")})*\n\n'
-    total_inc, total_exp = 0, 0
+    month   = datetime.now().strftime('%m/%Y')
+    report  = f'*סטטוס כלכלי — {month}*\n\n'
+    total_inc, total_exp = 0.0, 0.0
+
     for cat, total in summary:
         emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
         if cat == 'הכנסה':
             total_inc += total
-            report += f'{emoji} *{cat}*: +{total} ש"ח\n'
+            report += f'{emoji} *{cat}*: +{total:,.0f} ש"ח\n\n'
         else:
-            total_exp += abs(total)
+            spent = abs(total)
+            total_exp += spent
             limit = get_budget_limit(cat)
             if limit > 0:
-                perc = min((abs(total) / limit) * 100, 100)
+                perc   = min((spent / limit) * 100, 100)
                 filled = min(int(perc / 10), 10)
-                bar = ('█' * filled) + ('░' * (10 - filled))
-                report += f'{emoji} *{cat}*: {abs(total)}/{int(limit)}\n{bar} {int(perc)}%\n\n'
+                bar    = '█' * filled + '░' * (10 - filled)
+                over   = ' ⚠️' if spent > limit else ''
+                report += f'{emoji} *{cat}*: {spent:,.0f}/{limit:,.0f} ש"ח{over}\n{bar} {int(perc)}%\n\n'
             else:
-                report += f'{emoji} *{cat}*: {abs(total)} ש"ח\n\n'
+                report += f'{emoji} *{cat}*: {spent:,.0f} ש"ח\n\n'
+
     bal = total_inc - total_exp
-    report += f'━━━━━━━━━━━━━━━\n💵 הכנסות: {total_inc}\n💸 הוצאות: {total_exp}\n━━━━━━━━━━━━━━━\n'
-    report += f'*מאזן*: +{bal}' if bal >= 0 else f'*גרעון*: {bal}'
+    report += '━━━━━━━━━━━━━━━\n'
+    report += f'💰 הכנסות: {total_inc:,.0f} ש"ח\n'
+    report += f'💸 הוצאות: {total_exp:,.0f} ש"ח\n'
+    report += '━━━━━━━━━━━━━━━\n'
+    if bal >= 0:
+        report += f'✅ *מאזן חיובי*: +{bal:,.0f} ש"ח'
+    else:
+        report += f'⚠️ *גרעון*: {abs(bal):,.0f} ש"ח'
     return report
 
-def get_welcome_message():
+
+def get_welcome_message() -> str:
     return (
-        'אהלן! אני *סחבק* - העוזר האישי שלך\n\n'
+        'אהלן! אני *סחבק* — העוזר האישי שלך 🤖\n\n'
         'פשוט כתוב לי בחופשי:\n\n'
-        '*יומן:* "תקבע לי פגישה עם דני מחר ב-8"\n'
-        '*משימות:* "שים לי משימה דחופה לקנות חלב"\n'
-        '*תקציב:* "אכלתי המבורגר ב-70 שקל"\n\n'
+        '📅 *יומן:* "תקבע לי פגישה עם דני מחר ב-8"\n'
+        '✅ *משימות:* "שים לי משימה דחופה לקנות חלב"\n'
+        '💵 *תקציב:* "אכלתי המבורגר ב-70 שקל"\n\n'
         'לדוחות ועזרה שלח *"תפריט"*'
     )
 
-def get_help_menu():
+
+def get_help_menu() -> str:
     return (
-        '*תפריט עזרה - סחבק*\n\n'
+        '*תפריט עזרה — סחבק* 🤖\n\n'
         '*פקודות מהירות:*\n'
-        '"סטטוס משימות"\n'
-        '"סיימתי משימה"\n'
-        '"סטטוס כלכלי"\n'
-        '"הגדר תקציב [קטגוריה] [סכום]"\n\n'
-        'אני כאן לעשות לך סדר!'
+        '• "סטטוס משימות"\n'
+        '• "סיימתי משימה"\n'
+        '• "סטטוס כלכלי"\n'
+        '• "הגדר תקציב [קטגוריה] [סכום]"\n\n'
+        '*קטגוריות תקציב:*\n'
+        + '  '.join(f'{e} {c}' for c, e in BUDGET_CATEGORIES_HE.items()) +
+        '\n\nאני כאן לעשות לך סדר! 💪'
     )
 
-if __name__ == '__main__':
-    flask_debug = os.getenv('FLASK_DEBUG', 'False').lower() in ['true', '1']
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=flask_debug)
 
-import re
-import requests as http_requests
-from datetime import datetime, timedelta
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import google.generativeai as genai
-import hmac
-import hashlib
-import sqlite3
-
-app = Flask(__name__)
-
-# Environment variables
-VERIFY_TOKEN = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
-WHATSAPP_TOKEN = os.getenv('WHATSAPP_TOKEN')
-PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
-GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
-APP_SECRET = os.getenv('APP_SECRET')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-
-# DB File (Volume in Railway)
-DB_FILE = '/app/data/sahbak.db'
-
-# Configure Gemini AI
-if GEMINI_API_KEY:
-genai.configure(api_key=GEMINI_API_KEY)
-
-BUDGET_CATEGORIES = {'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️', 'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚', 'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰'}
-DEFAULT_BUDGET_LIMITS = {'דיור': 5000, 'רכב': 2000, 'נופש': 1500, 'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500, 'בילויים': 800, 'קניות': 1000}
-TASK_QUADRANTS_EMOJI = {'חשוב דחוף': '🔴', 'חשוב לא דחוף': '🟡', 'דחוף לא חשוב': '🟠', 'לא דחוף לא חשוב': '🟢'}
-
-def init_db():
-os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS budget (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, amount REAL, date TEXT, description TEXT, user_id TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, quadrant TEXT, description TEXT, created_at TEXT, completed INTEGER DEFAULT 0)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS contexts (user_id TEXT PRIMARY KEY, context_json TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS budget_limits (category TEXT PRIMARY KEY, amount REAL)''')
-cursor.execute('SELECT COUNT(*) FROM budget_limits')
-if cursor.fetchone()[0] == 0:
-for cat, limit in DEFAULT_BUDGET_LIMITS.items():
-cursor.execute('INSERT INTO budget_limits (category, amount) VALUES (?, ?)', (cat, limit))
-conn.commit()
-conn.close()
-
-init_db()
-
-# --- Database Helpers ---
-def get_user_context(user_id):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('SELECT context_json FROM contexts WHERE user_id = ?', (user_id,))
-row = cursor.fetchone()
-conn.close()
-return json.loads(row[0]) if row else None
-
-def set_user_context(user_id, context):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('INSERT OR REPLACE INTO contexts (user_id, context_json) VALUES (?, ?)', (user_id, json.dumps(context)))
-conn.commit()
-conn.close()
-
-def delete_user_context(user_id):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('DELETE FROM contexts WHERE user_id = ?', (user_id,))
-conn.commit()
-conn.close()
-
-def get_budget_limit(category):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('SELECT amount FROM budget_limits WHERE category = ?', (category,))
-row = cursor.fetchone()
-conn.close()
-return row[0] if row else 0
-
-def set_budget_limit(category, amount):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)', (category, amount))
-conn.commit()
-conn.close()
-
-def add_expense(category, amount, date, description, user_id):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)', (category, amount, date, description, user_id))
-conn.commit()
-conn.close()
-
-def get_category_total_spent(category):
-current_month = datetime.now().strftime('%Y-%m')
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute("SELECT SUM(ABS(amount)) FROM budget WHERE category = ? AND amount < 0 AND strftime('%Y-%m', date) = ?", (category, current_month))
-row = cursor.fetchone()
-conn.close()
-return row[0] if row[0] else 0
-
-def get_all_budget_summary():
-current_month = datetime.now().strftime('%Y-%m')
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute("SELECT category, SUM(amount) FROM budget WHERE strftime('%Y-%m', date) = ? GROUP BY category", (current_month,))
-rows = cursor.fetchall()
-conn.close()
-return rows
-
-def add_task(quadrant, description):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('INSERT INTO tasks (quadrant, description, created_at, completed) VALUES (?, ?, ?, 0)', (quadrant, description, datetime.now().isoformat()))
-conn.commit()
-conn.close()
-
-def get_active_tasks():
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('SELECT id, quadrant, description FROM tasks WHERE completed = 0 ORDER BY id ASC')
-rows = cursor.fetchall()
-conn.close()
-return rows
-
-def mark_task_completed(task_id):
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('UPDATE tasks SET completed = 1 WHERE id = ?', (task_id,))
-changes = cursor.rowcount
-conn.commit()
-conn.close()
-return changes > 0
-
-def get_tasks_completion_stats():
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute('SELECT SUM(completed), COUNT(*) FROM tasks')
-row = cursor.fetchone()
-conn.close()
-completed = row[0] if row[0] else 0
-total = row[1] if row[1] else 0
-return completed, total
-
-# --- Google Calendar ---
-def get_calendar_service():
-if not GOOGLE_CREDENTIALS: return None
-try:
-creds_dict = json.loads(GOOGLE_CREDENTIALS)
-credentials = service_account.Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/calendar'])
-return build('calendar', 'v3', credentials=credentials)
-except Exception as e:
-print(f'Calendar service error: {e}')
-return None
-
-def process_calendar_ai(title, start_time_iso, location):
-service = get_calendar_service()
-if not service: return '❌ שגיאת התחברות ליומן גוגל (בדוק Credentials).'
-
-start_time = datetime.fromisoformat(start_time_iso)
-end_time = start_time + timedelta(hours=1)
-event = {
-'summary': title,
-'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-}
-if location: event['location'] = location
-
-try:
-created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-link = created.get("htmlLink", "לא זמין")
-return f'📅 האירוע נוצר בהצלחה ביומן!\nכותרת: {title}\nזמן: {start_time.strftime("%d/%m/%Y %H:%M")}\nקישור: {link}'
-except Exception as e:
-print(f'Calendar error: {e}')
-return f'❌ שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם הבוט בהגדרות גוגל.'
-
-# --- AI Logic Engine ---
-def analyze_with_ai(text):
-if not GEMINI_API_KEY:
-return {"action": "unknown", "reply": "⚠️ מפתח Gemini חסר. אנא הגדר GEMINI_API_KEY ב-Railway."}
-
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-prompt = f"""
-אתה עוזר אישי חכם בוואטסאפ שנקרא "סחבק". תפקידך לנתח משפטים חופשיים של משתמש ולהמיר אותם לפעולות במערכת.
-תאריך ושעה נוכחיים: {now_str} (השתמש בזה כדי לחשב זמנים מופשטים כמו "מחר", "בעוד יומיים", או "ביום שלישי").
-
-נתח את המשפט הבא בדיוק רב: "{text}"
-
-החזר *אך ורק* אובייקט JSON טהור (ללא טקסט מקדים וללא תגיות מיוחדות של קוד). ה-JSON חייב להתאים לאחת מ-4 התבניות הבאות:
-
-1. הוצאה או הכנסה כספית:
-{{"action": "expense", "amount": 100, "category": "מזון", "description": "תיאור קצר של מה שנקנה"}}
-* קטגוריות מותרות בלבד (מצא את המתאימה ביותר): דיור, רכב, נופש, מזון, בריאות, חינוך, בילויים, קניות, הכנסה.
-
-2. הוספת משימה חדשה:
-{{"action": "task", "quadrant": "חשוב דחוף", "description": "מה צריך לעשות"}}
-* הערך quadrant חייב להיות אחד מאלה בלבד: חשוב דחוף, חשוב לא דחוף, דחוף לא חשוב, לא דחוף לא חשוב. בחר לפי ההקשר.
-
-3. קביעת פגישה או אירוע ביומן:
-{{"action": "calendar", "title": "נושא הפגישה", "start_time": "2026-06-01T08:00:00", "location": "מיקום אם צוין אחרת null"}}
-* חובה לחשב תאריך ושעה מדויקים ולהחזיר בפורמט ISO 8601. אם המשתמש לא ציין שעה מפורשת, תקבע את הפגישה ל-09:00 בבוקר.
-
-4. לא מובן / חסר מידע מהותי / שיחת חולין (למשל סתם "היי"):
-{{"action": "unknown", "reply": "תשובה ידידותית וקצרה בעברית שאומרת שאתה סחבק ואיך אפשר לעזור"}}
-"""
-try:
-# שינוי חשוב כאן: עברנו למודל היציב והאוניברסלי ביותר של גוגל (gemini-pro)
-model = genai.GenerativeModel('gemini-pro')
-response = model.generate_content(prompt)
-res_text = response.text.strip()
-
-# טריק קוד כדי לנקות שאריות Markdown מבלי לשבור את התצוגה כאן
-triple_tick = "`" * 3
-if res_text.startswith(triple_tick + "json"):
-res_text = res_text[7:-3].strip()
-elif res_text.startswith(triple_tick):
-res_text = res_text[3:-3].strip()
-if res_text.endswith(triple_tick):
-res_text = res_text[:-3].strip()
-
-try:
-return json.loads(res_text)
-except json.JSONDecodeError:
-print(f"Failed to parse AI response as JSON: {res_text}")
-return {"action": "unknown", "reply": "סליחה, המוח שלי קצת התבלבל בפיענוח. אפשר לנסח את זה קצת אחרת? 😅"}
-
-except Exception as e:
-print(f"Gemini API Error: {e}")
-return {"action": "unknown", "reply": f"⚠️ יש כרגע עומס על שרתי הבינה המלאכותית: {str(e)[:50]}..."}
-
-# --- WhatsApp Handlers ---
-def send_whatsapp_message(to, message):
-if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID: return {'ok': False}
-url = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
-headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}', 'Content-Type': 'application/json'}
-data = {'messaging_product': 'whatsapp', 'to': to, 'type': 'text', 'text': {'body': message}}
-try:
-http_requests.post(url, headers=headers, json=data, timeout=10)
-return {'ok': True}
-except Exception as e:
-return {'ok': False}
-
-def verify_meta_signature(raw_body, signature_header):
-if not APP_SECRET or not signature_header: return False
-expected = 'sha256=' + hmac.new(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-return hmac.compare_digest(expected, signature_header)
+# ─────────────────────────────────────────────
+# Webhook Routes
+# ─────────────────────────────────────────────
 
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
-if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
-return request.args.get('hub.challenge'), 200
-return 'Forbidden', 403
+    mode      = request.args.get('hub.mode')
+    token     = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    if mode == 'subscribe' and token == VERIFY_TOKEN and challenge:
+        logger.info('Webhook verified successfully')
+        return challenge, 200
+    logger.warning('Webhook verification failed (bad token or mode)')
+    return 'Forbidden', 403
+
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-raw_body = request.get_data()
-signature = request.headers.get('X-Hub-Signature-256')
-if APP_SECRET and not verify_meta_signature(raw_body, signature):
-return jsonify({'error': 'invalid signature'}), 403
-data = request.get_json(silent=True)
-if not data: return jsonify({'status': 'ignored'}), 200
-try:
-value = data.get('entry', [])[0].get('changes', [])[0].get('value', {})
-if 'messages' not in value: return jsonify({'status': 'ignored'}), 200
-message = value['messages'][0]
-from_number = message.get('from')
-text = message.get('text', {}).get('body', '') if message.get('type') == 'text' else ''
-if text:
-response = process_message(text, from_number)
-send_whatsapp_message(from_number, response)
-return jsonify({'status': 'ok'}), 200
-except Exception as e:
-print(f'Webhook Error: {e}')
-return jsonify({'status': 'error'}), 500
+    raw_body  = request.get_data()
+    signature = request.headers.get('X-Hub-Signature-256')
 
-# --- Main Processor ---
-def process_message(text, user_id):
-text = text.strip()
+    if APP_SECRET and not verify_meta_signature(raw_body, signature):
+        logger.warning('Invalid webhook signature — request rejected')
+        return jsonify({'error': 'invalid signature'}), 403
 
-# 1. State Machine Context (Wizard fallback)
-context = get_user_context(user_id)
-if context:
-if text in ['ביטול', 'בטל']:
-delete_user_context(user_id)
-return 'הפעולה בוטלה. אפשר להתחיל מחדש 🙂'
-if context['type'] == 'complete_task':
-match = re.search(r'(\d+)', text)
-if not match: return '❌ שלח רק את **המספר** של המשימה שסיימת (או "ביטול").'
-success = mark_task_completed(int(match.group(1)))
-if success:
-delete_user_context(user_id)
-return f'🎉 מעולה! משימה {match.group(1)} סומנה כהושלמה.'
-return '❌ לא מצאתי משימה פתוחה עם המספר הזה.'
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'status': 'ignored'}), 200
 
-# 2. Hardcoded System Commands
-if text in ['ביטול', 'בטל']: return 'אין פעולה פתוחה לביטול.'
+    try:
+        changes = data.get('entry', [{}])[0].get('changes', [{}])[0]
+        value   = changes.get('value', {})
+        if 'messages' not in value:
+            return jsonify({'status': 'ignored'}), 200
 
-limit_match = re.search(r'הגדר\s*תקציב\s*([א-ת]+)\s*(\d+)', text)
-if limit_match:
-cat, amt = limit_match.group(1), int(limit_match.group(2))
-if cat in BUDGET_CATEGORIES:
-set_budget_limit(cat, amt)
-return f'✅ תקרת התקציב לקטגוריית {cat} עודכנה ל-{amt} ש"ח.'
-return f'❌ לא מצאתי קטגוריה בשם "{cat}".'
+        message     = value['messages'][0]
+        from_number = message.get('from', '')
+        msg_type    = message.get('type', '')
 
-if re.search(r'(סיימתי|בוצע|הושלם)\s*(משימה)?', text):
-active_tasks = get_active_tasks()
-if not active_tasks: return '📝 אין משימות פתוחות לסיים!'
-msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
-for task_id, quad, desc in active_tasks:
-msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {desc[:40]}...\n'
-set_user_context(user_id, {'type': 'complete_task'})
-return msg
+        if not from_number:
+            return jsonify({'status': 'ignored'}), 200
 
-if 'סטטוס משימות' in text or 'רשימת משימות' in text: return get_task_status()
-if 'סטטוס כלכלי' in text or 'מאזן' in text or 'תקציב' in text: return get_detailed_budget()
-if 'עזרה' in text or 'תפריט' in text: return get_help_menu()
+        if msg_type == 'text':
+            text     = message.get('text', {}).get('body', '').strip()
+            response = process_message(text, from_number) if text else get_welcome_message()
+        elif msg_type in MEDIA_TYPES:
+            response = process_media_message(message, from_number)
+        else:
+            response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, או קובץ.'
 
-# 3. AI Magic - The Brain!
-ai_result = analyze_with_ai(text)
-if not ai_result:
-return "❌ המוח של סחבק לא הצליח לנתח את ההודעה. נסה שוב."
+        send_whatsapp_message(from_number, response)
+        return jsonify({'status': 'ok'}), 200
 
-action = ai_result.get("action")
+    except (IndexError, KeyError) as exc:
+        logger.warning('Malformed webhook payload: %s', exc)
+        return jsonify({'status': 'ignored'}), 200
+    except Exception:
+        logger.exception('Unhandled webhook error')
+        return jsonify({'status': 'error'}), 500
 
-if action == "expense":
-amt = ai_result.get("amount", 0)
-cat = ai_result.get("category", "")
-desc = ai_result.get("description", text)
-if cat not in BUDGET_CATEGORIES: return f"❌ קטגוריה לא חוקית ({cat})."
-add_expense(cat, -amt if cat != 'הכנסה' else amt, datetime.now().isoformat(), desc, user_id)
-limit_txt = ""
-if cat != 'הכנסה' and get_budget_limit(cat) > 0:
-rem = get_budget_limit(cat) - get_category_total_spent(cat)
-limit_txt = f'\n⚠️ חרגת ב-{abs(rem)}!' if rem < 0 else f'\nנותרו {rem} ש"ח (החודש)'
-return f'✅ נרשם!\n{BUDGET_CATEGORIES.get(cat, "💵")} {cat}: {amt} ש"ח{limit_txt}'
 
-elif action == "task":
-quad = ai_result.get("quadrant", "")
-desc = ai_result.get("description", text)
-if quad not in TASK_QUADRANTS_EMOJI: return f"❌ סוג משימה לא חוקי ({quad})."
-add_task(quad, desc)
-return f'✅ משימה נוספה\n{TASK_QUADRANTS_EMOJI[quad]} {quad}\n{desc}'
+@app.route('/health', methods=['GET'])
+def health():
+    """Simple health-check endpoint for Railway / uptime monitors."""
+    return jsonify({
+        'status':    'ok',
+        'timestamp': datetime.now().isoformat(),
+        'gemini':    bool(GEMINI_API_KEY),
+        'whatsapp':  bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
+        'calendar':  bool(GOOGLE_CREDENTIALS),
+    }), 200
 
-elif action == "calendar":
-title = ai_result.get("title", "אירוע מסחבק")
-start_time_iso = ai_result.get("start_time")
-if not start_time_iso: return "❌ חסר תאריך ושעה."
-return process_calendar_ai(title, start_time_iso, ai_result.get("location"))
 
-elif action == "unknown":
-return ai_result.get("reply", "לא כל כך הבנתי. אפשר לנסח אחרת? 😅")
-else:
-return get_welcome_message()
-
-def get_task_status():
-completed, total = get_tasks_completion_stats()
-active_tasks = get_active_tasks()
-if not active_tasks: return f'📝 אין משימות פתוחות.\n✅ {completed}/{total} משימות הושלמו.'
-status = '*📋 משימות פתוחות*\n\n'
-grouped = {q: [] for q in TASK_QUADRANTS_EMOJI.keys()}
-for tid, quad, desc in active_tasks: grouped[quad].append((tid, desc))
-for quad, emoji in TASK_QUADRANTS_EMOJI.items():
-if grouped[quad]:
-status += f'{emoji} *{quad}*\n'
-for tid, desc in grouped[quad]: status += f' • [{tid}]: {desc[:50]}\n'
-status += '\n'
-return status + f'(לסיום: "סיימתי משימה")'
-
-def get_detailed_budget():
-summary = get_all_budget_summary()
-if not summary: return '💰 אין רשומות לחודש הנוכחי.'
-report = f'*💰 סטטוס כלכלי (חודש {datetime.now().strftime("%m/%Y")})*\n\n'
-total_inc, total_exp = 0, 0
-for cat, total in summary:
-emoji = BUDGET_CATEGORIES.get(cat, '💵')
-if cat == 'הכנסה':
-total_inc += total
-report += f'{emoji} *{cat}*: +{total} ש"ח\n'
-else:
-total_exp += abs(total)
-limit = get_budget_limit(cat)
-if limit > 0:
-perc = min((abs(total) / limit) * 100, 100)
-bar = '█' * min(int(perc / 10), 10) + '░' * (10 - min(int(perc / 10), 10))
-report += f'{emoji} *{cat}*: {abs(total)}/{int(limit)}\n{bar} {int(perc)}%\n\n'
-else:
-report += f'{emoji} *{cat}*: {abs(total)} ש"ח\n\n'
-bal = total_inc - total_exp
-report += f'━━━━━━━━━━━━━━━\n💵 הכנסות: {total_inc}\n💸 הוצאות: {total_exp}\n━━━━━━━━━━━━━━━\n'
-report += f'✅ *מאזן*: +{bal}' if bal >= 0 else f'⚠️ *גרעון*: {bal}'
-return report
-
-def get_welcome_message():
-return (
-'👋 אהלן! אני *סחבק* - העוזר האישי החכם שלך 🤖✨\n\n'
-'איתי אפשר פשוט לדבר חופשי, ממש כמו חבר! הנה כמה דברים שאני מבין:\n\n'
-'📅 *יומן:* "תקבע לי פגישה עם דני מחר ב-8 בבוקר"\n'
-'✅ *משימות:* "שים לי משימה דחופה לקנות חלב"\n'
-'💸 *תקציב:* "אכלתי עכשיו המבורגר ב-70 שקל"\n\n'
-'💡 *טיפ:* לעזרה או צפייה בדוחות (כמו מאזן כלכלי), פשוט שלח לי *"תפריט"*.\n\n'
-'אז... מה עושים היום? 🎯'
-)
-
-def get_help_menu():
-return (
-'🤖 *תפריט עזרה - סחבק*\n'
-'אני מבין שפה חופשית! פשוט תכתוב לי מה שאתה רוצה לעשות.\n\n'
-'*פקודות מהירות שימושיות:* ⚡\n'
-'• 📋 *"סטטוס משימות"*\n'
-'• ✔️ *"סיימתי משימה"*\n'
-'• 💰 *"סטטוס כלכלי"*\n'
-'• ⚙️ *"הגדר תקציב [קטגוריה] [סכום]"*\n\n'
-'אני כאן כדי לעשות לך סדר! 😎'
-)
-
+# ─────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────
 if __name__ == '__main__':
-flask_debug = os.getenv('FLASK_DEBUG', 'False').lower() in ['true', '1']
-app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=flask_debug)
-
-קראתי את הקוד שלך. הוא כתוב טוב! מצאתי מספר בעיות — חלקן קריטיות (יגרמו לשגיאות בריצה) וחלקן שיפורים חשובים.
-
-🔴 באגים קריטיים
-1. hmac.new — לא קיים!
-python
-# ❌ שגוי — אין hmac.new
-expected = 'sha256=' + hmac.new(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-
-# ✅ נכון — צריך hmac.new → hmac.new לא קיים, הפונקציה הנכונה היא:
-expected = 'sha256=' + hmac.new(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-# הנכון:
-expected = 'sha256=' + hmac.HMAC(APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-# או יותר נכון:
-expected = 'sha256=' + hmac.new(  # ← זה לא קיים!
-התיקון:
-
-python
-def verify_meta_signature(raw_body, signature_header):
-    if not APP_SECRET or not signature_header: return False
-    expected = 'sha256=' + hmac.new(
-        APP_SECRET.encode('utf-8'), raw_body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
-hmac.new לא קיים ב-Python! הפונקציה הנכונה היא hmac.new → hmac.new — רגע, בואו נהיה מדויקים:
-
-שגוי	נכון
-hmac.new(...)	hmac.new(...) — לא קיים בפייתון!
-—	hmac.HMAC(key, msg, digestmod)
-—	או hashlib.hmac (Python 3.13+)
-python
-# ✅ הגרסה הנכונה:
-def verify_meta_signature(raw_body, signature_header):
-    if not APP_SECRET or not signature_header: return False
-    mac = hmac.new(APP_SECRET.encode(), raw_body, hashlib.sha256)  # ❌
-    # צריך להיות:
-    mac = hmac.HMAC(APP_SECRET.encode(), raw_body, hashlib.sha256)
-    expected = 'sha256=' + mac.hexdigest()
-    return hmac.compare_digest(expected, signature_header)
-2. מודל gemini-pro — מיושן ומושבת
-python
-# ❌ המודל הזה כבר לא זמין ב-API של גוגל (הושבת בפברואר 2025)
-model = genai.GenerativeModel('gemini-pro')
-
-# ✅ תחליף ל:
-model = genai.GenerativeModel('gemini-1.5-flash')  # מהיר וזול
-# או:
-model = genai.GenerativeModel('gemini-1.5-pro')    # יותר חכם
-3. ניקוי ה-Markdown מ-AI — לוגיקה שבורה
-python
-# ❌ הקוד הנוכחי — לא מנקה נכון
-triple_tick = "`" * 3
-if res_text.startswith(triple_tick + "json"):
-    res_text = res_text[7:-3].strip()   # חותך 7 תווים (```json) אבל לא בודק שורה חדשה
-elif res_text.startswith(triple_tick):
-    res_text = res_text[3:-3].strip()
-if res_text.endswith(triple_tick):      # בדיקה כפולה — כבר טופלה למעלה!
-    res_text = res_text[:-3].strip()
-
-# ✅ הנכון — regex נקי ואמין:
-res_text = re.sub(r'^```(?:json)?\s*', '', res_text)
-res_text = re.sub(r'\s*```$', '', res_text).strip()
-🟡 בעיות חשובות (לא קריסה, אבל באגים)
-4. desc[:40]... — תמיד מוסיף ... גם לטקסט קצר
-python
-# ❌ אם desc קצרה מ-40 תווים, יצא "קנה חלב..."
-msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {desc[:40]}...\n'
-
-# ✅
-msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {desc[:40]}{"..." if len(desc) > 40 else ""}\n'
-5. חסר user_id ב-get_all_budget_summary
-הטבלה budget כוללת user_id, אך הסיכום לא מסנן לפיו — כל המשתמשים רואים נתונים של כולם:
-
-python
-# ❌ מחזיר נתונים של כל המשתמשים
-cursor.execute("SELECT category, SUM(amount) FROM budget WHERE strftime('%Y-%m', date) = ? GROUP BY category", (current_month,))
-
-# ✅ צריך להעביר user_id לפונקציה
-def get_all_budget_summary(user_id):
-    ...
-    cursor.execute(
-        "SELECT category, SUM(amount) FROM budget WHERE strftime('%Y-%m', date) = ? AND user_id = ? GROUP BY category",
-        (current_month, user_id)
-    )
-וגם לעדכן את הקריאה ב-get_detailed_budget(user_id) ולהעביר user_id משרשרת הקריאות.
-
-🟢 שיפורים מומלצים
-6. חיבורי DB לא נסגרים בכשל
-python
-# ✅ השתמש ב-context manager בכל מקום:
-def add_expense(category, amount, date, description, user_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            'INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)',
-            (category, amount, date, description, user_id)
-        )
-        conn.commit()
-כך אם נזרקת חריגה, החיבור ייסגר אוטומטית.
-
-7. send_whatsapp_message — בולע שגיאות בשקט
-python
-# ✅ הוסף לוג לפחות:
-except Exception as e:
-    print(f"WhatsApp send error to {to}: {e}")
-    return {'ok': False}
-סיכום התיקונים לפי עדיפות
-עדיפות	בעיה	השפעה
-🔴 קריטי	hmac.new → hmac.HMAC	קריסה בכל בקשה עם חתימה
-🔴 קריטי	gemini-pro → gemini-1.5-flash	כל קריאת AI נכשלת
-🔴 חשוב	תיקון ניקוי Markdown	JSON לא מפוענח לפעמים
-🟡 בינוני	פילטור user_id בתקציב	נתוני משתמשים מתערבבים
-🟡 בינוני	desc[:40]...	הודעות לא אסתטיות
-🟢 שיפור	with sqlite3.connect	מניעת דליפות חיבור
-רוצה שאתן לך את הקובץ השלם עם כל התיקונים?
-
-Prepared using Claude Sonnet 4.6 Thinking
-תוכל לכתוב את הקובץ השלם המתוקן כדי שאוכל להתעתיק אותו בשלמותו?ֿ
-Completed 3 steps
-
-
-
-
-app_fixed.py
-Python
-הקובץ המתוקן מוכן להורדה!
-
-הנה סיכום כל השינויים שבוצעו בגרסה הזו:
-
-שינויים עיקריים
-#	מה שונה	איפה
-🔴	hmac.new → hmac.HMAC	verify_meta_signature()
-🔴	'gemini-pro' → 'gemini-1.5-flash'	analyze_with_ai()
-🔴	ניקוי Markdown עם re.sub	analyze_with_ai()
-🟡	פילטור user_id בכל שאילתות התקציב	get_category_total_spent, get_all_budget_summary, get_detailed_budget
-🟡	desc[:40]... → ... רק אם ארוך מ-40	process_message, get_task_status
-🟢	כל חיבורי DB עם with sqlite3.connect	כל הפונקציות
-🟢	לוג שגיאה ב-send_whatsapp_message	send_whatsapp_message()
-Prepared using Claude Sonnet 4.6 Thinking
-הקוד קרס
-
-תוכל לשלוח את הודעת השגיאה המלאה (traceback)? 🔍
-
-בלי לדעת מה כתוב בשגיאה, קשה מאוד לדעת מה בדיוק קרס. תעתיק את הטקסט מהטרמינל / Railway logs — ואני אתקן מיד.
-
-Prepared using Claude Sonnet 4.6 Thinking
-app_fixed
-from flask import Flask, request, jsonify
-import os
-import json
-import re
-import requests as http_requests
-from datetime import datetime, timedelta
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import google.generativeai as genai
-import hmac
-import hashlib
-import sqlite3
-
-app = Flask(__name__)
-
-# Environment variables
-VERIFY_TOKEN = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
-WHATSAPP_TOKEN = os.getenv('WHATSAPP_TOKEN')
-PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
-GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
-APP_SECRET = os.getenv('APP_SECRET')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-
-# DB File (Volume in Railway)
-DB_FILE = '/app/data/sahbak.db'
-
-# Configure Gemini AI
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-BUDGET_CATEGORIES = {'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️', 'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚', 'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰'}
-DEFAULT_BUDGET_LIMITS = {'דיור': 5000, 'רכב': 2000, 'נופש': 1500, 'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500, 'בילויים': 800, 'קניות': 1000}
-TASK_QUADRANTS_EMOJI = {'חשוב דחוף': '🔴', 'חשוב לא דחוף': '🟡', 'דחוף לא חשוב': '🟠', 'לא דחוף לא חשוב': '🟢'}
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS budget (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, amount REAL, date TEXT, description TEXT, user_id TEXT)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, quadrant TEXT, description TEXT, created_at TEXT, completed INTEGER DEFAULT 0)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS contexts (user_id TEXT PRIMARY KEY, context_json TEXT)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS budget_limits (category TEXT PRIMARY KEY, amount REAL)''')
-        cursor.execute('SELECT COUNT(*) FROM budget_limits')
-        if cursor.fetchone()[0] == 0:
-            for cat, limit in DEFAULT_BUDGET_LIMITS.items():
-                cursor.execute('INSERT INTO budget_limits (category, amount) VALUES (?, ?)', (cat, limit))
-        conn.commit()
-
-init_db()
-
-# --- Database Helpers ---
-def get_user_context(user_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT context_json FROM contexts WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-    return json.loads(row[0]) if row else None
-
-def set_user_context(user_id, context):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT OR REPLACE INTO contexts (user_id, context_json) VALUES (?, ?)', (user_id, json.dumps(context)))
-        conn.commit()
-
-def delete_user_context(user_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('DELETE FROM contexts WHERE user_id = ?', (user_id,))
-        conn.commit()
-
-def get_budget_limit(category):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT amount FROM budget_limits WHERE category = ?', (category,))
-        row = cursor.fetchone()
-    return row[0] if row else 0
-
-def set_budget_limit(category, amount):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)', (category, amount))
-        conn.commit()
-
-def add_expense(category, amount, date, description, user_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT INTO budget (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)', (category, amount, date, description, user_id))
-        conn.commit()
-
-def get_category_total_spent(category, user_id):
-    current_month = datetime.now().strftime('%Y-%m')
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT SUM(ABS(amount)) FROM budget WHERE category = ? AND amount < 0 AND user_id = ? AND strftime('%Y-%m', date) = ?",
-            (category, user_id, current_month)
-        )
-        row = cursor.fetchone()
-    return row[0] if row[0] else 0
-
-def get_all_budget_summary(user_id):
-    current_month = datetime.now().strftime('%Y-%m')
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT category, SUM(amount) FROM budget WHERE strftime('%Y-%m', date) = ? AND user_id = ? GROUP BY category",
-            (current_month, user_id)
-        )
-        rows = cursor.fetchall()
-    return rows
-
-def add_task(quadrant, description):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT INTO tasks (quadrant, description, created_at, completed) VALUES (?, ?, ?, 0)', (quadrant, description, datetime.now().isoformat()))
-        conn.commit()
-
-def get_active_tasks():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, quadrant, description FROM tasks WHERE completed = 0 ORDER BY id ASC')
-        rows = cursor.fetchall()
-    return rows
-
-def mark_task_completed(task_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('UPDATE tasks SET completed = 1 WHERE id = ?', (task_id,))
-        changes = cursor.rowcount
-        conn.commit()
-    return changes > 0
-
-def get_tasks_completion_stats():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT SUM(completed), COUNT(*) FROM tasks')
-        row = cursor.fetchone()
-    completed = row[0] if row[0] else 0
-    total = row[1] if row[1] else 0
-    return completed, total
-
-# --- Google Calendar ---
-def get_calendar_service():
-    if not GOOGLE_CREDENTIALS: return None
-    try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
-        credentials = service_account.Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/calendar'])
-        return build('calendar', 'v3', credentials=credentials)
-    except Exception as e:
-        print(f'Calendar service error: {e}')
-        return None
-
-def process_calendar_ai(title, start_time_iso, location):
-    service = get_calendar_service()
-    if not service: return 'שגיאת התחברות ליומן גוגל (בדוק Credentials).'
-    
-    start_time = datetime.fromisoformat(start_time_iso)
-    end_time = start_time + timedelta(hours=1)
-    event = {
-        'summary': title,
-        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-        'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-    }
-    if location: event['location'] = location
-
-    try:
-        created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        link = created.get("htmlLink", "לא זמין")
-        return f'האירוע נוצר בהצלחה ביומן!\nכותרת: {title}\nזמן: {start_time.strftime("%d/%m/%Y %H:%M")}\nקישור: {link}'
-    except Exception as e:
-        print(f'Calendar error: {e}')
-        return 'שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם הבוט בהגדרות גוגל.'
-
-# --- AI Logic Engine ---
-def analyze_with_ai(text):
-    if not GEMINI_API_KEY:
-        return {"action": "unknown", "reply": "מפתח Gemini חסר. אנא הגדר GEMINI_API_KEY ב-Railway."}
-        
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
-    prompt = f"""
-    אתה עוזר אישי חכם בוואטסאפ שנקרא "סחבק". תפקידך לנתח משפטים חופשיים של משתמש ולהמיר אותם לפעולות במערכת.
-    תאריך ושעה נוכחיים: {now_str} (השתמש בזה כדי לחשב זמנים מופשטים כמו "מחר", "בעוד יומיים", או "ביום שלישי").
-    
-    נתח את המשפט הבא בדיוק רב: "{text}"
-    
-    החזר *אך ורק* אובייקט JSON טהור (ללא טקסט מקדים וללא תגיות מיוחדות של קוד). ה-JSON חייב להתאים לאחת מ-4 התבניות הבאות:
-    
-    1. הוצאה או הכנסה כספית:
-    {{"action": "expense", "amount": 100, "category": "מזון", "description": "תיאור קצר של מה שנקנה"}}
-    * קטגוריות מותרות בלבד (מצא את המתאימה ביותר): דיור, רכב, נופש, מזון, בריאות, חינוך, בילויים, קניות, הכנסה.
-    
-    2. הוספת משימה חדשה:
-    {{"action": "task", "quadrant": "חשוב דחוף", "description": "מה צריך לעשות"}}
-    * הערך quadrant חייב להיות אחד מאלה בלבד: חשוב דחוף, חשוב לא דחוף, דחוף לא חשוב, לא דחוף לא חשוב. בחר לפי ההקשר.
-    
-    3. קביעת פגישה או אירוע ביומן:
-    {{"action": "calendar", "title": "נושא הפגישה", "start_time": "2026-06-01T08:00:00", "location": "מיקום אם צוין אחרת null"}}
-    * חובה לחשב תאריך ושעה מדויקים ולהחזיר בפורמט ISO 8601. אם המשתמש לא ציין שעה מפורשת, תקבע את הפגישה ל-09:00 בבוקר.
-    
-    4. לא מובן / חסר מידע מהותי / שיחת חולין (למשל סתם "היי"):
-    {{"action": "unknown", "reply": "תשובה ידידותית וקצרה בעברית שאומרת שאתה סחבק ואיך אפשר לעזור"}}
-    """
-    try:
-        # תיקון: gemini-1.5-flash במקום gemini-pro שהושבת
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
-        res_text = response.text.strip()
-        
-        # תיקון: ניקוי Markdown עם regex אמין
-        res_text = re.sub(r'^```(?:json)?\s*', '', res_text)
-        res_text = re.sub(r'\s*```$', '', res_text).strip()
-            
-        try:
-            return json.loads(res_text)
-        except json.JSONDecodeError:
-            print(f"Failed to parse AI response as JSON: {res_text}")
-            return {"action": "unknown", "reply": "סליחה, המוח שלי קצת התבלבל בפיענוח. אפשר לנסח את זה קצת אחרת?"}
-            
-    except Exception as e:
-        print(f"Gemini API Error: {e}")
-        return {"action": "unknown", "reply": f"יש כרגע עומס על שרתי הבינה המלאכותית: {str(e)[:50]}..."}
-
-# --- WhatsApp Handlers ---
-def send_whatsapp_message(to, message):
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID: return {'ok': False}
-    url = f'https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages'
-    headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}', 'Content-Type': 'application/json'}
-    data = {'messaging_product': 'whatsapp', 'to': to, 'type': 'text', 'text': {'body': message}}
-    try:
-        http_requests.post(url, headers=headers, json=data, timeout=10)
-        return {'ok': True}
-    except Exception as e:
-        print(f"WhatsApp send error to {to}: {e}")
-        return {'ok': False}
-
-de
+    debug = os.getenv('FLASK_DEBUG', 'false').lower() in ('true', '1')
+    port  = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=debug)
