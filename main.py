@@ -236,7 +236,7 @@ prompt = f"""
 """
 try:
 # שינוי חשוב כאן: עברנו למודל היציב והאוניברסלי ביותר של גוגל (gemini-pro)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
 response = model.generate_content(prompt)
 res_text = response.text.strip()
 
