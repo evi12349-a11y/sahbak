@@ -5,20 +5,32 @@ Production-grade Flask server for Railway deployment.
 Stack:
   • WhatsApp Cloud API (Meta Graph API)  — messaging
   • Google Gemini (google-genai SDK)     — natural-language understanding
+                                           via real Function / Tool Calling
   • Google Calendar API                  — event creation
-  • SQLite                               — budget / tasks / context storage
+  • SQLite (WAL)                          — budget / tasks / context storage
+
+Key reliability features:
+  1. Async webhook handling  — ACK Meta in milliseconds, work on a thread pool
+                               (prevents WhatsApp timeouts + duplicate re-delivery).
+  2. Exponential backoff     — every Gemini call is retried with jitter on
+                               transient errors (rate-limit / overload / 5xx).
+  3. Function Calling        — Gemini returns strict, typed tool calls instead of
+                               free-text we have to parse; supports several
+                               actions in a single message (parallel calls).
+  4. Voice / image / docs    — handled through the same async + retry pipeline.
 """
 from __future__ import annotations  # makes type hints version-proof (3.9+)
 
 import os
 import re
 import json
+import time
+import random
 import hmac
-import base64
 import hashlib
 import logging
 import sqlite3
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -33,6 +45,12 @@ from googleapiclient.discovery import build
 # package (legacy SDK deprecated 2025-11-30).
 from google import genai
 from google.genai import types
+
+# Newer SDK versions expose typed error classes; fall back gracefully if not.
+try:
+    from google.genai import errors as genai_errors  # type: ignore
+except Exception:  # pragma: no cover
+    genai_errors = None
 
 # ─────────────────────────────────────────────
 # Logging
@@ -65,6 +83,12 @@ TIMEZONE_NAME        = os.getenv('TIMEZONE', 'Asia/Jerusalem')
 # To survive redeploys on Railway, attach a Volume and point DB_PATH at its
 # mount path, e.g. DB_PATH=/app/data/sahbak.db
 DB_FILE = os.getenv('DB_PATH', os.path.join('data', 'sahbak.db'))
+
+# How many webhooks we are willing to process concurrently. A bounded pool
+# protects the box from an unbounded thread explosion if many messages arrive
+# at once (far safer than spawning one raw Thread per message).
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '8'))
+_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix='sahbak-msg')
 
 # Gemini client (constructing it makes no network call, so module-level is fine)
 _genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -105,6 +129,7 @@ BUDGET_CATEGORIES_HE = {
     'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚',
     'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰',
 }
+VALID_CATEGORIES = list(BUDGET_CATEGORIES_HE.keys())
 
 DEFAULT_BUDGET_LIMITS = {
     'דיור': 5000, 'רכב': 2000, 'נופש': 1500,
@@ -118,6 +143,7 @@ TASK_QUADRANTS_EMOJI = {
     'דחוף לא חשוב':     '🟠',
     'לא דחוף לא חשוב':  '🟢',
 }
+VALID_QUADRANTS = list(TASK_QUADRANTS_EMOJI.keys())
 
 SUPPORTED_IMAGE_TYPES  = {'image'}
 SUPPORTED_AUDIO_TYPES  = {'audio'}
@@ -128,6 +154,73 @@ MEDIA_TYPES            = SUPPORTED_IMAGE_TYPES | SUPPORTED_AUDIO_TYPES | SUPPORT
 WHATSAPP_TEXT_LIMIT = 4096
 # Gemini inline-request size guard (~20MB ceiling; stay safely under it)
 MAX_MEDIA_BYTES = 18 * 1024 * 1024
+
+# Keep the dedup table from growing forever — drop ids older than this.
+PROCESSED_TTL_DAYS = 3
+
+
+# ═════════════════════════════════════════════
+# Retry — Exponential backoff with jitter  (Doc §2)
+# ═════════════════════════════════════════════
+# Transient HTTP statuses worth retrying. 429 = rate limit / quota,
+# 5xx = server overload or hiccup. Everything else (400/401/403/404) is a
+# permanent error and is re-raised immediately.
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Substrings that signal a transient failure when no numeric code is available.
+_RETRYABLE_NEEDLES = (
+    'rate limit', 'rate-limit', 'quota', 'resource exhausted', 'overload',
+    'overloaded', 'unavailable', 'deadline', 'timed out', 'timeout',
+    'try again', 'temporarily', 'connection', 'connection reset',
+    'internal error', 'internal server', '429', '500', '502', '503', '504',
+)
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Best-effort detection of transient errors across SDK versions."""
+    # 1) Typed SDK errors (newer google-genai)
+    if genai_errors is not None:
+        if isinstance(exc, getattr(genai_errors, 'ServerError', ())):
+            return True
+        client_err = getattr(genai_errors, 'ClientError', None)
+        if client_err and isinstance(exc, client_err):
+            code = getattr(exc, 'code', None)
+            return code in RETRYABLE_STATUS  # only 408/429 among 4xx
+
+    # 2) Any object that carries a numeric status code
+    for attr in ('code', 'status_code', 'http_status'):
+        code = getattr(exc, attr, None)
+        if isinstance(code, int) and code in RETRYABLE_STATUS:
+            return True
+
+    # 3) Fall back to message inspection
+    msg = str(exc).lower()
+    return any(n in msg for n in _RETRYABLE_NEEDLES)
+
+
+def call_with_retry(fn, *, what: str = 'AI call',
+                    max_attempts: int = 4, base_delay: float = 1.0):
+    """Run `fn`, retrying transient failures with exponential backoff + jitter.
+
+    Delays grow 1s → 2s → 4s (plus up to +30% random jitter to avoid
+    thundering-herd). Permanent errors are raised on the first failure.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — we re-raise non-retryable below
+            last_exc = exc
+            if attempt >= max_attempts or not _is_retryable_error(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            delay += random.uniform(0, delay * 0.3)  # jitter
+            logger.warning('%s failed (attempt %d/%d): %s — retrying in %.1fs',
+                           what, attempt, max_attempts, exc, delay)
+            time.sleep(delay)
+    # Should be unreachable, but keeps the type checker happy.
+    assert last_exc is not None
+    raise last_exc
 
 
 # ─────────────────────────────────────────────
@@ -146,6 +239,7 @@ def init_db() -> None:
         # WAL = concurrent readers + a single writer; far fewer "database is
         # locked" errors now that webhooks are handled on background threads.
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=10000')
         c = conn.cursor()
         c.executescript('''
             CREATE TABLE IF NOT EXISTS budget (
@@ -180,6 +274,11 @@ def init_db() -> None:
                 message_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_budget_user_date
+                ON budget (user_id, date);
+            CREATE INDEX IF NOT EXISTS idx_tasks_user_completed
+                ON tasks (user_id, completed);
         ''')
         # Seed default limits only on first run
         c.execute('SELECT COUNT(*) FROM budget_limits')
@@ -190,6 +289,17 @@ def init_db() -> None:
             )
         conn.commit()
     logger.info('Database initialised at %s', DB_FILE)
+
+
+def _cleanup_processed_messages() -> None:
+    """Drop dedup rows older than PROCESSED_TTL_DAYS (keeps the table small)."""
+    cutoff = (now_local() - timedelta(days=PROCESSED_TTL_DAYS)).isoformat()
+    try:
+        with _connect() as conn:
+            conn.execute('DELETE FROM processed_messages WHERE created_at < ?', (cutoff,))
+            conn.commit()
+    except Exception:
+        logger.exception('processed_messages cleanup failed')
 
 
 def mark_message_seen(message_id: str) -> bool:
@@ -208,6 +318,9 @@ def mark_message_seen(message_id: str) -> bool:
                 (message_id, now_local().isoformat())
             )
             conn.commit()
+        # Opportunistic, cheap, ~2% of the time — no extra scheduler needed.
+        if random.random() < 0.02:
+            _cleanup_processed_messages()
         return cur.rowcount > 0
     except Exception:
         logger.exception('Dedup check failed for %s', message_id)
@@ -335,6 +448,16 @@ def mark_task_completed(task_id: int, user_id: str) -> bool:
     return cursor.rowcount > 0
 
 
+def delete_task_by_id(task_id: int, user_id: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            'DELETE FROM tasks WHERE id = ? AND user_id = ?',
+            (task_id, user_id)
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
 def get_tasks_completion_stats(user_id: str) -> tuple[int, int]:
     """Completion stats for the CURRENT month only, so the ratio stays meaningful."""
     current_month = now_local().strftime('%Y-%m')
@@ -349,6 +472,18 @@ def get_tasks_completion_stats(user_id: str) -> tuple[int, int]:
     completed = row[0] if row[0] else 0
     total     = row[1] if row[1] else 0
     return completed, total
+
+
+def find_tasks_by_text(query: str, user_id: str) -> list[tuple]:
+    """Fuzzy-ish match: return active tasks whose description contains `query`
+    (case-insensitive, whitespace-normalised). Used by complete/delete tools."""
+    q = re.sub(r'\s+', ' ', (query or '').strip()).lower()
+    active = get_active_tasks(user_id)
+    if not q:
+        return active
+    matches = [(tid, quad, desc) for tid, quad, desc in active
+               if q in re.sub(r'\s+', ' ', desc.strip()).lower()]
+    return matches
 
 
 # ─────────────────────────────────────────────
@@ -371,104 +506,474 @@ def get_calendar_service():
         return None
 
 
+def _parse_event_datetime(start_time_iso: str) -> datetime | None:
+    """Parse the AI-supplied start time and make it timezone-aware (Israel).
+
+    The model returns naive ISO strings like '2026-06-01T09:00:00'. We attach
+    LOCAL_TZ so the event lands at the intended wall-clock time regardless of
+    the (UTC) server. If the model ever returns an offset, we respect it.
+    """
+    try:
+        dt = datetime.fromisoformat(start_time_iso)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None and LOCAL_TZ is not None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt
+
+
 def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -> str:
     service = get_calendar_service()
     if not service:
         return 'שגיאת התחברות ליומן גוגל (בדוק Credentials).'
-    try:
-        start_time = datetime.fromisoformat(start_time_iso)
-    except ValueError:
+
+    start_time = _parse_event_datetime(start_time_iso)
+    if start_time is None:
         return f'תאריך לא תקין: {start_time_iso}'
+
+    # Guard against the model scheduling something that already passed (e.g. it
+    # parsed "ב-8" as 08:00 when it's already 10:00). Warn, don't silently bury it.
+    past_note = ''
+    if start_time < now_local() - timedelta(minutes=1):
+        past_note = '\n⚠️ שים לב: הזמן שביקשת כבר עבר — קבעתי בכל זאת. לשינוי כתוב לי תאריך חדש.'
+
     end_time = start_time + timedelta(hours=1)
     event: dict = {
         'summary': title,
-        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Jerusalem'},
-        'end':   {'dateTime': end_time.isoformat(),   'timeZone': 'Asia/Jerusalem'},
+        'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE_NAME},
+        'end':   {'dateTime': end_time.isoformat(),   'timeZone': TIMEZONE_NAME},
     }
     if location:
         event['location'] = location
     try:
         created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
         link    = created.get('htmlLink', 'לא זמין')
+        weekday = HEB_WEEKDAYS[start_time.weekday()]
         return (
             f'האירוע נוצר בהצלחה! 📅\n'
             f'כותרת: {title}\n'
-            f'זמן: {start_time.strftime("%d/%m/%Y %H:%M")}\n'
-            f'קישור: {link}'
+            f'יום {weekday}, {start_time.strftime("%d/%m/%Y בשעה %H:%M")}'
+            + (f'\nמיקום: {location}' if location else '') +
+            f'\nקישור: {link}'
+            f'{past_note}'
         )
     except Exception:
         logger.exception('Calendar insert failed')
         return 'שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם חשבון השירות.'
 
 
-# ─────────────────────────────────────────────
-# AI — Gemini (google-genai SDK)
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
+# AI — Gemini Function / Tool Calling  (Doc §3)
+# ═════════════════════════════════════════════
+# Instead of asking the model for free-form JSON and parsing it (brittle), we
+# declare strict, typed tools. The model returns one or more `function_call`
+# parts with validated args, which we dispatch in `execute_tool`. This nearly
+# eliminates "the bot didn't understand" failures and supports several actions
+# in a single message (parallel function calling).
 
-def analyze_with_ai(text: str) -> dict:
-    """Parse a free-form Hebrew message into a structured action dict."""
+def _make_function_declaration(name: str, description: str, schema: dict):
+    """Build a FunctionDeclaration compatibly across google-genai versions.
+
+    Newer SDKs use `parameters_json_schema=`; older ones use `parameters=`.
+    """
+    try:
+        return types.FunctionDeclaration(
+            name=name, description=description, parameters_json_schema=schema
+        )
+    except TypeError:
+        return types.FunctionDeclaration(
+            name=name, description=description, parameters=schema
+        )
+
+
+def _build_tools() -> list:
+    cats = ', '.join(VALID_CATEGORIES)
+    quads = ', '.join(VALID_QUADRANTS)
+
+    declarations = [
+        _make_function_declaration(
+            'add_expense',
+            'רישום הוצאה או הכנסה כספית. השתמש בזה כשהמשתמש מדווח שקנה משהו, '
+            'שילם, הוציא או הרוויח כסף. עבור הכנסה (משכורת, החזר, קיבל כסף) '
+            'בחר את הקטגוריה "הכנסה".',
+            {
+                'type': 'object',
+                'properties': {
+                    'amount': {
+                        'type': 'number',
+                        'description': 'הסכום בשקלים, תמיד מספר חיובי.',
+                    },
+                    'category': {
+                        'type': 'string',
+                        'enum': VALID_CATEGORIES,
+                        'description': f'הקטגוריה. אחת מתוך: {cats}.',
+                    },
+                    'description': {
+                        'type': 'string',
+                        'description': 'תיאור קצר של ההוצאה/ההכנסה (למשל "המבורגר", "משכורת").',
+                    },
+                },
+                'required': ['amount', 'category'],
+            },
+        ),
+        _make_function_declaration(
+            'add_task',
+            'הוספת משימה לרשימת המטלות לפי מטריצת אייזנהאואר. השתמש בזה כשהמשתמש '
+            'מבקש להוסיף משימה, לזכור לעשות משהו, או לשים תזכורת למטלה.',
+            {
+                'type': 'object',
+                'properties': {
+                    'quadrant': {
+                        'type': 'string',
+                        'enum': VALID_QUADRANTS,
+                        'description': (
+                            f'רמת הדחיפות/חשיבות. אחת מתוך: {quads}. '
+                            'אם המשתמש לא ציין במפורש, הסק לפי ההקשר '
+                            '(ברירת מחדל סבירה: "חשוב לא דחוף").'
+                        ),
+                    },
+                    'description': {
+                        'type': 'string',
+                        'description': 'תיאור המשימה.',
+                    },
+                },
+                'required': ['quadrant', 'description'],
+            },
+        ),
+        _make_function_declaration(
+            'create_calendar_event',
+            'יצירת אירוע ביומן גוגל. השתמש בזה כשהמשתמש מבקש לקבוע פגישה, '
+            'תור, אירוע או תזכורת עם זמן מסוים.',
+            {
+                'type': 'object',
+                'properties': {
+                    'title': {
+                        'type': 'string',
+                        'description': 'כותרת האירוע (למשל "פגישה עם דני").',
+                    },
+                    'start_time': {
+                        'type': 'string',
+                        'description': (
+                            'זמן ההתחלה בפורמט ISO 8601 ללא אזור זמן, '
+                            'למשל "2026-06-01T09:00:00". חשב תאריכים יחסיים '
+                            '("מחר", "יום שלישי", "עוד שעה") לפי הזמן הנוכחי שניתן לך.'
+                        ),
+                    },
+                    'location': {
+                        'type': 'string',
+                        'description': 'מיקום האירוע, אם צוין. אחרת השמט.',
+                    },
+                },
+                'required': ['title', 'start_time'],
+            },
+        ),
+        _make_function_declaration(
+            'complete_task',
+            'סימון משימה קיימת כהושלמה. השתמש בזה כשהמשתמש אומר שסיים, ביצע '
+            'או השלים מטלה כלשהי.',
+            {
+                'type': 'object',
+                'properties': {
+                    'task_query': {
+                        'type': 'string',
+                        'description': (
+                            'תיאור או מילות מפתח של המשימה שהושלמה (למשל "חלב", '
+                            '"להתקשר לרופא"). אם המשתמש לא פירט איזו, השאר ריק.'
+                        ),
+                    },
+                },
+                'required': [],
+            },
+        ),
+        _make_function_declaration(
+            'delete_task',
+            'מחיקת משימה מהרשימה (לא סימון כהושלמה, אלא הסרה מוחלטת). השתמש בזה '
+            'כשהמשתמש מבקש למחוק, להסיר או לבטל משימה.',
+            {
+                'type': 'object',
+                'properties': {
+                    'task_query': {
+                        'type': 'string',
+                        'description': 'תיאור או מילות מפתח של המשימה למחיקה.',
+                    },
+                },
+                'required': [],
+            },
+        ),
+        _make_function_declaration(
+            'set_budget_limit',
+            'הגדרה או עדכון של תקרת תקציב חודשית לקטגוריה.',
+            {
+                'type': 'object',
+                'properties': {
+                    'category': {
+                        'type': 'string',
+                        'enum': [c for c in VALID_CATEGORIES if c != 'הכנסה'],
+                        'description': f'הקטגוריה. אחת מתוך: {cats} (לא כולל הכנסה).',
+                    },
+                    'amount': {
+                        'type': 'number',
+                        'description': 'תקרת התקציב החדשה בשקלים.',
+                    },
+                },
+                'required': ['category', 'amount'],
+            },
+        ),
+        _make_function_declaration(
+            'get_budget_status',
+            'הצגת דוח כספי מפורט לחודש הנוכחי (הכנסות, הוצאות, יתרה לכל קטגוריה). '
+            'השתמש כשהמשתמש שואל על מצב כספי, מאזן, תקציב או כמה הוציא.',
+            {'type': 'object', 'properties': {}, 'required': []},
+        ),
+        _make_function_declaration(
+            'get_tasks_status',
+            'הצגת רשימת כל המשימות הפתוחות. השתמש כשהמשתמש שואל מה יש לו לעשות, '
+            'מבקש את רשימת המשימות או את הסטטוס שלהן.',
+            {'type': 'object', 'properties': {}, 'required': []},
+        ),
+        _make_function_declaration(
+            'show_help',
+            'הצגת תפריט העזרה והפקודות הזמינות. השתמש כשהמשתמש שואל מה אתה יכול '
+            'לעשות, מבקש עזרה או תפריט.',
+            {'type': 'object', 'properties': {}, 'required': []},
+        ),
+    ]
+    return [types.Tool(function_declarations=declarations)]
+
+
+# Build once at import — declarations are static.
+_TOOLS = None
+def _get_tools():
+    global _TOOLS
+    if _TOOLS is None:
+        _TOOLS = _build_tools()
+    return _TOOLS
+
+
+def _system_instruction() -> str:
+    now = now_local()
+    weekday = HEB_WEEKDAYS[now.weekday()]
+    return (
+        'אתה "סחבק", עוזר אישי חכם וידידותי בוואטסאפ שעוזר בניהול יומן, משימות '
+        'ותקציב. אתה מדבר עברית, בקצרה ובחום.\n\n'
+        f'הזמן הנוכחי: {now.strftime("%Y-%m-%d %H:%M")} (יום {weekday}).\n'
+        'השתמש בזמן הזה כדי לחשב תאריכים יחסיים כמו "מחר", "מחרתיים", '
+        '"יום ראשון הבא" או "עוד שעתיים".\n\n'
+        'כשהמשתמש מבקש פעולה (הוצאה, משימה, אירוע, שאילתה) — קרא לכלי המתאים. '
+        'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים '
+        '(למשל גם לקבוע פגישה וגם להוסיף משימה).\n'
+        'אם המשתמש רק משוחח, שואל שאלה כללית או אומר שלום — ענה בטקסט קצר '
+        'וחביב בלי לקרוא לכלי.'
+    )
+
+
+def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
+    """Send a free-form Hebrew message to Gemini.
+
+    Returns (tool_calls, reply_text):
+      • tool_calls — list of (function_name, args_dict). Empty for plain chat.
+      • reply_text — the model's text answer when no tool was called.
+    Raises on a final, non-recoverable API failure (caller shows a friendly msg).
+    """
     client = get_genai_client()
     if not client:
-        return {'action': 'unknown', 'reply': 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'}
+        return [], 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'
 
-    now_str = now_local().strftime('%Y-%m-%d %H:%M')
-    prompt = f"""
-אתה עוזר אישי חכם בוואטסאפ שנקרא "סחבק". תפקידך לנתח משפטים חופשיים של משתמש ולהמיר אותם לפעולות במערכת.
-תאריך ושעה נוכחיים: {now_str}
-
-נתח את המשפט הבא: "{text}"
-
-החזר אך ורק אובייקט JSON טהור ללא טקסט נוסף, ללא בקשת json וללא ```.
-
-התבניות האפשריות:
-
-1. {{"action": "expense", "amount": 100, "category": "מזון", "description": "תיאור"}}
-   קטגוריות חוקיות בלבד: דיור, רכב, נופש, מזון, בריאות, חינוך, בילויים, קניות, הכנסה
-
-2. {{"action": "task", "quadrant": "חשוב דחוף", "description": "מה לעשות"}}
-   ערכי quadrant חוקיים בלבד: חשוב דחוף, חשוב לא דחוף, דחוף לא חשוב, לא דחוף לא חשוב
-
-3. {{"action": "calendar", "title": "נושא", "start_time": "2026-06-01T09:00:00", "location": null}}
-
-4. {{"action": "unknown", "reply": "תשובה קצרה וידידותית בעברית"}}
-"""
-    raw = ''
-    try:
-        response = client.models.generate_content(
+    def _call():
+        return client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt,
+            contents=text,
             config=types.GenerateContentConfig(
-                response_mime_type='application/json',  # forces valid JSON output
-                temperature=0.2,
+                system_instruction=_system_instruction(),
+                tools=_get_tools(),
+                temperature=0.0,  # deterministic routing
             ),
         )
-        raw = (response.text or '').strip()
-        # Defensive: strip any accidental markdown fences
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw).strip()
-        if not raw:
-            return {'action': 'unknown', 'reply': 'סליחה, לא הצלחתי להבין. נסח אחרת?'}
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning('AI returned non-JSON: %s', raw[:200])
-        return {'action': 'unknown', 'reply': 'סליחה, לא הצלחתי להבין. נסח אחרת?'}
-    except Exception:
-        logger.exception('Gemini API error')
-        return {'action': 'unknown', 'reply': 'שגיאה זמנית בשרתי AI. נסה שוב עוד רגע.'}
 
+    response = call_with_retry(_call, what='Gemini (router)')
+
+    # Preferred path: SDK exposes a convenient .function_calls property.
+    calls: list[tuple[str, dict]] = []
+    fcs = getattr(response, 'function_calls', None)
+    if fcs:
+        for fc in fcs:
+            calls.append((fc.name, dict(fc.args or {})))
+        return calls, ''
+
+    # Fallback: walk the parts manually (older SDKs / edge cases).
+    try:
+        parts = response.candidates[0].content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        parts = []
+    text_chunks: list[str] = []
+    for part in parts:
+        fc = getattr(part, 'function_call', None)
+        if fc and getattr(fc, 'name', None):
+            calls.append((fc.name, dict(fc.args or {})))
+        elif getattr(part, 'text', None):
+            text_chunks.append(part.text)
+
+    if calls:
+        return calls, ''
+    return [], ' '.join(c.strip() for c in text_chunks).strip()
+
+
+# ── Tool dispatch ────────────────────────────
+
+def _tool_add_expense(args: dict, user_id: str) -> str:
+    try:
+        amt = abs(float(args.get('amount', 0)))
+    except (TypeError, ValueError):
+        return 'לא הצלחתי להבין את הסכום. נסה שוב, למשל "הוצאתי 50 שקל על מזון".'
+    if amt <= 0:
+        return 'הסכום חייב להיות גדול מאפס. נסה שוב 🙂'
+    cat  = (args.get('category') or '').strip()
+    desc = (args.get('description') or '').strip() or cat
+    if cat not in BUDGET_CATEGORIES_HE:
+        return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(VALID_CATEGORIES)}'
+
+    signed_amt = amt if cat == 'הכנסה' else -amt
+    add_expense(cat, signed_amt, now_local().isoformat(), desc, user_id)
+
+    alert = ''
+    if cat != 'הכנסה':
+        limit = get_budget_limit(cat)
+        if limit > 0:
+            spent = get_category_total_spent(cat, user_id)
+            rem   = limit - spent
+            if rem < 0:
+                alert = f'\n⚠️ חרגת ב-{abs(rem):,.0f} ש"ח מהתקציב של {cat}!'
+            else:
+                alert = f'\nנותרו {rem:,.0f} ש"ח בקטגוריה החודש'
+    label = 'הכנסה' if cat == 'הכנסה' else 'הוצאה'
+    return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}* ({label}): {amt:,.0f} ש"ח{alert}'
+
+
+def _tool_add_task(args: dict, user_id: str) -> str:
+    quad = (args.get('quadrant') or '').strip()
+    desc = (args.get('description') or '').strip()
+    if quad not in TASK_QUADRANTS_EMOJI:
+        quad = 'חשוב לא דחוף'  # safe default rather than failing
+    if not desc:
+        return 'מה המשימה שתרצה להוסיף?'
+    add_task(quad, desc, user_id)
+    return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
+
+
+def _tool_create_event(args: dict, user_id: str) -> str:
+    title          = (args.get('title') or 'אירוע').strip()
+    start_time_iso = args.get('start_time')
+    if not start_time_iso:
+        return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
+    location = (args.get('location') or '').strip() or None
+    return process_calendar_ai(title, start_time_iso, location)
+
+
+def _tool_complete_task(args: dict, user_id: str) -> str:
+    query   = (args.get('task_query') or '').strip()
+    matches = find_tasks_by_text(query, user_id)
+
+    if not get_active_tasks(user_id):
+        return 'אין משימות פתוחות לסיים! 🎉'
+
+    # Exactly one match → complete it immediately.
+    if query and len(matches) == 1:
+        tid, _quad, desc = matches[0]
+        if mark_task_completed(tid, user_id):
+            preview = desc[:50] + ('…' if len(desc) > 50 else '')
+            return f'מעולה! 🎉 סימנתי כהושלם:\n[{tid}] {preview}'
+        return 'לא הצלחתי לסמן את המשימה. נסה "סטטוס משימות".'
+
+    # Zero or many matches → ask which one, via the existing context flow.
+    candidates = matches if matches else get_active_tasks(user_id)
+    set_user_context(user_id, {'type': 'complete_task'})
+    msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
+    for tid, quad, desc in candidates:
+        preview = desc[:40] + ('…' if len(desc) > 40 else '')
+        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
+    msg += '\n(או "ביטול")'
+    return msg
+
+
+def _tool_delete_task(args: dict, user_id: str) -> str:
+    query   = (args.get('task_query') or '').strip()
+    matches = find_tasks_by_text(query, user_id)
+
+    if not get_active_tasks(user_id):
+        return 'אין משימות פתוחות למחוק.'
+
+    if query and len(matches) == 1:
+        tid, _quad, desc = matches[0]
+        if delete_task_by_id(tid, user_id):
+            preview = desc[:50] + ('…' if len(desc) > 50 else '')
+            return f'🗑️ נמחקה המשימה:\n[{tid}] {preview}'
+        return 'לא הצלחתי למחוק את המשימה. נסה "סטטוס משימות".'
+
+    candidates = matches if matches else get_active_tasks(user_id)
+    set_user_context(user_id, {'type': 'delete_task'})
+    msg = '*איזו משימה למחוק? (שלח את המספר)*\n\n'
+    for tid, quad, desc in candidates:
+        preview = desc[:40] + ('…' if len(desc) > 40 else '')
+        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
+    msg += '\n(או "ביטול")'
+    return msg
+
+
+def _tool_set_limit(args: dict, user_id: str) -> str:
+    cat = (args.get('category') or '').strip()
+    try:
+        amt = float(args.get('amount', 0))
+    except (TypeError, ValueError):
+        return 'הסכום לתקציב לא תקין.'
+    if cat not in BUDGET_CATEGORIES_HE or cat == 'הכנסה':
+        return f'לא ניתן להגדיר תקציב לקטגוריה "{cat}".'
+    if amt <= 0:
+        return 'תקרת התקציב חייבת להיות גדולה מאפס.'
+    set_budget_limit(cat, amt)
+    return f'✅ תקרת התקציב לקטגוריית *{cat}* עודכנה ל-{amt:,.0f} ש"ח.'
+
+
+def execute_tool(name: str, args: dict, user_id: str) -> str:
+    """Dispatch a single validated tool call to its handler."""
+    handlers = {
+        'add_expense':            _tool_add_expense,
+        'add_task':               _tool_add_task,
+        'create_calendar_event':  _tool_create_event,
+        'complete_task':          _tool_complete_task,
+        'delete_task':            _tool_delete_task,
+        'set_budget_limit':       _tool_set_limit,
+        'get_budget_status':      lambda a, u: get_detailed_budget(u),
+        'get_tasks_status':       lambda a, u: get_task_status(u),
+        'show_help':              lambda a, u: get_help_menu(),
+    }
+    handler = handlers.get(name)
+    if not handler:
+        logger.warning('Unknown tool requested: %s', name)
+        return 'לא הצלחתי לבצע את הפעולה. נסה לנסח אחרת או כתוב "תפריט".'
+    try:
+        return handler(args, user_id)
+    except Exception:
+        logger.exception('Tool "%s" failed (args=%s)', name, args)
+        return 'אופס, משהו השתבש בביצוע הפעולה. נסה שוב 🙏'
+
+
+# ── Multimodal helpers (image / audio / document) ──
 
 def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: str) -> str:
     client = get_genai_client()
     if not client or not image_data:
         return 'שלח הודעת טקסט כדי שאוכל לעזור לך 😊'
+    contents = [
+        'תאר את התמונה הזו בעברית בקצרה. אם יש בה טקסט, ציין אותו. היה ממוקד ומועיל.',
+        types.Part.from_bytes(data=image_data, mime_type=mime_type or 'image/jpeg'),
+    ]
+    if caption:
+        contents.append(f'הערת המשתמש: {caption}')
     try:
-        contents = [
-            'תאר את התמונה הזו בעברית בקצרה. אם יש בה טקסט, ציין אותו. היה ממוקד ומועיל.',
-            types.Part.from_bytes(data=image_data, mime_type=mime_type or 'image/jpeg'),
-        ]
-        if caption:
-            contents.append(f'הערת המשתמש: {caption}')
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        response = call_with_retry(
+            lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
+            what='Gemini (image)',
+        )
         out = (response.text or '').strip()
         return f'📷 *תיאור התמונה:*\n{out}' if out else 'לא הצלחתי לנתח את התמונה.'
     except Exception:
@@ -481,12 +986,15 @@ def transcribe_audio_with_ai(audio_data: bytes | None, mime_type: str) -> str | 
     if not client or not audio_data:
         return None
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                'תמלל את ההקלטה הבאה לעברית. החזר אך ורק את הטקסט המתומלל, ללא הסברים.',
-                types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/ogg'),
-            ],
+        response = call_with_retry(
+            lambda: client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    'תמלל את ההקלטה הבאה לעברית. החזר אך ורק את הטקסט המתומלל, ללא הסברים.',
+                    types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/ogg'),
+                ],
+            ),
+            what='Gemini (audio)',
         )
         out = (response.text or '').strip()
         return out or None
@@ -507,12 +1015,15 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
                 'אני יכול לקרוא כרגע רק PDF או קובצי טקסט. '
                 'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                'סכם בקצרה בעברית את תוכן המסמך הבא, בנקודות עיקריות וברורות.',
-                types.Part.from_bytes(data=doc_data, mime_type=mime_type),
-            ],
+        response = call_with_retry(
+            lambda: client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    'סכם בקצרה בעברית את תוכן המסמך הבא, בנקודות עיקריות וברורות.',
+                    types.Part.from_bytes(data=doc_data, mime_type=mime_type),
+                ],
+            ),
+            what='Gemini (document)',
         )
         out = (response.text or '').strip()
         return f'📄 *סיכום — {name}:*\n{out}' if out else f'לא הצלחתי לסכם את {name}.'
@@ -525,33 +1036,70 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
 # WhatsApp API
 # ─────────────────────────────────────────────
 
-def send_whatsapp_message(to: str, message: str) -> bool:
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        logger.error('WhatsApp credentials not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)')
-        return False
+def _split_for_whatsapp(message: str, limit: int = WHATSAPP_TEXT_LIMIT) -> list[str]:
+    """Split a long reply into <=limit chunks, preferring line boundaries so we
+    never cut a word/emoji mid-way (which WhatsApp's hard 4096 cut would do)."""
+    if len(message) <= limit:
+        return [message]
+    chunks: list[str] = []
+    current = ''
+    for line in message.split('\n'):
+        # A single line longer than the limit must be hard-split.
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = f'{current}\n{line}' if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _post_whatsapp(payload: dict) -> bool:
     url     = f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages'
     headers = {
         'Authorization': f'Bearer {WHATSAPP_TOKEN}',
         'Content-Type':  'application/json',
     }
-    payload = {
-        'messaging_product': 'whatsapp',
-        'to':                to,
-        'type':              'text',
-        'text':              {'body': message[:WHATSAPP_TEXT_LIMIT]},
-    }
-    try:
+
+    def _do():
         resp = http_requests.post(url, headers=headers, json=payload, timeout=15)
+        # Retry on Meta's transient/5xx; surface the body for everything else.
+        if resp.status_code in RETRYABLE_STATUS:
+            raise RuntimeError(f'WhatsApp transient {resp.status_code}: {resp.text[:300]}')
         if resp.status_code >= 400:
             # Log Meta's actual error body — this is what you need to debug
             # "the bot isn't replying" (expired token, number not allow-listed,
-            # 24-hour window closed, etc.)
+            # 24-hour window closed, etc.). Not retryable.
             logger.error('WhatsApp send failed (%s): %s', resp.status_code, resp.text[:500])
             return False
         return True
+
+    try:
+        return call_with_retry(_do, what='WhatsApp send', max_attempts=3)
     except Exception:
-        logger.exception('Failed to send WhatsApp message to %s', to)
+        logger.exception('Failed to send WhatsApp message')
         return False
+
+
+def send_whatsapp_message(to: str, message: str) -> bool:
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        logger.error('WhatsApp credentials not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)')
+        return False
+    ok = True
+    for chunk in _split_for_whatsapp(message):
+        payload = {
+            'messaging_product': 'whatsapp',
+            'to':                to,
+            'type':              'text',
+            'text':              {'body': chunk},
+        }
+        ok = _post_whatsapp(payload) and ok
+    return ok
 
 
 def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
@@ -560,10 +1108,13 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         return None, ''
     headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}'}
     try:
-        # Step 1: get media URL
-        meta = http_requests.get(
-            f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}',
-            headers=headers, timeout=15
+        # Step 1: get media URL (retry transient failures)
+        meta = call_with_retry(
+            lambda: http_requests.get(
+                f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}',
+                headers=headers, timeout=15
+            ),
+            what='WhatsApp media meta', max_attempts=3,
         )
         meta.raise_for_status()
         meta_json = meta.json()
@@ -572,7 +1123,10 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         if not media_url:
             return None, mime_type
         # Step 2: download actual bytes (the CDN URL also needs the auth header)
-        media_resp = http_requests.get(media_url, headers=headers, timeout=30)
+        media_resp = call_with_retry(
+            lambda: http_requests.get(media_url, headers=headers, timeout=30),
+            what='WhatsApp media download', max_attempts=3,
+        )
         media_resp.raise_for_status()
         return media_resp.content, mime_type
     except Exception:
@@ -606,93 +1160,50 @@ def process_message(text: str, user_id: str) -> str:
             delete_user_context(user_id)
             return 'הפעולה בוטלה ✅'
 
-        if context.get('type') == 'complete_task':
+        ctype = context.get('type')
+        if ctype in ('complete_task', 'delete_task'):
             match = re.search(r'(\d+)', text)
             if not match:
-                return 'שלח רק את המספר של המשימה שסיימת (או "ביטול").'
+                action = 'שסיימת' if ctype == 'complete_task' else 'למחיקה'
+                return f'שלח רק את המספר של המשימה {action} (או "ביטול").'
             task_id = int(match.group(1))
-            if mark_task_completed(task_id, user_id):
+            if ctype == 'complete_task':
+                ok = mark_task_completed(task_id, user_id)
+                done_msg = f'מעולה! 🎉 משימה {task_id} סומנה כהושלמה.'
+            else:
+                ok = delete_task_by_id(task_id, user_id)
+                done_msg = f'🗑️ משימה {task_id} נמחקה.'
+            if ok:
                 delete_user_context(user_id)
-                return f'מעולה! 🎉 משימה {task_id} סומנה כהושלמה.'
-            return 'לא מצאתי משימה פתוחה עם המספר הזה. נסה שוב (או "ביטול").'
+                return done_msg
+            return 'לא מצאתי משימה עם המספר הזה. נסה שוב (או "ביטול").'
 
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
-    # ── Quick commands ───────────────────────
-
-    # Set budget limit: "הגדר תקציב מזון 3000"
-    limit_match = re.search(r'הגדר\s*תקציב\s*([א-ת\s]+?)\s+(\d+)', text)
-    if limit_match:
-        cat = limit_match.group(1).strip()
-        amt = int(limit_match.group(2))
-        if cat in BUDGET_CATEGORIES_HE:
-            set_budget_limit(cat, amt)
-            return f'✅ תקרת התקציב לקטגוריית *{cat}* עודכנה ל-{amt:,} ש"ח.'
-        return f'לא מצאתי קטגוריה בשם "{cat}".\nקטגוריות: {", ".join(BUDGET_CATEGORIES_HE)}'
-
-    # Complete task flow
-    if re.search(r'(סיימתי|בוצע|הושלם)\s*(משימה)?', text):
-        active_tasks = get_active_tasks(user_id)
-        if not active_tasks:
-            return 'אין משימות פתוחות לסיים! 🎉'
-        msg = '*איזו משימה סיימת? (שלח מספר)*\n\n'
-        for task_id, quad, desc in active_tasks:
-            preview = desc[:40] + ('…' if len(desc) > 40 else '')
-            msg += f'{task_id}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
-        set_user_context(user_id, {'type': 'complete_task'})
-        return msg
-
-    if any(kw in text for kw in ('סטטוס משימות', 'רשימת משימות')):
-        return get_task_status(user_id)
-    if any(kw in text for kw in ('סטטוס כלכלי', 'מאזן', 'תקציב')):
-        return get_detailed_budget(user_id)
-    if any(kw in text for kw in ('עזרה', 'תפריט')):
+    # ── A couple of instant, deterministic shortcuts (no AI latency) ──
+    if text in ('תפריט', 'עזרה', 'help', 'menu'):
         return get_help_menu()
 
-    # ── AI routing ───────────────────────────
-    ai_result = analyze_with_ai(text)
+    # ── AI routing via Function Calling ──────
+    try:
+        tool_calls, reply_text = get_ai_tool_calls(text)
+    except Exception:
+        # All retries exhausted — transient AI outage. Be honest, stay calm.
+        logger.exception('AI router permanently failed for user %s', user_id)
+        return 'יש כרגע עומס זמני בשרתי ה-AI 🛠️ נסה שוב עוד רגע קצר.'
 
-    action = ai_result.get('action')
+    if tool_calls:
+        # Execute every requested action (supports several in one message) and
+        # combine the confirmations into a single reply.
+        results = [execute_tool(name, args, user_id) for name, args in tool_calls]
+        return '\n\n'.join(r for r in results if r)
 
-    if action == 'expense':
-        amt  = float(ai_result.get('amount', 0))
-        cat  = ai_result.get('category', '')
-        desc = ai_result.get('description') or text
-        if cat not in BUDGET_CATEGORIES_HE:
-            return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(BUDGET_CATEGORIES_HE)}'
-        signed_amt = amt if cat == 'הכנסה' else -amt
-        add_expense(cat, signed_amt, now_local().isoformat(), desc, user_id)
-        alert = ''
-        if cat != 'הכנסה':
-            limit = get_budget_limit(cat)
-            if limit > 0:
-                spent = get_category_total_spent(cat, user_id)
-                rem   = limit - spent
-                alert = f'\n⚠️ חרגת ב-{abs(rem):,.0f} ש"ח!' if rem < 0 else f'\nנותרו {rem:,.0f} ש"ח החודש'
-        return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}*: {amt:,.0f} ש"ח{alert}'
+    if reply_text:
+        return reply_text
 
-    if action == 'task':
-        quad = ai_result.get('quadrant', '')
-        desc = ai_result.get('description') or text
-        if quad not in TASK_QUADRANTS_EMOJI:
-            return f'סוג משימה לא חוקי: "{quad}".'
-        add_task(quad, desc, user_id)
-        return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
-
-    if action == 'calendar':
-        title          = ai_result.get('title') or 'אירוע'
-        start_time_iso = ai_result.get('start_time')
-        if not start_time_iso:
-            return 'חסר תאריך ושעה לאירוע.'
-        return process_calendar_ai(title, start_time_iso, ai_result.get('location'))
-
-    if action == 'unknown':
-        return ai_result.get('reply') or 'לא הבנתי. כתוב "תפריט" לרשימת הפקודות.'
-
-    # Fallback — should never reach here if AI behaves
-    logger.warning('Unexpected AI action "%s" for user %s', action, user_id)
-    return 'לא הצלחתי לעבד את הבקשה. נסה לנסח אחרת, או כתוב "תפריט".'
+    # Neither a tool nor text — extremely rare. Nudge gently.
+    return 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
 
 
 def process_media_message(message: dict, user_id: str) -> str:
@@ -738,7 +1249,7 @@ def get_task_status(user_id: str) -> str:
     completed, total = get_tasks_completion_stats(user_id)
     active_tasks     = get_active_tasks(user_id)
     if not active_tasks:
-        return f'אין משימות פתוחות 🎉\n{completed}/{total} משימות הושלמו.'
+        return f'אין משימות פתוחות 🎉\n{completed}/{total} משימות הושלמו החודש.'
     grouped: dict[str, list] = {q: [] for q in TASK_QUADRANTS_EMOJI}
     for tid, quad, desc in active_tasks:
         grouped.setdefault(quad, []).append((tid, desc))
@@ -750,8 +1261,8 @@ def get_task_status(user_id: str) -> str:
                 preview = desc[:50] + ('…' if len(desc) > 50 else '')
                 status += f'  [{tid}] {preview}\n'
             status += '\n'
-    status += f'סה"כ: {len(active_tasks)} פתוחות | {completed}/{total} הושלמו\n'
-    status += '(לסיום: שלח "סיימתי משימה")'
+    status += f'סה"כ: {len(active_tasks)} פתוחות | {completed}/{total} הושלמו החודש\n'
+    status += '(לסיום: "סיימתי [שם המשימה]" · למחיקה: "מחק [שם המשימה]")'
     return status
 
 
@@ -808,14 +1319,21 @@ def get_welcome_message() -> str:
 def get_help_menu() -> str:
     return (
         '*תפריט עזרה — סחבק* 🤖\n\n'
+        'דבר איתי חופשי, אני מבין שפה טבעית:\n'
+        '• "קבע פגישה עם רופא השיניים ביום ראשון ב-10"\n'
+        '• "תוסיף משימה חשובה להכין מצגת"\n'
+        '• "שילמתי 250 על דלק"\n'
+        '• "סיימתי את המשימה של החלב"\n\n'
+        '*אפשר גם לבקש כמה דברים בהודעה אחת!*\n\n'
         '*פקודות מהירות:*\n'
-        '• "סטטוס משימות"\n'
-        '• "סיימתי משימה"\n'
-        '• "סטטוס כלכלי"\n'
-        '• "הגדר תקציב [קטגוריה] [סכום]"\n\n'
+        '• "סטטוס משימות" / "מה יש לי לעשות"\n'
+        '• "סטטוס כלכלי" / "מאזן"\n'
+        '• "הגדר תקציב מזון 3000"\n'
+        '• "מחק משימה ..." · "ביטול"\n\n'
         '*קטגוריות תקציב:*\n'
         + '  '.join(f'{e} {c}' for c, e in BUDGET_CATEGORIES_HE.items()) +
-        '\n\nאני כאן לעשות לך סדר! 💪'
+        '\n\nאפשר גם הקלטה קולית 🎤, תמונה 📷 או PDF 📄\n'
+        'אני כאן לעשות לך סדר! 💪'
     )
 
 
@@ -824,7 +1342,7 @@ def get_help_menu() -> str:
 # ─────────────────────────────────────────────
 
 def _handle_message_safely(message: dict, from_number: str) -> None:
-    """Runs in a background thread: build the reply and send it."""
+    """Runs on the thread pool: build the reply and send it."""
     try:
         msg_type = message.get('type', '')
         if msg_type == 'text':
@@ -888,14 +1406,10 @@ def webhook():
             logger.info('Duplicate message %s ignored', message_id)
             return jsonify({'status': 'duplicate'}), 200
 
-        # Process in the background so we ACK Meta within milliseconds.
-        # This prevents webhook timeouts (and the automatic re-delivery that
-        # follows) when Gemini / Calendar take a few seconds to respond.
-        threading.Thread(
-            target=_handle_message_safely,
-            args=(message, from_number),
-            daemon=True,
-        ).start()
+        # Process on a bounded background pool so we ACK Meta within
+        # milliseconds. This prevents webhook timeouts (and the automatic
+        # re-delivery that follows) when Gemini / Calendar take a few seconds.
+        _executor.submit(_handle_message_safely, message, from_number)
 
         return jsonify({'status': 'ok'}), 200
 
@@ -931,7 +1445,8 @@ def health():
 # ─────────────────────────────────────────────
 
 def _log_startup_config() -> None:
-    logger.info('סחבק starting — model=%s, whatsapp_api=%s', GEMINI_MODEL, WHATSAPP_API_VERSION)
+    logger.info('סחבק starting — model=%s, whatsapp_api=%s, workers=%d',
+                GEMINI_MODEL, WHATSAPP_API_VERSION, MAX_WORKERS)
     missing = [name for name, val in {
         'WHATSAPP_TOKEN':  WHATSAPP_TOKEN,
         'PHONE_NUMBER_ID': PHONE_NUMBER_ID,
