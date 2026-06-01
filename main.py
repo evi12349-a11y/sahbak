@@ -232,7 +232,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def _ensure_column(conn, table: str, column: str, col_def: str) -> None:
-    """Adds a column to an existing table if it's missing.
+    """Add a column to an existing table if it's missing.
 
     CREATE TABLE IF NOT EXISTS does NOT modify a table that already exists on
     the volume from an older schema, so columns added later (like user_id)
@@ -251,6 +251,8 @@ def init_db() -> None:
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     with _connect() as conn:
+        # WAL = concurrent readers + a single writer; far fewer "database is
+        # locked" errors now that webhooks are handled on background threads.
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA busy_timeout=10000')
         c = conn.cursor()
@@ -308,7 +310,7 @@ def init_db() -> None:
                 ON tasks (user_id, completed);
         ''')
 
-        # 4) Seed default limits only on first run.
+        # 4) Seed default limits only on first run
         c.execute('SELECT COUNT(*) FROM budget_limits')
         if c.fetchone()[0] == 0:
             c.executemany(
@@ -1485,9 +1487,9 @@ def _log_startup_config() -> None:
     if not APP_SECRET:
         logger.warning('APP_SECRET not set — webhook signature verification is OFF')
 
+
 # ═══════════════════════════════════════════════════════════════════════
 # ██  Dashboard REST API  ██
-# הוסף את הבלוק הזה ב-main.py, ממש לפני השורה:  if __name__ == '__main__':
 # ═══════════════════════════════════════════════════════════════════════
 #
 # אבטחה: כל בקשה מה-Dashboard חייבת לשלוח Header:
@@ -1497,9 +1499,10 @@ def _log_startup_config() -> None:
 
 DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
 
+
 def _require_dashboard_key():
     """מחזיר None אם המפתח תקין, response שגיאה אחרת."""
-    if not DASHBOARD_API_K שEY:
+    if not DASHBOARD_API_KEY:
         return jsonify({'error': 'DASHBOARD_API_KEY not configured on server'}), 503
     key = request.headers.get('X-Dashboard-Key', '')
     if not hmac.compare_digest(key, DASHBOARD_API_KEY):
@@ -1696,8 +1699,9 @@ def api_set_budget_limits():
     return jsonify({'status': 'ok', 'updated': updated}), 200
 
 # ═══════════════════════════════════════════════════════════════════════
-# סוף בלוק ה-Dashboard API  — המשך if __name__ == '__main__': אחרי זה
+# סוף בלוק ה-Dashboard API
 # ═══════════════════════════════════════════════════════════════════════
+
 
 # Run at import time so it also executes under gunicorn (production).
 init_db()
