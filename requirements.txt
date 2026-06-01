@@ -1,18 +1,21 @@
-# ── Web framework ──
-Flask>=3.0.0
-gunicorn>=21.2.0
+# סחבק — Python dependencies
+# ---------------------------------------------------------------------------
+# IMPORTANT: google-genai must be recent enough to support BOTH
+#   • parameters_json_schema= on FunctionDeclaration, and
+#   • ThinkingConfig(thinking_budget=...)
+# The code falls back gracefully if these aren't available, but on an old
+# google-genai the thinking-budget=0 fix (the main bug fix) can't apply and
+# you'd still see the "200 OK but empty" behaviour. Keep this pinned & fresh.
 
-# ── HTTP client (WhatsApp Cloud API + media download) ──
-requests>=2.31.0
+google-genai>=1.16.0
+google-api-python-client>=2.130.0
+google-auth>=2.30.0
 
-# ── Google Gemini (new unified SDK; function calling + multimodal) ──
-google-genai>=1.0.0
+flask>=3.0.0
+gunicorn>=22.0.0
+requests>=2.32.0
 
-# ── Google Calendar ──
-google-api-python-client>=2.100.0
-google-auth>=2.23.0
-
-# ── Timezone database ──
-# Critical on slim Railway/Docker images, which often ship without the IANA
-# tz database. Without this, ZoneInfo('Asia/Jerusalem') fails and times drift.
+# Timezone database — required for ZoneInfo('Asia/Jerusalem') on slim
+# Linux images (Railway/Nixpacks). Without it, now_local() falls back to UTC
+# and every "tomorrow at 9", month rollover, and timestamp is 2-3h off.
 tzdata>=2024.1
