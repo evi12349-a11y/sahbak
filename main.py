@@ -9,15 +9,33 @@ Stack:
   • Google Calendar API                  — event creation
   • SQLite (WAL)                          — budget / tasks / context storage
 
-Key reliability features:
-  1. Async webhook handling  — ACK Meta in milliseconds, work on a thread pool
-                               (prevents WhatsApp timeouts + duplicate re-delivery).
-  2. Exponential backoff     — every Gemini call is retried with jitter on
-                               transient errors (rate-limit / overload / 5xx).
-  3. Function Calling        — Gemini returns strict, typed tool calls instead of
-                               free-text we have to parse; supports several
-                               actions in a single message (parallel calls).
-  4. Voice / image / docs    — handled through the same async + retry pipeline.
+════════════════════════════════════════════════════════════════════════
+WHAT CHANGED IN THIS REVISION (read me)
+════════════════════════════════════════════════════════════════════════
+The previous version *looked* like an "AI overload" problem, but the Railway
+logs proved otherwise: the Gemini HTTP calls were returning **200 OK** while
+the user still got "there's load on the AI servers" / "I didn't understand".
+
+Root cause: gemini-2.5-flash is a *thinking* model. With thinking enabled +
+function-calling + temperature=0, the model frequently returns a candidate
+whose only part is an internal "thought" — so `response.function_calls` is
+empty AND `response.text` is None. 200 OK, but nothing usable → the bot
+silently dead-ended.
+
+Fixes (see inline comments tagged [FIX]):
+  1. Thinking DISABLED for the router (thinking_budget=0). Routing is fast
+     classification — thinking only added latency and this very bug.
+  2. Bulletproof response parsing + a no-tools fallback so the bot NEVER
+     returns an empty "I didn't understand" when the model actually answered.
+  3. Fast deterministic shortcuts for the common commands (מאזן / סטטוס /
+     הגדר תקציב …) so they cost 0 API calls and never fail.
+  4. Retry logic tightened: fewer attempts, shorter delays for the interactive
+     path, and far less greedy "is this retryable?" matching (so a permanent
+     error fails instantly instead of stalling ~7s then showing "overload").
+  5. Whitespace-only / empty inbound text no longer burns an AI call or spams
+     the full welcome screen.
+  6. Calendar service + tool declarations cached; busy_timeout on every DB
+     connection.
 """
 from __future__ import annotations  # makes type hints version-proof (3.9+)
 
@@ -41,8 +59,8 @@ from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# Gemini — new unified SDK. Replaces the deprecated `google-generativeai`
-# package (legacy SDK deprecated 2025-11-30).
+# Gemini — new unified SDK (`google-genai`). Replaces the deprecated
+# `google-generativeai` package (legacy SDK deprecated 2025-11-30).
 from google import genai
 from google.genai import types
 
@@ -61,6 +79,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger('sahbak')
+
+# Bump this on every meaningful deploy so /health proves which build is live.
+BUILD_VERSION = '2026-06-01-r2'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -160,27 +181,35 @@ PROCESSED_TTL_DAYS = 3
 
 
 # ═════════════════════════════════════════════
-# Retry — Exponential backoff with jitter  (Doc §2)
+# Retry — Exponential backoff with jitter
 # ═════════════════════════════════════════════
-# Transient HTTP statuses worth retrying. 429 = rate limit / quota,
-# 5xx = server overload or hiccup. Everything else (400/401/403/404) is a
-# permanent error and is re-raised immediately.
+# [FIX] Tightened. Transient HTTP statuses worth retrying. 429 = rate limit,
+# 5xx = server overload/hiccup. Everything else (400/401/403/404/INVALID_*) is
+# permanent and re-raised immediately so we fail FAST instead of stalling.
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
-# Substrings that signal a transient failure when no numeric code is available.
+# [FIX] Much less greedy than before. We ONLY fall back to message inspection
+# when there is no numeric code, and we match phrases that are unambiguously
+# transient. Removed dangerous broad needles like 'connection',
+# 'internal error', and bare '500' which caused permanent errors to be retried
+# (adding ~7s latency before failing — exactly the "it's slow / gives up" pain).
 _RETRYABLE_NEEDLES = (
-    'rate limit', 'rate-limit', 'quota', 'resource exhausted', 'overload',
-    'overloaded', 'unavailable', 'deadline', 'timed out', 'timeout',
-    'try again', 'temporarily', 'connection', 'connection reset',
-    'internal error', 'internal server', '429', '500', '502', '503', '504',
+    'rate limit', 'rate-limit', 'resource exhausted', 'resource_exhausted',
+    'quota exceeded', 'overloaded', 'unavailable', 'try again later',
+    'temporarily unavailable', 'deadline exceeded', 'service unavailable',
+    '429', '503',
 )
 
 
 def _is_retryable_error(exc: Exception) -> bool:
-    """Best-effort detection of transient errors across SDK versions."""
+    """Best-effort detection of *transient* errors across SDK versions.
+
+    Conservative on purpose: when in doubt, treat as permanent and fail fast.
+    """
     # 1) Typed SDK errors (newer google-genai)
     if genai_errors is not None:
-        if isinstance(exc, getattr(genai_errors, 'ServerError', ())):
+        server_err = getattr(genai_errors, 'ServerError', None)
+        if server_err and isinstance(exc, server_err):
             return True
         client_err = getattr(genai_errors, 'ClientError', None)
         if client_err and isinstance(exc, client_err):
@@ -190,22 +219,26 @@ def _is_retryable_error(exc: Exception) -> bool:
     # 2) Any object that carries a numeric status code
     for attr in ('code', 'status_code', 'http_status'):
         code = getattr(exc, attr, None)
-        if isinstance(code, int) and code in RETRYABLE_STATUS:
-            return True
+        if isinstance(code, int):
+            return code in RETRYABLE_STATUS
 
-    # 3) Fall back to message inspection
+    # 3) Last resort — narrow message inspection
     msg = str(exc).lower()
     return any(n in msg for n in _RETRYABLE_NEEDLES)
 
 
 def call_with_retry(fn, *, what: str = 'AI call',
-                    max_attempts: int = 4, base_delay: float = 1.0):
-    """Run `fn`, retrying transient failures with exponential backoff + jitter.
+                    max_attempts: int = 3, base_delay: float = 0.6,
+                    max_total: float = 6.0):
+    """Run `fn`, retrying *transient* failures with exponential backoff + jitter.
 
-    Delays grow 1s → 2s → 4s (plus up to +30% random jitter to avoid
-    thundering-herd). Permanent errors are raised on the first failure.
+    [FIX] Defaults tuned for an interactive WhatsApp bot: 3 attempts, fast
+    backoff (~0.6s, 1.2s), and a hard ceiling on total time spent waiting
+    (`max_total`) so a user is never left hanging for many seconds. Permanent
+    errors are raised on the first failure.
     """
     last_exc: Exception | None = None
+    spent = 0.0
     for attempt in range(1, max_attempts + 1):
         try:
             return fn()
@@ -215,11 +248,15 @@ def call_with_retry(fn, *, what: str = 'AI call',
                 raise
             delay = base_delay * (2 ** (attempt - 1))
             delay += random.uniform(0, delay * 0.3)  # jitter
+            if spent + delay > max_total:
+                logger.warning('%s: transient error but time budget exhausted '
+                               '(%.1fs) — giving up early: %s', what, spent, exc)
+                raise
+            spent += delay
             logger.warning('%s failed (attempt %d/%d): %s — retrying in %.1fs',
                            what, attempt, max_attempts, exc, delay)
             time.sleep(delay)
-    # Should be unreachable, but keeps the type checker happy.
-    assert last_exc is not None
+    assert last_exc is not None  # unreachable; keeps type checker happy
     raise last_exc
 
 
@@ -227,8 +264,15 @@ def call_with_retry(fn, *, what: str = 'AI call',
 # Database
 # ─────────────────────────────────────────────
 def _connect() -> sqlite3.Connection:
-    # timeout reduces "database is locked" under concurrent webhooks
-    return sqlite3.connect(DB_FILE, timeout=10)
+    # [FIX] Set busy_timeout on EVERY connection (not just init_db). Under the
+    # thread pool, concurrent writers used to hit "database is locked" because
+    # only the init connection had the timeout.
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute('PRAGMA busy_timeout=10000')
+    except Exception:
+        pass
+    return conn
 
 
 def _ensure_column(conn, table: str, column: str, col_def: str) -> None:
@@ -519,9 +563,20 @@ def find_tasks_by_text(query: str, user_id: str) -> list[tuple]:
 # ─────────────────────────────────────────────
 # Google Calendar
 # ─────────────────────────────────────────────
+# [FIX] Cache the service. Previously every event rebuilt credentials + the
+# discovery client (json.loads + auth handshake) on each call — slow and wasteful.
+_calendar_service = None
+_calendar_service_failed = False
+
 
 def get_calendar_service():
+    global _calendar_service, _calendar_service_failed
+    if _calendar_service is not None:
+        return _calendar_service
+    if _calendar_service_failed:
+        return None
     if not GOOGLE_CREDENTIALS:
+        _calendar_service_failed = True
         return None
     try:
         creds_dict  = json.loads(GOOGLE_CREDENTIALS)
@@ -530,9 +585,12 @@ def get_calendar_service():
         )
         # cache_discovery=False avoids a noisy warning + file cache on
         # read-only / serverless filesystems.
-        return build('calendar', 'v3', credentials=credentials, cache_discovery=False)
+        _calendar_service = build('calendar', 'v3', credentials=credentials,
+                                  cache_discovery=False)
+        return _calendar_service
     except Exception:
         logger.exception('Failed to build calendar service')
+        _calendar_service_failed = True
         return None
 
 
@@ -576,7 +634,10 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
     if location:
         event['location'] = location
     try:
-        created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+        created = call_with_retry(
+            lambda: service.events().insert(calendarId=CALENDAR_ID, body=event).execute(),
+            what='Calendar insert', max_attempts=3, base_delay=0.6, max_total=6.0,
+        )
         link    = created.get('htmlLink', 'לא זמין')
         weekday = HEB_WEEKDAYS[start_time.weekday()]
         return (
@@ -593,13 +654,11 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
 
 
 # ═════════════════════════════════════════════
-# AI — Gemini Function / Tool Calling  (Doc §3)
+# AI — Gemini Function / Tool Calling
 # ═════════════════════════════════════════════
 # Instead of asking the model for free-form JSON and parsing it (brittle), we
 # declare strict, typed tools. The model returns one or more `function_call`
-# parts with validated args, which we dispatch in `execute_tool`. This nearly
-# eliminates "the bot didn't understand" failures and supports several actions
-# in a single message (parallel function calling).
+# parts with validated args, which we dispatch in `execute_tool`.
 
 def _make_function_declaration(name: str, description: str, schema: dict):
     """Build a FunctionDeclaration compatibly across google-genai versions.
@@ -780,6 +839,26 @@ def _get_tools():
     return _TOOLS
 
 
+# [FIX] Build a GenerateContentConfig with thinking DISABLED, compatibly across
+# SDK versions. Thinking is the thing that produced 200-OK-but-empty responses
+# for the router. Some older SDKs don't accept thinking_config — so we try, and
+# fall back to a config without it.
+def _router_config():
+    base_kwargs = dict(
+        system_instruction=_system_instruction(),
+        tools=_get_tools(),
+        temperature=0.0,  # deterministic routing
+    )
+    # Attempt to attach thinking_config(thinking_budget=0).
+    try:
+        thinking = types.ThinkingConfig(thinking_budget=0)
+        return types.GenerateContentConfig(thinking_config=thinking, **base_kwargs)
+    except Exception:
+        # SDK too old for ThinkingConfig, or signature differs — config without
+        # it still works (model may think, but parsing below now tolerates it).
+        return types.GenerateContentConfig(**base_kwargs)
+
+
 def _system_instruction() -> str:
     now = now_local()
     weekday = HEB_WEEKDAYS[now.weekday()]
@@ -793,8 +872,59 @@ def _system_instruction() -> str:
         'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים '
         '(למשל גם לקבוע פגישה וגם להוסיף משימה).\n'
         'אם המשתמש רק משוחח, שואל שאלה כללית או אומר שלום — ענה בטקסט קצר '
-        'וחביב בלי לקרוא לכלי.'
+        'וחביב בלי לקרוא לכלי. תמיד תן תשובה כלשהי — לעולם אל תשתוק.'
     )
+
+
+def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
+    """Pull (function_calls, text) out of a Gemini response, defensively.
+
+    [FIX] This is the heart of the bug fix. We:
+      • prefer response.function_calls,
+      • else walk candidate parts (skipping 'thought' parts),
+      • read text WITHOUT touching response.text (which can raise when the
+        candidate has no text part), assembling it from parts ourselves.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    # Convenience accessor first.
+    fcs = getattr(response, 'function_calls', None)
+    if fcs:
+        for fc in fcs:
+            try:
+                calls.append((fc.name, dict(fc.args or {})))
+            except Exception:
+                logger.warning('Bad function_call object: %r', fc)
+        if calls:
+            return calls, ''
+
+    # Manual walk of the parts.
+    parts = []
+    try:
+        candidate = response.candidates[0]
+        parts = candidate.content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        parts = []
+
+    text_chunks: list[str] = []
+    for part in parts:
+        # Skip internal "thought" parts — they are not user-facing.
+        if getattr(part, 'thought', False):
+            continue
+        fc = getattr(part, 'function_call', None)
+        if fc and getattr(fc, 'name', None):
+            try:
+                calls.append((fc.name, dict(fc.args or {})))
+            except Exception:
+                logger.warning('Bad function_call part: %r', fc)
+            continue
+        txt = getattr(part, 'text', None)
+        if txt:
+            text_chunks.append(txt)
+
+    if calls:
+        return calls, ''
+    return [], ' '.join(c.strip() for c in text_chunks).strip()
 
 
 def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
@@ -803,7 +933,12 @@ def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
     Returns (tool_calls, reply_text):
       • tool_calls — list of (function_name, args_dict). Empty for plain chat.
       • reply_text — the model's text answer when no tool was called.
-    Raises on a final, non-recoverable API failure (caller shows a friendly msg).
+
+    [FIX] Guarantees a non-empty result whenever the model responded at all.
+    If the primary (with-tools) call comes back empty — the old failure mode —
+    we retry ONCE without tools to at least get a friendly text reply, so the
+    user never sees a silent "I didn't understand" after a successful 200.
+    Raises only on a final, non-recoverable transient API failure.
     """
     client = get_genai_client()
     if not client:
@@ -813,39 +948,40 @@ def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
         return client.models.generate_content(
             model=GEMINI_MODEL,
             contents=text,
-            config=types.GenerateContentConfig(
-                system_instruction=_system_instruction(),
-                tools=_get_tools(),
-                temperature=0.0,  # deterministic routing
-            ),
+            config=_router_config(),
         )
 
-    response = call_with_retry(_call, what='Gemini (router)')
+    response = call_with_retry(_call, what='Gemini (router)',
+                               max_attempts=3, base_delay=0.6, max_total=6.0)
+    calls, reply_text = _extract_calls_and_text(response)
+    if calls or reply_text:
+        return calls, reply_text
 
-    # Preferred path: SDK exposes a convenient .function_calls property.
-    calls: list[tuple[str, dict]] = []
-    fcs = getattr(response, 'function_calls', None)
-    if fcs:
-        for fc in fcs:
-            calls.append((fc.name, dict(fc.args or {})))
-        return calls, ''
-
-    # Fallback: walk the parts manually (older SDKs / edge cases).
+    # Empty response despite 200 OK — the exact bug we saw in the logs.
+    logger.warning('Router returned empty content (200 but no call/text). '
+                   'Retrying once without tools for a text reply. msg=%r', text[:120])
     try:
-        parts = response.candidates[0].content.parts or []
-    except (AttributeError, IndexError, TypeError):
-        parts = []
-    text_chunks: list[str] = []
-    for part in parts:
-        fc = getattr(part, 'function_call', None)
-        if fc and getattr(fc, 'name', None):
-            calls.append((fc.name, dict(fc.args or {})))
-        elif getattr(part, 'text', None):
-            text_chunks.append(part.text)
+        def _plain():
+            cfg_kwargs = dict(system_instruction=_system_instruction(), temperature=0.3)
+            try:
+                cfg = types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    **cfg_kwargs)
+            except Exception:
+                cfg = types.GenerateContentConfig(**cfg_kwargs)
+            return client.models.generate_content(
+                model=GEMINI_MODEL, contents=text, config=cfg)
+        resp2 = call_with_retry(_plain, what='Gemini (plain fallback)',
+                                max_attempts=2, base_delay=0.5, max_total=4.0)
+        _, text2 = _extract_calls_and_text(resp2)
+        if text2:
+            return [], text2
+    except Exception:
+        logger.exception('Plain fallback also failed')
 
-    if calls:
-        return calls, ''
-    return [], ' '.join(c.strip() for c in text_chunks).strip()
+    # Truly nothing — return a helpful nudge instead of a silent dead-end.
+    return [], ('לא הצלחתי לעבד את הבקשה הזו 🤔 נסה לנסח קצת אחרת, '
+                'או כתוב "תפריט" לרשימת הפקודות.')
 
 
 # ── Tool dispatch ────────────────────────────
@@ -1002,9 +1138,9 @@ def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: st
     try:
         response = call_with_retry(
             lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
-            what='Gemini (image)',
+            what='Gemini (image)', max_attempts=3, base_delay=0.8, max_total=10.0,
         )
-        out = (response.text or '').strip()
+        _, out = _extract_calls_and_text(response)
         return f'📷 *תיאור התמונה:*\n{out}' if out else 'לא הצלחתי לנתח את התמונה.'
     except Exception:
         logger.exception('Image description failed')
@@ -1024,9 +1160,9 @@ def transcribe_audio_with_ai(audio_data: bytes | None, mime_type: str) -> str | 
                     types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/ogg'),
                 ],
             ),
-            what='Gemini (audio)',
+            what='Gemini (audio)', max_attempts=3, base_delay=0.8, max_total=10.0,
         )
-        out = (response.text or '').strip()
+        _, out = _extract_calls_and_text(response)
         return out or None
     except Exception:
         logger.exception('Audio transcription failed')
@@ -1053,9 +1189,9 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
                     types.Part.from_bytes(data=doc_data, mime_type=mime_type),
                 ],
             ),
-            what='Gemini (document)',
+            what='Gemini (document)', max_attempts=3, base_delay=0.8, max_total=12.0,
         )
-        out = (response.text or '').strip()
+        _, out = _extract_calls_and_text(response)
         return f'📄 *סיכום — {name}:*\n{out}' if out else f'לא הצלחתי לסכם את {name}.'
     except Exception:
         logger.exception('Document summary failed')
@@ -1110,7 +1246,8 @@ def _post_whatsapp(payload: dict) -> bool:
         return True
 
     try:
-        return call_with_retry(_do, what='WhatsApp send', max_attempts=3)
+        return call_with_retry(_do, what='WhatsApp send',
+                               max_attempts=3, base_delay=0.6, max_total=6.0)
     except Exception:
         logger.exception('Failed to send WhatsApp message')
         return False
@@ -1119,6 +1256,8 @@ def _post_whatsapp(payload: dict) -> bool:
 def send_whatsapp_message(to: str, message: str) -> bool:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error('WhatsApp credentials not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)')
+        return False
+    if not message:
         return False
     ok = True
     for chunk in _split_for_whatsapp(message):
@@ -1144,7 +1283,7 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
                 f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}',
                 headers=headers, timeout=15
             ),
-            what='WhatsApp media meta', max_attempts=3,
+            what='WhatsApp media meta', max_attempts=3, base_delay=0.6, max_total=6.0,
         )
         meta.raise_for_status()
         meta_json = meta.json()
@@ -1155,7 +1294,7 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         # Step 2: download actual bytes (the CDN URL also needs the auth header)
         media_resp = call_with_retry(
             lambda: http_requests.get(media_url, headers=headers, timeout=30),
-            what='WhatsApp media download', max_attempts=3,
+            what='WhatsApp media download', max_attempts=3, base_delay=0.8, max_total=8.0,
         )
         media_resp.raise_for_status()
         return media_resp.content, mime_type
@@ -1177,11 +1316,77 @@ def verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool
 
 
 # ─────────────────────────────────────────────
+# Fast deterministic shortcuts  [FIX: latency + reliability]
+# ─────────────────────────────────────────────
+# The help menu itself advertises these phrases. They have ONE obvious meaning,
+# so routing them through Gemini only added 1-3s of latency and a failure
+# surface (the 200-OK-but-empty bug). Handle them locally → instant, 0 API
+# calls, never fails. The AI is still used for everything genuinely free-form.
+
+_GREETINGS = {
+    'שלום', 'היי', 'הי', 'אהלן', 'הלו', 'הייי', 'בוקר טוב', 'ערב טוב',
+    'צהריים טובים', 'מה קורה', 'מה נשמע', 'מה המצב', 'hi', 'hello', 'hey',
+    'start', 'התחל', 'התחלה',
+}
+
+# "הגדר תקציב <קטגוריה> <סכום>"  (set budget <category> <amount>)
+_SET_BUDGET_RE = re.compile(
+    r'^(?:הגדר|עדכן|קבע|שנה)\s+תקציב\s+(\S+)\s+([\d,\.]+)\s*(?:ש"ח|שקל|שקלים|₪)?\s*$'
+)
+
+
+def _try_fast_shortcut(text: str, user_id: str) -> str | None:
+    """Return a reply if `text` is an unambiguous command we can serve without
+    the AI; otherwise None (let the AI router handle it)."""
+    t = text.strip()
+    low = t.lower()
+
+    # Help / menu
+    if low in ('תפריט', 'עזרה', 'help', 'menu', 'פקודות', '?'):
+        return get_help_menu()
+
+    # Greetings → welcome (only for a clean, short greeting, not a sentence)
+    if low in _GREETINGS:
+        return get_welcome_message()
+
+    # Budget status
+    if t in ('מאזן', 'סטטוס כלכלי', 'סטטוס כספי', 'תקציב', 'מצב כספי',
+             'כמה הוצאתי', 'דוח', 'דוח כספי', 'מצב תקציב'):
+        return get_detailed_budget(user_id)
+
+    # Tasks status
+    if t in ('סטטוס משימות', 'משימות', 'מה יש לי לעשות', 'מה יש לי',
+             'רשימת משימות', 'המשימות שלי', 'מטלות', 'todo', 'משימות פתוחות'):
+        return get_task_status(user_id)
+
+    # Set budget limit: "הגדר תקציב מזון 3000"
+    m = _SET_BUDGET_RE.match(t)
+    if m:
+        cat = m.group(1).strip()
+        raw_amt = m.group(2).replace(',', '')
+        try:
+            amt = float(raw_amt)
+        except ValueError:
+            return None  # fall through to AI
+        # category may be exact or close; require exact match against our set
+        if cat in BUDGET_CATEGORIES_HE and cat != 'הכנסה':
+            return _tool_set_limit({'category': cat, 'amount': amt}, user_id)
+        # unknown category word → let AI try to map it
+        return None
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # Message Processing
 # ─────────────────────────────────────────────
 
 def process_message(text: str, user_id: str) -> str:
-    text = text.strip()
+    text = (text or '').strip()
+    if not text:
+        # [FIX] Never fire the AI on an empty/whitespace message and never spam
+        # the full welcome screen for it. A gentle nudge is enough.
+        return 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
 
     # ── Multi-step context flow ──────────────
     context = get_user_context(user_id)
@@ -1211,28 +1416,36 @@ def process_message(text: str, user_id: str) -> str:
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
-    # ── A couple of instant, deterministic shortcuts (no AI latency) ──
-    if text in ('תפריט', 'עזרה', 'help', 'menu'):
-        return get_help_menu()
+    # ── Fast deterministic shortcuts (no AI latency, can't fail) ──
+    shortcut = _try_fast_shortcut(text, user_id)
+    if shortcut is not None:
+        return shortcut
 
     # ── AI routing via Function Calling ──────
     try:
         tool_calls, reply_text = get_ai_tool_calls(text)
     except Exception:
-        # All retries exhausted — transient AI outage. Be honest, stay calm.
+        # All retries exhausted — genuine transient AI outage. Be honest, calm,
+        # and DON'T pretend the user did something wrong.
         logger.exception('AI router permanently failed for user %s', user_id)
-        return 'יש כרגע עומס זמני בשרתי ה-AI 🛠️ נסה שוב עוד רגע קצר.'
+        return ('יש כרגע עומס זמני על שרתי ה-AI 🛠️\n'
+                'הבקשה שלך לא אבדה — נסה לשלוח אותה שוב עוד כמה שניות.')
 
     if tool_calls:
         # Execute every requested action (supports several in one message) and
         # combine the confirmations into a single reply.
         results = [execute_tool(name, args, user_id) for name, args in tool_calls]
-        return '\n\n'.join(r for r in results if r)
+        combined = '\n\n'.join(r for r in results if r)
+        if combined:
+            return combined
+        # Extremely unlikely (all tools returned empty) — don't go silent.
+        return 'בוצע ✅'
 
     if reply_text:
         return reply_text
 
-    # Neither a tool nor text — extremely rare. Nudge gently.
+    # get_ai_tool_calls already guarantees a non-empty fallback, so we should
+    # never reach here — but if we do, nudge rather than dead-end.
     return 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
 
 
@@ -1371,14 +1584,29 @@ def get_help_menu() -> str:
 # Webhook Routes
 # ─────────────────────────────────────────────
 
+# [FIX] Send a quick "I'm on it" ACK ONLY for the genuinely slow path (media:
+# download + Gemini vision/transcription). This is exactly the user's ask —
+# "say you're handling it, then update when done" — without spamming an extra
+# message before the instant text replies.
+SEND_MEDIA_ACK = os.getenv('SEND_MEDIA_ACK', 'true').lower() in ('true', '1', 'yes')
+
+
 def _handle_message_safely(message: dict, from_number: str) -> None:
     """Runs on the thread pool: build the reply and send it."""
     try:
         msg_type = message.get('type', '')
         if msg_type == 'text':
-            text     = message.get('text', {}).get('body', '').strip()
-            response = process_message(text, from_number) if text else get_welcome_message()
+            text = message.get('text', {}).get('body', '')
+            if text and text.strip():
+                response = process_message(text, from_number)
+            else:
+                # Empty/odd 'text' event (reaction, edit, system) — quiet nudge,
+                # not the whole welcome screen on every weird event.
+                response = 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
         elif msg_type in MEDIA_TYPES:
+            if SEND_MEDIA_ACK:
+                # Reassure immediately; the heavy work follows.
+                send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
             response = process_media_message(message, from_number)
         else:
             response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, הקלטה או קובץ.'
@@ -1386,7 +1614,10 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
     except Exception:
         logger.exception('Failed to handle message from %s', from_number)
         try:
-            send_whatsapp_message(from_number, 'אופס, משהו השתבש אצלי. נסה שוב עוד רגע 🙏')
+            send_whatsapp_message(
+                from_number,
+                'אופס, משהו השתבש אצלי 🙏 הבקשה לא אבדה — נסה שוב עוד רגע.'
+            )
         except Exception:
             logger.exception('Also failed to send error reply to %s', from_number)
 
@@ -1454,7 +1685,7 @@ def webhook():
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({'service': 'sahbak', 'status': 'running'}), 200
+    return jsonify({'service': 'sahbak', 'status': 'running', 'version': BUILD_VERSION}), 200
 
 
 @app.route('/health', methods=['GET'])
@@ -1462,6 +1693,7 @@ def health():
     """Simple health-check endpoint for Railway / uptime monitors."""
     return jsonify({
         'status':    'ok',
+        'version':   BUILD_VERSION,
         'timestamp': now_local().isoformat(),
         'model':     GEMINI_MODEL,
         'gemini':    bool(GEMINI_API_KEY),
@@ -1475,8 +1707,8 @@ def health():
 # ─────────────────────────────────────────────
 
 def _log_startup_config() -> None:
-    logger.info('סחבק starting — model=%s, whatsapp_api=%s, workers=%d',
-                GEMINI_MODEL, WHATSAPP_API_VERSION, MAX_WORKERS)
+    logger.info('סחבק starting — build=%s, model=%s, whatsapp_api=%s, workers=%d',
+                BUILD_VERSION, GEMINI_MODEL, WHATSAPP_API_VERSION, MAX_WORKERS)
     missing = [name for name, val in {
         'WHATSAPP_TOKEN':  WHATSAPP_TOKEN,
         'PHONE_NUMBER_ID': PHONE_NUMBER_ID,
