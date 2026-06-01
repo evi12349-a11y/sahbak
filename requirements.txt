@@ -1,13 +1,18 @@
-# Web framework + production server
-flask>=3.0,<4.0
+# ── Web framework ──
+Flask>=3.0.0
 gunicorn>=21.2.0
 
-# Gemini — new unified SDK (replaces the deprecated google-generativeai)
+# ── HTTP client (WhatsApp Cloud API + media download) ──
+requests>=2.31.0
+
+# ── Google Gemini (new unified SDK; function calling + multimodal) ──
 google-genai>=1.0.0
 
-# Google Calendar
+# ── Google Calendar ──
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
 
-# HTTP client (WhatsApp Cloud API)
-requests>=2.31.0
+# ── Timezone database ──
+# Critical on slim Railway/Docker images, which often ship without the IANA
+# tz database. Without this, ZoneInfo('Asia/Jerusalem') fails and times drift.
+tzdata>=2024.1
