@@ -14,7 +14,7 @@ google-auth>=2.30.0
 flask>=3.0.0
 gunicorn>=22.0.0
 requests>=2.32.0
-
+Flask-Cors==4.0.1
 # Timezone database — required for ZoneInfo('Asia/Jerusalem') on slim
 # Linux images (Railway/Nixpacks). Without it, now_local() falls back to UTC
 # and every "tomorrow at 9", month rollover, and timestamp is 2-3h off.
