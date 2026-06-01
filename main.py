@@ -1457,6 +1457,219 @@ def _log_startup_config() -> None:
     if not APP_SECRET:
         logger.warning('APP_SECRET not set — webhook signature verification is OFF')
 
+# ═══════════════════════════════════════════════════════════════════════
+# ██  Dashboard REST API  ██
+# הוסף את הבלוק הזה ב-main.py, ממש לפני השורה:  if __name__ == '__main__':
+# ═══════════════════════════════════════════════════════════════════════
+#
+# אבטחה: כל בקשה מה-Dashboard חייבת לשלוח Header:
+#   X-Dashboard-Key: <הערך שהגדרת ב-Railway כ-DASHBOARD_API_KEY>
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
+
+def _require_dashboard_key():
+    """מחזיר None אם המפתח תקין, response שגיאה אחרת."""
+    if not DASHBOARD_API_K שEY:
+        return jsonify({'error': 'DASHBOARD_API_KEY not configured on server'}), 503
+    key = request.headers.get('X-Dashboard-Key', '')
+    if not hmac.compare_digest(key, DASHBOARD_API_KEY):
+        return jsonify({'error': 'unauthorized'}), 401
+    return None
+
+
+def _get_user_id():
+    """user_id מה-query string או מה-JSON body."""
+    return (request.args.get('user_id') or
+            (request.get_json(silent=True) or {}).get('user_id', ''))
+
+
+# ─── GET /api/dashboard?user_id=<PHONE> ─────────────────────────────────────
+@app.route('/api/dashboard', methods=['GET'])
+def api_dashboard():
+    """מחזיר את כל הנתונים לדשבורד: תקציב, משימות, תנועות."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    user_id = _get_user_id()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    # תקציב חודש נוכחי
+    budget_rows = get_all_budget_summary(user_id)
+    limits      = get_all_budget_limits()
+    budget = []
+    for cat, total in budget_rows:
+        budget.append({
+            'category': cat,
+            'emoji':    BUDGET_CATEGORIES_HE.get(cat, '💵'),
+            'total':    round(total, 2),
+            'limit':    limits.get(cat, 0),
+        })
+
+    # משימות פתוחות
+    active = get_active_tasks(user_id)
+    tasks  = [{'id': t[0], 'quadrant': t[1], 'description': t[2]} for t in active]
+
+    # סטטיסטיקת השלמה (חודש נוכחי)
+    completed, total_tasks = get_tasks_completion_stats(user_id)
+
+    # תנועות אחרונות — 50 האחרונות בחודש הנוכחי
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, category, amount, date, description
+               FROM budget
+               WHERE user_id = ? AND strftime('%Y-%m', date) = ?
+               ORDER BY id DESC LIMIT 50""",
+            (user_id, current_month)
+        ).fetchall()
+    transactions = [
+        {'id': r[0], 'category': r[1], 'amount': r[2],
+         'date': r[3], 'description': r[4]}
+        for r in rows
+    ]
+
+    return jsonify({
+        'user_id':         user_id,
+        'month':           current_month,
+        'budget_summary':  budget,
+        'budget_limits':   limits,
+        'tasks':           tasks,
+        'tasks_completed': completed,
+        'tasks_total':     total_tasks,
+        'transactions':    transactions,
+        'timestamp':       now_local().isoformat(),
+    }), 200
+
+
+# ─── POST /api/expense ───────────────────────────────────────────────────────
+@app.route('/api/expense', methods=['POST'])
+def api_add_expense():
+    """הוסף הוצאה/הכנסה מהדשבורד — מסונכרן מיידית עם הבוט."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    data    = request.get_json(silent=True) or {}
+    user_id = data.get('user_id', '')
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'invalid amount'}), 400
+
+    category    = (data.get('category') or '').strip()
+    description = (data.get('description') or category).strip()
+
+    if category not in BUDGET_CATEGORIES_HE:
+        return jsonify({'error': f'invalid category: {category}',
+                        'valid': VALID_CATEGORIES}), 400
+    if amount <= 0:
+        return jsonify({'error': 'amount must be positive'}), 400
+
+    signed = amount if category == 'הכנסה' else -amount
+    add_expense(category, signed, now_local().isoformat(), description, user_id)
+    return jsonify({'status': 'ok', 'category': category, 'amount': signed}), 201
+
+
+# ─── DELETE /api/expense/<id>?user_id=<PHONE> ───────────────────────────────
+@app.route('/api/expense/<int:expense_id>', methods=['DELETE'])
+def api_delete_expense(expense_id):
+    """מחיקת תנועה לפי ID."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    user_id = _get_user_id()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+    with _connect() as conn:
+        cur = conn.execute(
+            'DELETE FROM budget WHERE id = ? AND user_id = ?',
+            (expense_id, user_id)
+        )
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'error': 'expense not found'}), 404
+    return jsonify({'status': 'ok', 'expense_id': expense_id}), 200
+
+
+# ─── POST /api/tasks ─────────────────────────────────────────────────────────
+@app.route('/api/tasks', methods=['POST'])
+def api_add_task():
+    """הוסף משימה מהדשבורד — מסונכרן מיידית עם הבוט."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    data    = request.get_json(silent=True) or {}
+    user_id = data.get('user_id', '')
+    quad    = (data.get('quadrant') or 'חשוב לא דחוף').strip()
+    desc    = (data.get('description') or '').strip()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+    if not desc:
+        return jsonify({'error': 'description required'}), 400
+    if quad not in TASK_QUADRANTS_EMOJI:
+        quad = 'חשוב לא דחוף'
+    add_task(quad, desc, user_id)
+    return jsonify({'status': 'ok', 'quadrant': quad, 'description': desc}), 201
+
+
+# ─── PATCH /api/tasks/<id>/complete?user_id=<PHONE> ─────────────────────────
+@app.route('/api/tasks/<int:task_id>/complete', methods=['PATCH'])
+def api_complete_task(task_id):
+    """סמן משימה כהושלמה מהדשבורד."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    user_id = _get_user_id()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+    ok = mark_task_completed(task_id, user_id)
+    if not ok:
+        return jsonify({'error': 'task not found or already completed'}), 404
+    return jsonify({'status': 'ok', 'task_id': task_id}), 200
+
+
+# ─── DELETE /api/tasks/<id>?user_id=<PHONE> ─────────────────────────────────
+@app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
+def api_delete_task_route(task_id):
+    """מחק משימה מהדשבורד."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    user_id = _get_user_id()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+    ok = delete_task_by_id(task_id, user_id)
+    if not ok:
+        return jsonify({'error': 'task not found'}), 404
+    return jsonify({'status': 'ok', 'task_id': task_id}), 200
+
+
+# ─── PUT /api/budget-limits ──────────────────────────────────────────────────
+@app.route('/api/budget-limits', methods=['PUT'])
+def api_set_budget_limits():
+    """עדכן מגבלות תקציב מהדשבורד. Body: { "מזון": 3000, "רכב": 2000, ... }"""
+    err = _require_dashboard_key()
+    if err:
+        return err
+    data    = request.get_json(silent=True) or {}
+    updated = []
+    for cat, amt in data.items():
+        if cat in BUDGET_CATEGORIES_HE and cat != 'הכנסה':
+            try:
+                set_budget_limit(cat, float(amt))
+                updated.append(cat)
+            except (TypeError, ValueError):
+                pass
+    return jsonify({'status': 'ok', 'updated': updated}), 200
+
+# ═══════════════════════════════════════════════════════════════════════
+# סוף בלוק ה-Dashboard API  — המשך if __name__ == '__main__': אחרי זה
+# ═══════════════════════════════════════════════════════════════════════
 
 # Run at import time so it also executes under gunicorn (production).
 init_db()
