@@ -54,6 +54,7 @@ from zoneinfo import ZoneInfo
 
 import requests as http_requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # Google Calendar (google-api-python-client + google-auth)
 from google.oauth2 import service_account
@@ -87,6 +88,7 @@ BUILD_VERSION = '2026-06-01-r2'
 # App & Config
 # ─────────────────────────────────────────────
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}}, allow_headers=["X-Dashboard-Key", "Content-Type"])
 
 VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
 WHATSAPP_TOKEN       = os.getenv('WHATSAPP_TOKEN')
