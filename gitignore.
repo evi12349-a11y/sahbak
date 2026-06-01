@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Local database (SQLite + WAL sidecars)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets / env
+.env
+.env.*
+*.key
+credentials*.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
