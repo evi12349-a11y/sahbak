@@ -231,16 +231,33 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(DB_FILE, timeout=10)
 
 
+def _ensure_column(conn, table: str, column: str, col_def: str) -> None:
+    """Adds a column to an existing table if it's missing.
+
+    CREATE TABLE IF NOT EXISTS does NOT modify a table that already exists on
+    the volume from an older schema, so columns added later (like user_id)
+    never reach the old table. We add them here. The column is added as
+    NULLABLE on purpose — SQLite cannot add a NOT NULL column to a table that
+    already has rows; old rows simply won't match any user_id filter.
+    """
+    existing = [row[1] for row in conn.execute(f'PRAGMA table_info({table})')]
+    if column not in existing:
+        conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {col_def}')
+        logger.info('Migration: added missing column %s.%s', table, column)
+
+
 def init_db() -> None:
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     with _connect() as conn:
-        # WAL = concurrent readers + a single writer; far fewer "database is
-        # locked" errors now that webhooks are handled on background threads.
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA busy_timeout=10000')
         c = conn.cursor()
+
+        # 1) Create tables (safe on a fresh DB). Indexes are created separately
+        #    in step 3, AFTER the migration, so they never run against an old
+        #    table that is still missing a column.
         c.executescript('''
             CREATE TABLE IF NOT EXISTS budget (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,13 +291,24 @@ def init_db() -> None:
                 message_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
             );
+        ''')
 
+        # 2) Migrate OLD databases on the Railway volume.
+        #    THIS is what fixes "no such column: user_id": the tasks (and maybe
+        #    budget) table was created by an earlier version without user_id,
+        #    and CREATE TABLE IF NOT EXISTS left it untouched.
+        _ensure_column(conn, 'budget', 'user_id', 'TEXT')
+        _ensure_column(conn, 'tasks',  'user_id', 'TEXT')
+
+        # 3) Indexes — only now that user_id is guaranteed to exist.
+        c.executescript('''
             CREATE INDEX IF NOT EXISTS idx_budget_user_date
                 ON budget (user_id, date);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_completed
                 ON tasks (user_id, completed);
         ''')
-        # Seed default limits only on first run
+
+        # 4) Seed default limits only on first run.
         c.execute('SELECT COUNT(*) FROM budget_limits')
         if c.fetchone()[0] == 0:
             c.executemany(
