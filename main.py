@@ -10,32 +10,42 @@ Stack:
   • SQLite (WAL)                          — budget / tasks / context storage
 
 ════════════════════════════════════════════════════════════════════════
-WHAT CHANGED IN THIS REVISION (read me)
+WHAT CHANGED IN THIS REVISION  (r3 — multi-user hardening)
 ════════════════════════════════════════════════════════════════════════
-The previous version *looked* like an "AI overload" problem, but the Railway
-logs proved otherwise: the Gemini HTTP calls were returning **200 OK** while
-the user still got "there's load on the AI servers" / "I didn't understand".
+This build makes the bot safe and correct for MULTIPLE users (friends),
+fixing three places where data used to "leak" between people, and adds a
+proper onboarding flow for newcomers. Tags: [MULTI].
 
-Root cause: gemini-2.5-flash is a *thinking* model. With thinking enabled +
-function-calling + temperature=0, the model frequently returns a candidate
-whose only part is an internal "thought" — so `response.function_calls` is
-empty AND `response.text` is None. 200 OK, but nothing usable → the bot
-silently dead-ended.
+  1. [MULTI] PER-USER CALENDARS. Previously every event from every user was
+     written to a single CALENDAR_ID (the owner's calendar) — so a friend's
+     "meeting tomorrow" landed on YOUR calendar. Now each user writes to THEIR
+     OWN calendar. If a user has no calendar connected yet, the bot REFUSES to
+     create the event (instead of silently dumping it on the owner) and tells
+     them how to connect.
 
-Fixes (see inline comments tagged [FIX]):
-  1. Thinking DISABLED for the router (thinking_budget=0). Routing is fast
-     classification — thinking only added latency and this very bug.
-  2. Bulletproof response parsing + a no-tools fallback so the bot NEVER
-     returns an empty "I didn't understand" when the model actually answered.
-  3. Fast deterministic shortcuts for the common commands (מאזן / סטטוס /
-     הגדר תקציב …) so they cost 0 API calls and never fail.
-  4. Retry logic tightened: fewer attempts, shorter delays for the interactive
-     path, and far less greedy "is this retryable?" matching (so a permanent
-     error fails instantly instead of stalling ~7s then showing "overload").
-  5. Whitespace-only / empty inbound text no longer burns an AI call or spams
-     the full welcome screen.
-  6. Calendar service + tool declarations cached; busy_timeout on every DB
-     connection.
+  2. [MULTI] PER-USER BUDGET LIMITS. The budget_limits table had no user_id,
+     so "set food budget 3000" changed the limit for EVERYONE. It is now keyed
+     by (user_id, category). Old global table is migrated/rebuilt automatically.
+
+  3. [MULTI] ALLOWLIST. Optional ALLOWED_USERS env var. If set, anyone not on
+     the list is silently ignored — protecting your Gemini quota and calendar
+     from strangers who get hold of the number.
+
+  4. [MULTI] NEW-USER ONBOARDING. The first time someone ever messages the bot,
+     they get a friendly welcome that walks them through connecting their
+     personal calendar (it even prints the exact service-account email to share
+     with). They can use tasks/budget immediately.
+
+  5. [MULTI] LIVE CALENDAR LINKING (no redeploy). An admin (ADMIN_USERS) can
+     connect a friend's calendar straight from WhatsApp:
+         חבר יומן 972501234567 friend@gmail.com
+     Mappings are stored in the DB, so you never have to redeploy to add a
+     friend. The USER_CALENDARS env var still works as a bootstrap (handy for
+     the owner's own calendar).
+
+Everything from the previous revision (thinking disabled for the router,
+bulletproof response parsing, fast deterministic shortcuts, tightened retry,
+cached calendar service, busy_timeout on every connection) is preserved.
 """
 from __future__ import annotations  # makes type hints version-proof (3.9+)
 
@@ -81,7 +91,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-01-r2'
+BUILD_VERSION = '2026-06-02-r3'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -102,13 +112,37 @@ VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
 WHATSAPP_TOKEN       = os.getenv('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID      = os.getenv('PHONE_NUMBER_ID')
 GOOGLE_CREDENTIALS   = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')
+CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')  # legacy fallback only
 APP_SECRET           = os.getenv('APP_SECRET')
 GEMINI_API_KEY       = os.getenv('GEMINI_API_KEY')
 
 GEMINI_MODEL         = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 WHATSAPP_API_VERSION = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
 TIMEZONE_NAME        = os.getenv('TIMEZONE', 'Asia/Jerusalem')
+
+# ── [MULTI] Multi-user access control & calendar mapping ──────────────────
+# ALLOWED_USERS: comma-separated phone numbers (in WhatsApp format, e.g.
+# 972501234567). If empty, EVERYONE who messages the bot is served.
+ALLOWED_USERS = set(filter(None, (
+    n.strip() for n in os.getenv('ALLOWED_USERS', '').split(',')
+)))
+
+# ADMIN_USERS: comma-separated phone numbers allowed to run admin commands
+# (e.g. linking a friend's calendar from WhatsApp). Set this to YOUR number.
+ADMIN_USERS = set(filter(None, (
+    n.strip() for n in os.getenv('ADMIN_USERS', '').split(',')
+)))
+
+# USER_CALENDARS: optional JSON bootstrap map {phone: calendar_id}. The DB
+# table (user_calendars) takes precedence; this is mainly to seed the owner.
+#   e.g. USER_CALENDARS={"972501111111":"me@gmail.com"}
+try:
+    USER_CALENDARS = json.loads(os.getenv('USER_CALENDARS', '{}'))
+    if not isinstance(USER_CALENDARS, dict):
+        raise ValueError('USER_CALENDARS must be a JSON object')
+except Exception:
+    logger.warning('USER_CALENDARS is not valid JSON — ignoring it.')
+    USER_CALENDARS = {}
 
 # DB path defaults to ./data/sahbak.db (works locally AND on Railway).
 # To survive redeploys on Railway, attach a Volume and point DB_PATH at its
@@ -132,10 +166,6 @@ def get_genai_client():
 # ─────────────────────────────────────────────
 # Time — single source of truth for "now"
 # ─────────────────────────────────────────────
-# Railway containers run in UTC. A naive datetime.now() there makes "tomorrow
-# at 9", the budget's current month, and task timestamps all 2–3 hours off from
-# Israel — which silently lands events/expenses on the wrong day or month.
-# Everything below goes through now_local() instead.
 try:
     LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception:
@@ -152,6 +182,16 @@ def now_local() -> datetime:
     return datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.now()
 
 
+def _normalize_phone(raw: str) -> str:
+    """Normalise a typed phone number toward WhatsApp's international format
+    (digits only, no '+'). Converts a leading-0 Israeli number to 972…; leaves
+    anything else as digits-only. Used by the admin calendar-link command."""
+    p = re.sub(r'[\s\-()]', '', (raw or '').strip()).lstrip('+')
+    if p.startswith('0') and len(p) == 10:   # 0XX-XXXXXXX → 972XXXXXXXXX
+        p = '972' + p[1:]
+    return p
+
+
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
@@ -162,6 +202,9 @@ BUDGET_CATEGORIES_HE = {
 }
 VALID_CATEGORIES = list(BUDGET_CATEGORIES_HE.keys())
 
+# Sensible defaults used as a FALLBACK whenever a user hasn't set their own
+# limit. They are no longer written to the DB — each user simply inherits
+# these until they override a category.
 DEFAULT_BUDGET_LIMITS = {
     'דיור': 5000, 'רכב': 2000, 'נופש': 1500,
     'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500,
@@ -193,16 +236,8 @@ PROCESSED_TTL_DAYS = 3
 # ═════════════════════════════════════════════
 # Retry — Exponential backoff with jitter
 # ═════════════════════════════════════════════
-# [FIX] Tightened. Transient HTTP statuses worth retrying. 429 = rate limit,
-# 5xx = server overload/hiccup. Everything else (400/401/403/404/INVALID_*) is
-# permanent and re-raised immediately so we fail FAST instead of stalling.
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
-# [FIX] Much less greedy than before. We ONLY fall back to message inspection
-# when there is no numeric code, and we match phrases that are unambiguously
-# transient. Removed dangerous broad needles like 'connection',
-# 'internal error', and bare '500' which caused permanent errors to be retried
-# (adding ~7s latency before failing — exactly the "it's slow / gives up" pain).
 _RETRYABLE_NEEDLES = (
     'rate limit', 'rate-limit', 'resource exhausted', 'resource_exhausted',
     'quota exceeded', 'overloaded', 'unavailable', 'try again later',
@@ -216,7 +251,6 @@ def _is_retryable_error(exc: Exception) -> bool:
 
     Conservative on purpose: when in doubt, treat as permanent and fail fast.
     """
-    # 1) Typed SDK errors (newer google-genai)
     if genai_errors is not None:
         server_err = getattr(genai_errors, 'ServerError', None)
         if server_err and isinstance(exc, server_err):
@@ -224,15 +258,13 @@ def _is_retryable_error(exc: Exception) -> bool:
         client_err = getattr(genai_errors, 'ClientError', None)
         if client_err and isinstance(exc, client_err):
             code = getattr(exc, 'code', None)
-            return code in RETRYABLE_STATUS  # only 408/429 among 4xx
+            return code in RETRYABLE_STATUS
 
-    # 2) Any object that carries a numeric status code
     for attr in ('code', 'status_code', 'http_status'):
         code = getattr(exc, attr, None)
         if isinstance(code, int):
             return code in RETRYABLE_STATUS
 
-    # 3) Last resort — narrow message inspection
     msg = str(exc).lower()
     return any(n in msg for n in _RETRYABLE_NEEDLES)
 
@@ -240,13 +272,7 @@ def _is_retryable_error(exc: Exception) -> bool:
 def call_with_retry(fn, *, what: str = 'AI call',
                     max_attempts: int = 3, base_delay: float = 0.6,
                     max_total: float = 6.0):
-    """Run `fn`, retrying *transient* failures with exponential backoff + jitter.
-
-    [FIX] Defaults tuned for an interactive WhatsApp bot: 3 attempts, fast
-    backoff (~0.6s, 1.2s), and a hard ceiling on total time spent waiting
-    (`max_total`) so a user is never left hanging for many seconds. Permanent
-    errors are raised on the first failure.
-    """
+    """Run `fn`, retrying *transient* failures with exponential backoff + jitter."""
     last_exc: Exception | None = None
     spent = 0.0
     for attempt in range(1, max_attempts + 1):
@@ -274,9 +300,6 @@ def call_with_retry(fn, *, what: str = 'AI call',
 # Database
 # ─────────────────────────────────────────────
 def _connect() -> sqlite3.Connection:
-    # [FIX] Set busy_timeout on EVERY connection (not just init_db). Under the
-    # thread pool, concurrent writers used to hit "database is locked" because
-    # only the init connection had the timeout.
     conn = sqlite3.connect(DB_FILE, timeout=10)
     try:
         conn.execute('PRAGMA busy_timeout=10000')
@@ -286,18 +309,36 @@ def _connect() -> sqlite3.Connection:
 
 
 def _ensure_column(conn, table: str, column: str, col_def: str) -> None:
-    """Add a column to an existing table if it's missing.
-
-    CREATE TABLE IF NOT EXISTS does NOT modify a table that already exists on
-    the volume from an older schema, so columns added later (like user_id)
-    never reach the old table. We add them here. The column is added as
-    NULLABLE on purpose — SQLite cannot add a NOT NULL column to a table that
-    already has rows; old rows simply won't match any user_id filter.
-    """
+    """Add a column to an existing table if it's missing."""
     existing = [row[1] for row in conn.execute(f'PRAGMA table_info({table})')]
     if column not in existing:
         conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {col_def}')
         logger.info('Migration: added missing column %s.%s', table, column)
+
+
+def _migrate_or_create_budget_limits(conn) -> None:
+    """[MULTI] budget_limits is now PER USER  (PRIMARY KEY user_id+category).
+
+    Older builds had a GLOBAL table (PRIMARY KEY category only). We can't add a
+    column to a PRIMARY KEY via ALTER, and the old global values can't be
+    attributed to any single user — so we rebuild the table. DEFAULT_BUDGET_LIMITS
+    provides sensible fallbacks for everyone, so nothing important is lost.
+    """
+    cols = [row[1] for row in conn.execute('PRAGMA table_info(budget_limits)')]
+    if cols and 'user_id' not in cols:
+        conn.execute('DROP TABLE budget_limits')
+        logger.info('Migration: dropped old GLOBAL budget_limits table')
+        cols = []
+    if not cols:
+        conn.execute('''
+            CREATE TABLE budget_limits (
+                user_id  TEXT NOT NULL,
+                category TEXT NOT NULL,
+                amount   REAL NOT NULL,
+                PRIMARY KEY (user_id, category)
+            )
+        ''')
+        logger.info('Created per-user budget_limits table')
 
 
 def init_db() -> None:
@@ -305,15 +346,11 @@ def init_db() -> None:
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     with _connect() as conn:
-        # WAL = concurrent readers + a single writer; far fewer "database is
-        # locked" errors now that webhooks are handled on background threads.
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA busy_timeout=10000')
         c = conn.cursor()
 
-        # 1) Create tables (safe on a fresh DB). Indexes are created separately
-        #    in step 3, AFTER the migration, so they never run against an old
-        #    table that is still missing a column.
+        # 1) Create tables (safe on a fresh DB).
         c.executescript('''
             CREATE TABLE IF NOT EXISTS budget (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -338,25 +375,32 @@ def init_db() -> None:
                 context_json TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS budget_limits (
-                category TEXT PRIMARY KEY,
-                amount   REAL NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
             );
+
+            -- [MULTI] remembers which users we've greeted (for onboarding).
+            CREATE TABLE IF NOT EXISTS known_users (
+                user_id    TEXT PRIMARY KEY,
+                first_seen TEXT NOT NULL
+            );
+
+            -- [MULTI] per-user calendar mapping (phone -> calendar id).
+            CREATE TABLE IF NOT EXISTS user_calendars (
+                user_id     TEXT PRIMARY KEY,
+                calendar_id TEXT NOT NULL
+            );
         ''')
 
-        # 2) Migrate OLD databases on the Railway volume.
-        #    THIS is what fixes "no such column: user_id": the tasks (and maybe
-        #    budget) table was created by an earlier version without user_id,
-        #    and CREATE TABLE IF NOT EXISTS left it untouched.
+        # 2) Per-user budget limits (handles migration from old global table).
+        _migrate_or_create_budget_limits(conn)
+
+        # 3) Migrate OLD budget/tasks tables that predate the user_id column.
         _ensure_column(conn, 'budget', 'user_id', 'TEXT')
         _ensure_column(conn, 'tasks',  'user_id', 'TEXT')
 
-        # 3) Indexes — only now that user_id is guaranteed to exist.
+        # 4) Indexes — only now that user_id is guaranteed to exist.
         c.executescript('''
             CREATE INDEX IF NOT EXISTS idx_budget_user_date
                 ON budget (user_id, date);
@@ -364,19 +408,11 @@ def init_db() -> None:
                 ON tasks (user_id, completed);
         ''')
 
-        # 4) Seed default limits only on first run
-        c.execute('SELECT COUNT(*) FROM budget_limits')
-        if c.fetchone()[0] == 0:
-            c.executemany(
-                'INSERT INTO budget_limits (category, amount) VALUES (?, ?)',
-                list(DEFAULT_BUDGET_LIMITS.items())
-            )
         conn.commit()
     logger.info('Database initialised at %s', DB_FILE)
 
 
 def _cleanup_processed_messages() -> None:
-    """Drop dedup rows older than PROCESSED_TTL_DAYS (keeps the table small)."""
     cutoff = (now_local() - timedelta(days=PROCESSED_TTL_DAYS)).isoformat()
     try:
         with _connect() as conn:
@@ -387,12 +423,7 @@ def _cleanup_processed_messages() -> None:
 
 
 def mark_message_seen(message_id: str) -> bool:
-    """Record a WhatsApp message id. Returns True if it is new (first time seen).
-
-    WhatsApp delivers webhooks at-least-once, so the same message can arrive
-    several times. We persist ids to avoid double-processing (e.g. logging the
-    same expense twice).
-    """
+    """Record a WhatsApp message id. Returns True if it is new (first time seen)."""
     if not message_id:
         return True
     try:
@@ -402,13 +433,70 @@ def mark_message_seen(message_id: str) -> bool:
                 (message_id, now_local().isoformat())
             )
             conn.commit()
-        # Opportunistic, cheap, ~2% of the time — no extra scheduler needed.
         if random.random() < 0.02:
             _cleanup_processed_messages()
         return cur.rowcount > 0
     except Exception:
         logger.exception('Dedup check failed for %s', message_id)
         return True  # fail open: better a rare duplicate than a dropped message
+
+
+# ── [MULTI] New-user tracking ────────────────
+
+def register_if_new_user(user_id: str) -> bool:
+    """Return True the first time we EVER see this user (and record them).
+    Returns False for repeat users, and on error (fail closed: we'd rather
+    skip the welcome than spam it)."""
+    if not user_id:
+        return False
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO known_users (user_id, first_seen) VALUES (?, ?)',
+                (user_id, now_local().isoformat())
+            )
+            conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        logger.exception('register_if_new_user failed for %s', user_id)
+        return False
+
+
+# ── [MULTI] Per-user calendar mapping ────────
+
+def get_user_calendar(user_id: str) -> str | None:
+    """The calendar id we should write to for this user. DB first, then the
+    USER_CALENDARS env bootstrap. None means 'no calendar connected'."""
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT calendar_id FROM user_calendars WHERE user_id = ?', (user_id,)
+            ).fetchone()
+        if row:
+            return row[0]
+    except Exception:
+        logger.exception('get_user_calendar lookup failed for %s', user_id)
+    return USER_CALENDARS.get(str(user_id))
+
+
+def set_user_calendar(user_id: str, calendar_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO user_calendars (user_id, calendar_id) VALUES (?, ?)',
+            (user_id, calendar_id)
+        )
+        conn.commit()
+
+
+def delete_user_calendar(user_id: str) -> None:
+    with _connect() as conn:
+        conn.execute('DELETE FROM user_calendars WHERE user_id = ?', (user_id,))
+        conn.commit()
+
+
+def calendar_id_for(user_id: str) -> str | None:
+    """Public helper used by the calendar flow."""
+    return get_user_calendar(user_id)
 
 
 # ── Context helpers ──────────────────────────
@@ -436,34 +524,43 @@ def delete_user_context(user_id: str) -> None:
         conn.commit()
 
 
-# ── Budget helpers ───────────────────────────
+# ── Budget helpers  [MULTI: now per-user] ────
 
-def get_budget_limit(category: str) -> float:
+def get_budget_limit(category: str, user_id: str) -> float:
+    """A user's limit for a category — their own override if set, else the
+    shared sensible default."""
     with _connect() as conn:
         row = conn.execute(
-            'SELECT amount FROM budget_limits WHERE category = ?', (category,)
+            'SELECT amount FROM budget_limits WHERE category = ? AND user_id = ?',
+            (category, user_id)
         ).fetchone()
-    return row[0] if row else 0.0
+    if row:
+        return row[0]
+    return DEFAULT_BUDGET_LIMITS.get(category, 0.0)
 
 
-def set_budget_limit(category: str, amount: float) -> None:
+def set_budget_limit(category: str, amount: float, user_id: str) -> None:
     with _connect() as conn:
         conn.execute(
-            'INSERT OR REPLACE INTO budget_limits (category, amount) VALUES (?, ?)',
-            (category, amount)
+            'INSERT OR REPLACE INTO budget_limits (user_id, category, amount) VALUES (?, ?, ?)',
+            (user_id, category, amount)
         )
         conn.commit()
 
 
-def get_all_budget_limits() -> dict:
+def get_all_budget_limits(user_id: str) -> dict:
+    """Defaults overlaid with the user's own overrides (for dashboard display)."""
     with _connect() as conn:
-        rows = conn.execute('SELECT category, amount FROM budget_limits').fetchall()
-    return {cat: amt for cat, amt in rows}
+        rows = conn.execute(
+            'SELECT category, amount FROM budget_limits WHERE user_id = ?', (user_id,)
+        ).fetchall()
+    merged = dict(DEFAULT_BUDGET_LIMITS)
+    merged.update({cat: amt for cat, amt in rows})
+    return merged
 
 
 def add_expense(category: str, amount: float, date: str,
                 description: str, user_id: str) -> None:
-    # Store only the date portion (YYYY-MM-DD) so strftime queries work reliably
     date_only = date[:10]
     with _connect() as conn:
         conn.execute(
@@ -559,7 +656,7 @@ def get_tasks_completion_stats(user_id: str) -> tuple[int, int]:
 
 
 def find_tasks_by_text(query: str, user_id: str) -> list[tuple]:
-    """Fuzzy-ish match: return active tasks whose description contains `query`
+    """Return active tasks whose description contains `query`
     (case-insensitive, whitespace-normalised). Used by complete/delete tools."""
     q = re.sub(r'\s+', ' ', (query or '').strip()).lower()
     active = get_active_tasks(user_id)
@@ -573,8 +670,6 @@ def find_tasks_by_text(query: str, user_id: str) -> list[tuple]:
 # ─────────────────────────────────────────────
 # Google Calendar
 # ─────────────────────────────────────────────
-# [FIX] Cache the service. Previously every event rebuilt credentials + the
-# discovery client (json.loads + auth handshake) on each call — slow and wasteful.
 _calendar_service = None
 _calendar_service_failed = False
 
@@ -593,8 +688,6 @@ def get_calendar_service():
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
         )
-        # cache_discovery=False avoids a noisy warning + file cache on
-        # read-only / serverless filesystems.
         _calendar_service = build('calendar', 'v3', credentials=credentials,
                                   cache_discovery=False)
         return _calendar_service
@@ -604,13 +697,20 @@ def get_calendar_service():
         return None
 
 
-def _parse_event_datetime(start_time_iso: str) -> datetime | None:
-    """Parse the AI-supplied start time and make it timezone-aware (Israel).
+def _service_account_email() -> str | None:
+    """[MULTI] The bot's service-account email — the address users must SHARE
+    their calendar with. Pulled straight from GOOGLE_CREDENTIALS so onboarding
+    can print it."""
+    if not GOOGLE_CREDENTIALS:
+        return None
+    try:
+        return json.loads(GOOGLE_CREDENTIALS).get('client_email')
+    except Exception:
+        return None
 
-    The model returns naive ISO strings like '2026-06-01T09:00:00'. We attach
-    LOCAL_TZ so the event lands at the intended wall-clock time regardless of
-    the (UTC) server. If the model ever returns an offset, we respect it.
-    """
+
+def _parse_event_datetime(start_time_iso: str) -> datetime | None:
+    """Parse the AI-supplied start time and make it timezone-aware (Israel)."""
     try:
         dt = datetime.fromisoformat(start_time_iso)
     except (ValueError, TypeError):
@@ -620,7 +720,22 @@ def _parse_event_datetime(start_time_iso: str) -> datetime | None:
     return dt
 
 
-def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -> str:
+def process_calendar_ai(title: str, start_time_iso: str,
+                        location: str | None, user_id: str) -> str:
+    # [MULTI] Resolve THIS user's own calendar. If they have none connected,
+    # refuse — never silently write a friend's event onto the owner's calendar.
+    cal_id = calendar_id_for(user_id)
+    if not cal_id:
+        sa = _service_account_email()
+        share = f'\nשתף את היומן שלך עם:\n{sa}\n(הרשאת "ביצוע שינויים באירועים")' if sa else ''
+        return (
+            'עדיין לא חיברתי לך יומן אישי 📅\n'
+            'כדי שאוכל לקבוע אירועים *ביומן שלך* צריך חיבור חד-פעמי קצר — '
+            'אחרת לא אקבע לך כלום.'
+            f'{share}\n'
+            'אחר כך שלח את כתובת ה-Gmail שלך למי שהקים את הבוט.'
+        )
+
     service = get_calendar_service()
     if not service:
         return 'שגיאת התחברות ליומן גוגל (בדוק Credentials).'
@@ -629,8 +744,6 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
     if start_time is None:
         return f'תאריך לא תקין: {start_time_iso}'
 
-    # Guard against the model scheduling something that already passed (e.g. it
-    # parsed "ב-8" as 08:00 when it's already 10:00). Warn, don't silently bury it.
     past_note = ''
     if start_time < now_local() - timedelta(minutes=1):
         past_note = '\n⚠️ שים לב: הזמן שביקשת כבר עבר — קבעתי בכל זאת. לשינוי כתוב לי תאריך חדש.'
@@ -645,7 +758,7 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
         event['location'] = location
     try:
         created = call_with_retry(
-            lambda: service.events().insert(calendarId=CALENDAR_ID, body=event).execute(),
+            lambda: service.events().insert(calendarId=cal_id, body=event).execute(),
             what='Calendar insert', max_attempts=3, base_delay=0.6, max_total=6.0,
         )
         link    = created.get('htmlLink', 'לא זמין')
@@ -659,22 +772,17 @@ def process_calendar_ai(title: str, start_time_iso: str, location: str | None) -
             f'{past_note}'
         )
     except Exception:
-        logger.exception('Calendar insert failed')
-        return 'שגיאה ביצירת אירוע. ודא ששיתפת את היומן עם חשבון השירות.'
+        logger.exception('Calendar insert failed (user=%s, cal=%s)', user_id, cal_id)
+        return ('שגיאה ביצירת אירוע. ודא שהיומן שלך משותף עם חשבון השירות '
+                'עם הרשאת עריכה.')
 
 
 # ═════════════════════════════════════════════
 # AI — Gemini Function / Tool Calling
 # ═════════════════════════════════════════════
-# Instead of asking the model for free-form JSON and parsing it (brittle), we
-# declare strict, typed tools. The model returns one or more `function_call`
-# parts with validated args, which we dispatch in `execute_tool`.
 
 def _make_function_declaration(name: str, description: str, schema: dict):
-    """Build a FunctionDeclaration compatibly across google-genai versions.
-
-    Newer SDKs use `parameters_json_schema=`; older ones use `parameters=`.
-    """
+    """Build a FunctionDeclaration compatibly across google-genai versions."""
     try:
         return types.FunctionDeclaration(
             name=name, description=description, parameters_json_schema=schema
@@ -849,23 +957,16 @@ def _get_tools():
     return _TOOLS
 
 
-# [FIX] Build a GenerateContentConfig with thinking DISABLED, compatibly across
-# SDK versions. Thinking is the thing that produced 200-OK-but-empty responses
-# for the router. Some older SDKs don't accept thinking_config — so we try, and
-# fall back to a config without it.
 def _router_config():
     base_kwargs = dict(
         system_instruction=_system_instruction(),
         tools=_get_tools(),
         temperature=0.0,  # deterministic routing
     )
-    # Attempt to attach thinking_config(thinking_budget=0).
     try:
         thinking = types.ThinkingConfig(thinking_budget=0)
         return types.GenerateContentConfig(thinking_config=thinking, **base_kwargs)
     except Exception:
-        # SDK too old for ThinkingConfig, or signature differs — config without
-        # it still works (model may think, but parsing below now tolerates it).
         return types.GenerateContentConfig(**base_kwargs)
 
 
@@ -887,17 +988,9 @@ def _system_instruction() -> str:
 
 
 def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
-    """Pull (function_calls, text) out of a Gemini response, defensively.
-
-    [FIX] This is the heart of the bug fix. We:
-      • prefer response.function_calls,
-      • else walk candidate parts (skipping 'thought' parts),
-      • read text WITHOUT touching response.text (which can raise when the
-        candidate has no text part), assembling it from parts ourselves.
-    """
+    """Pull (function_calls, text) out of a Gemini response, defensively."""
     calls: list[tuple[str, dict]] = []
 
-    # Convenience accessor first.
     fcs = getattr(response, 'function_calls', None)
     if fcs:
         for fc in fcs:
@@ -908,7 +1001,6 @@ def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
         if calls:
             return calls, ''
 
-    # Manual walk of the parts.
     parts = []
     try:
         candidate = response.candidates[0]
@@ -918,7 +1010,6 @@ def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
 
     text_chunks: list[str] = []
     for part in parts:
-        # Skip internal "thought" parts — they are not user-facing.
         if getattr(part, 'thought', False):
             continue
         fc = getattr(part, 'function_call', None)
@@ -938,18 +1029,7 @@ def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
 
 
 def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
-    """Send a free-form Hebrew message to Gemini.
-
-    Returns (tool_calls, reply_text):
-      • tool_calls — list of (function_name, args_dict). Empty for plain chat.
-      • reply_text — the model's text answer when no tool was called.
-
-    [FIX] Guarantees a non-empty result whenever the model responded at all.
-    If the primary (with-tools) call comes back empty — the old failure mode —
-    we retry ONCE without tools to at least get a friendly text reply, so the
-    user never sees a silent "I didn't understand" after a successful 200.
-    Raises only on a final, non-recoverable transient API failure.
-    """
+    """Send a free-form Hebrew message to Gemini. Returns (tool_calls, reply_text)."""
     client = get_genai_client()
     if not client:
         return [], 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'
@@ -967,7 +1047,6 @@ def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
     if calls or reply_text:
         return calls, reply_text
 
-    # Empty response despite 200 OK — the exact bug we saw in the logs.
     logger.warning('Router returned empty content (200 but no call/text). '
                    'Retrying once without tools for a text reply. msg=%r', text[:120])
     try:
@@ -989,7 +1068,6 @@ def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
     except Exception:
         logger.exception('Plain fallback also failed')
 
-    # Truly nothing — return a helpful nudge instead of a silent dead-end.
     return [], ('לא הצלחתי לעבד את הבקשה הזו 🤔 נסה לנסח קצת אחרת, '
                 'או כתוב "תפריט" לרשימת הפקודות.')
 
@@ -1013,7 +1091,7 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
 
     alert = ''
     if cat != 'הכנסה':
-        limit = get_budget_limit(cat)
+        limit = get_budget_limit(cat, user_id)   # [MULTI] per-user
         if limit > 0:
             spent = get_category_total_spent(cat, user_id)
             rem   = limit - spent
@@ -1042,7 +1120,7 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     if not start_time_iso:
         return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
     location = (args.get('location') or '').strip() or None
-    return process_calendar_ai(title, start_time_iso, location)
+    return process_calendar_ai(title, start_time_iso, location, user_id)  # [MULTI]
 
 
 def _tool_complete_task(args: dict, user_id: str) -> str:
@@ -1052,7 +1130,6 @@ def _tool_complete_task(args: dict, user_id: str) -> str:
     if not get_active_tasks(user_id):
         return 'אין משימות פתוחות לסיים! 🎉'
 
-    # Exactly one match → complete it immediately.
     if query and len(matches) == 1:
         tid, _quad, desc = matches[0]
         if mark_task_completed(tid, user_id):
@@ -1060,7 +1137,6 @@ def _tool_complete_task(args: dict, user_id: str) -> str:
             return f'מעולה! 🎉 סימנתי כהושלם:\n[{tid}] {preview}'
         return 'לא הצלחתי לסמן את המשימה. נסה "סטטוס משימות".'
 
-    # Zero or many matches → ask which one, via the existing context flow.
     candidates = matches if matches else get_active_tasks(user_id)
     set_user_context(user_id, {'type': 'complete_task'})
     msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
@@ -1105,7 +1181,7 @@ def _tool_set_limit(args: dict, user_id: str) -> str:
         return f'לא ניתן להגדיר תקציב לקטגוריה "{cat}".'
     if amt <= 0:
         return 'תקרת התקציב חייבת להיות גדולה מאפס.'
-    set_budget_limit(cat, amt)
+    set_budget_limit(cat, amt, user_id)   # [MULTI] per-user
     return f'✅ תקרת התקציב לקטגוריית *{cat}* עודכנה ל-{amt:,.0f} ש"ח.'
 
 
@@ -1213,14 +1289,11 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
 # ─────────────────────────────────────────────
 
 def _split_for_whatsapp(message: str, limit: int = WHATSAPP_TEXT_LIMIT) -> list[str]:
-    """Split a long reply into <=limit chunks, preferring line boundaries so we
-    never cut a word/emoji mid-way (which WhatsApp's hard 4096 cut would do)."""
     if len(message) <= limit:
         return [message]
     chunks: list[str] = []
     current = ''
     for line in message.split('\n'):
-        # A single line longer than the limit must be hard-split.
         while len(line) > limit:
             chunks.append(line[:limit])
             line = line[limit:]
@@ -1244,13 +1317,9 @@ def _post_whatsapp(payload: dict) -> bool:
 
     def _do():
         resp = http_requests.post(url, headers=headers, json=payload, timeout=15)
-        # Retry on Meta's transient/5xx; surface the body for everything else.
         if resp.status_code in RETRYABLE_STATUS:
             raise RuntimeError(f'WhatsApp transient {resp.status_code}: {resp.text[:300]}')
         if resp.status_code >= 400:
-            # Log Meta's actual error body — this is what you need to debug
-            # "the bot isn't replying" (expired token, number not allow-listed,
-            # 24-hour window closed, etc.). Not retryable.
             logger.error('WhatsApp send failed (%s): %s', resp.status_code, resp.text[:500])
             return False
         return True
@@ -1287,7 +1356,6 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         return None, ''
     headers = {'Authorization': f'Bearer {WHATSAPP_TOKEN}'}
     try:
-        # Step 1: get media URL (retry transient failures)
         meta = call_with_retry(
             lambda: http_requests.get(
                 f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}',
@@ -1301,7 +1369,6 @@ def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
         mime_type  = meta_json.get('mime_type', 'application/octet-stream')
         if not media_url:
             return None, mime_type
-        # Step 2: download actual bytes (the CDN URL also needs the auth header)
         media_resp = call_with_retry(
             lambda: http_requests.get(media_url, headers=headers, timeout=30),
             what='WhatsApp media download', max_attempts=3, base_delay=0.8, max_total=8.0,
@@ -1326,13 +1393,8 @@ def verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool
 
 
 # ─────────────────────────────────────────────
-# Fast deterministic shortcuts  [FIX: latency + reliability]
+# Fast deterministic shortcuts  +  admin commands
 # ─────────────────────────────────────────────
-# The help menu itself advertises these phrases. They have ONE obvious meaning,
-# so routing them through Gemini only added 1-3s of latency and a failure
-# surface (the 200-OK-but-empty bug). Handle them locally → instant, 0 API
-# calls, never fails. The AI is still used for everything genuinely free-form.
-
 _GREETINGS = {
     'שלום', 'היי', 'הי', 'אהלן', 'הלו', 'הייי', 'בוקר טוב', 'ערב טוב',
     'צהריים טובים', 'מה קורה', 'מה נשמע', 'מה המצב', 'hi', 'hello', 'hey',
@@ -1344,6 +1406,36 @@ _SET_BUDGET_RE = re.compile(
     r'^(?:הגדר|עדכן|קבע|שנה)\s+תקציב\s+(\S+)\s+([\d,\.]+)\s*(?:ש"ח|שקל|שקלים|₪)?\s*$'
 )
 
+# [MULTI] Admin-only calendar linking (no redeploy):
+#   "חבר יומן 972501234567 friend@gmail.com"   /   "נתק יומן 972501234567"
+_LINK_CAL_RE   = re.compile(r'^(?:חבר|קשר)\s+יומן\s+(\+?[\d\s\-()]{6,})\s+(\S+@\S+)\s*$')
+_UNLINK_CAL_RE = re.compile(r'^נתק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
+
+
+def _try_admin_command(text: str, user_id: str) -> str | None:
+    """Handle admin-only commands. Returns a reply if handled, else None."""
+    if user_id not in ADMIN_USERS:
+        return None
+    t = text.strip()
+
+    m = _LINK_CAL_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        email  = m.group(2).strip()
+        if not target:
+            return 'מספר לא תקין. נסה: חבר יומן 972501234567 someone@gmail.com'
+        set_user_calendar(target, email)
+        return (f'✅ חיברתי יומן.\nמספר: {target}\nיומן: {email}\n'
+                f'(ודא שהוא שיתף את היומן עם חשבון השירות עם הרשאת עריכה.)')
+
+    m = _UNLINK_CAL_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        delete_user_calendar(target)
+        return f'🔌 ניתקתי את היומן של {target}.'
+
+    return None
+
 
 def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     """Return a reply if `text` is an unambiguous command we can serve without
@@ -1351,25 +1443,20 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     t = text.strip()
     low = t.lower()
 
-    # Help / menu
     if low in ('תפריט', 'עזרה', 'help', 'menu', 'פקודות', '?'):
         return get_help_menu()
 
-    # Greetings → welcome (only for a clean, short greeting, not a sentence)
     if low in _GREETINGS:
         return get_welcome_message()
 
-    # Budget status
     if t in ('מאזן', 'סטטוס כלכלי', 'סטטוס כספי', 'תקציב', 'מצב כספי',
              'כמה הוצאתי', 'דוח', 'דוח כספי', 'מצב תקציב'):
         return get_detailed_budget(user_id)
 
-    # Tasks status
     if t in ('סטטוס משימות', 'משימות', 'מה יש לי לעשות', 'מה יש לי',
              'רשימת משימות', 'המשימות שלי', 'מטלות', 'todo', 'משימות פתוחות'):
         return get_task_status(user_id)
 
-    # Set budget limit: "הגדר תקציב מזון 3000"
     m = _SET_BUDGET_RE.match(t)
     if m:
         cat = m.group(1).strip()
@@ -1378,10 +1465,8 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
             amt = float(raw_amt)
         except ValueError:
             return None  # fall through to AI
-        # category may be exact or close; require exact match against our set
         if cat in BUDGET_CATEGORIES_HE and cat != 'הכנסה':
             return _tool_set_limit({'category': cat, 'amount': amt}, user_id)
-        # unknown category word → let AI try to map it
         return None
 
     return None
@@ -1394,8 +1479,6 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 def process_message(text: str, user_id: str) -> str:
     text = (text or '').strip()
     if not text:
-        # [FIX] Never fire the AI on an empty/whitespace message and never spam
-        # the full welcome screen for it. A gentle nudge is enough.
         return 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
 
     # ── Multi-step context flow ──────────────
@@ -1426,6 +1509,11 @@ def process_message(text: str, user_id: str) -> str:
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
+    # ── [MULTI] Admin commands (calendar linking, etc.) ──
+    admin = _try_admin_command(text, user_id)
+    if admin is not None:
+        return admin
+
     # ── Fast deterministic shortcuts (no AI latency, can't fail) ──
     shortcut = _try_fast_shortcut(text, user_id)
     if shortcut is not None:
@@ -1435,27 +1523,20 @@ def process_message(text: str, user_id: str) -> str:
     try:
         tool_calls, reply_text = get_ai_tool_calls(text)
     except Exception:
-        # All retries exhausted — genuine transient AI outage. Be honest, calm,
-        # and DON'T pretend the user did something wrong.
         logger.exception('AI router permanently failed for user %s', user_id)
         return ('יש כרגע עומס זמני על שרתי ה-AI 🛠️\n'
                 'הבקשה שלך לא אבדה — נסה לשלוח אותה שוב עוד כמה שניות.')
 
     if tool_calls:
-        # Execute every requested action (supports several in one message) and
-        # combine the confirmations into a single reply.
         results = [execute_tool(name, args, user_id) for name, args in tool_calls]
         combined = '\n\n'.join(r for r in results if r)
         if combined:
             return combined
-        # Extremely unlikely (all tools returned empty) — don't go silent.
         return 'בוצע ✅'
 
     if reply_text:
         return reply_text
 
-    # get_ai_tool_calls already guarantees a non-empty fallback, so we should
-    # never reach here — but if we do, nudge rather than dead-end.
     return 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
 
 
@@ -1470,7 +1551,6 @@ def process_media_message(message: dict, user_id: str) -> str:
     if media_id:
         media_data, mime_type = download_whatsapp_media(media_id)
 
-    # Guard against oversized media (Gemini inline-request limit)
     if media_data and len(media_data) > MAX_MEDIA_BYTES:
         return 'הקובץ גדול מדי לעיבוד (מעל ~18MB). שלח גרסה קטנה יותר או את הטקסט ישירות.'
 
@@ -1482,8 +1562,6 @@ def process_media_message(message: dict, user_id: str) -> str:
         if not transcript:
             return ('🎤 קיבלתי הקלטה אך לא הצלחתי לתמלל אותה.\n'
                     'נסה שוב, או שלח את ההודעה כטקסט.')
-        # Route the transcription through the normal text pipeline so a voice
-        # note can create events, tasks and expenses exactly like typed text.
         result = process_message(transcript, user_id)
         return f'🎤 _שמעתי:_ "{transcript}"\n\n{result}'
 
@@ -1535,7 +1613,7 @@ def get_detailed_budget(user_id: str) -> str:
         else:
             spent = abs(total)
             total_exp += spent
-            limit = get_budget_limit(cat)
+            limit = get_budget_limit(cat, user_id)   # [MULTI] per-user
             if limit > 0:
                 perc   = min((spent / limit) * 100, 100)
                 filled = min(int(perc / 10), 10)
@@ -1569,6 +1647,38 @@ def get_welcome_message() -> str:
     )
 
 
+def get_onboarding_message(user_id: str) -> str:
+    """[MULTI] Shown the first time a person ever messages the bot. Walks a
+    newcomer through connecting their OWN calendar so their events never land
+    on the owner's calendar."""
+    msg = (
+        'אהלן, וברוך הבא לסחבק! 🤖\n'
+        'אני העוזר האישי שלך לניהול *משימות*, *תקציב* ו*יומן*.\n\n'
+        'אפשר להתחיל מיד — כתוב לי בחופשי:\n'
+        '✅ "תוסיף משימה לקנות חלב"\n'
+        '💵 "שילמתי 50 שקל על מזון"\n'
+    )
+    if not calendar_id_for(user_id):
+        sa = _service_account_email()
+        msg += (
+            '\n📅 *חשוב — חיבור היומן שלך (חד-פעמי):*\n'
+            'כדי שאקבע אירועים *ביומן האישי שלך* (ולא של מישהו אחר), '
+            'צריך לחבר אותו פעם אחת. בלי זה לא אוכל לקבוע לך אירועים.\n'
+        )
+        if sa:
+            msg += (
+                '1️⃣ פתח את Google Calendar במחשב ← הגדרות ושיתוף\n'
+                '2️⃣ שתף את היומן שלך עם הכתובת הבאה, בהרשאת '
+                '"ביצוע שינויים באירועים":\n'
+                f'{sa}\n'
+                '3️⃣ שלח את כתובת ה-Gmail שלך למי שהקים את הבוט — והוא יחבר אותך תוך רגע.\n'
+            )
+        else:
+            msg += 'דבר עם מי שהקים את הבוט כדי לחבר את היומן שלך.\n'
+    msg += '\nלרשימת הפקודות המלאה כתוב *"תפריט"* 📋'
+    return msg
+
+
 def get_help_menu() -> str:
     return (
         '*תפריט עזרה — סחבק* 🤖\n\n'
@@ -1593,29 +1703,26 @@ def get_help_menu() -> str:
 # ─────────────────────────────────────────────
 # Webhook Routes
 # ─────────────────────────────────────────────
-
-# [FIX] Send a quick "I'm on it" ACK ONLY for the genuinely slow path (media:
-# download + Gemini vision/transcription). This is exactly the user's ask —
-# "say you're handling it, then update when done" — without spamming an extra
-# message before the instant text replies.
 SEND_MEDIA_ACK = os.getenv('SEND_MEDIA_ACK', 'true').lower() in ('true', '1', 'yes')
 
 
 def _handle_message_safely(message: dict, from_number: str) -> None:
     """Runs on the thread pool: build the reply and send it."""
     try:
+        # [MULTI] Greet brand-new users once and walk them through calendar
+        # setup, so their events never silently land on someone else's calendar.
+        if register_if_new_user(from_number):
+            send_whatsapp_message(from_number, get_onboarding_message(from_number))
+
         msg_type = message.get('type', '')
         if msg_type == 'text':
             text = message.get('text', {}).get('body', '')
             if text and text.strip():
                 response = process_message(text, from_number)
             else:
-                # Empty/odd 'text' event (reaction, edit, system) — quiet nudge,
-                # not the whole welcome screen on every weird event.
                 response = 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
         elif msg_type in MEDIA_TYPES:
             if SEND_MEDIA_ACK:
-                # Reassure immediately; the heavy work follows.
                 send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
             response = process_media_message(message, from_number)
         else:
@@ -1662,7 +1769,6 @@ def webhook():
         value    = changes.get('value', {})
         messages = value.get('messages')
         if not messages:
-            # Delivery/read receipts ("statuses") and other events land here
             return jsonify({'status': 'ignored'}), 200
 
         message     = messages[0]
@@ -1672,16 +1778,17 @@ def webhook():
         if not from_number:
             return jsonify({'status': 'ignored'}), 200
 
-        # Deduplicate — WhatsApp may deliver the same message more than once.
+        # [MULTI] Allowlist: if configured, silently ignore anyone not on it.
+        # Protects your Gemini quota and your calendar from strangers.
+        if ALLOWED_USERS and from_number not in ALLOWED_USERS:
+            logger.info('Ignoring message from non-allowed number %s', from_number)
+            return jsonify({'status': 'ignored'}), 200
+
         if not mark_message_seen(message_id):
             logger.info('Duplicate message %s ignored', message_id)
             return jsonify({'status': 'duplicate'}), 200
 
-        # Process on a bounded background pool so we ACK Meta within
-        # milliseconds. This prevents webhook timeouts (and the automatic
-        # re-delivery that follows) when Gemini / Calendar take a few seconds.
         _executor.submit(_handle_message_safely, message, from_number)
-
         return jsonify({'status': 'ok'}), 200
 
     except (IndexError, KeyError) as exc:
@@ -1689,7 +1796,6 @@ def webhook():
         return jsonify({'status': 'ignored'}), 200
     except Exception:
         logger.exception('Unhandled webhook error')
-        # Still ACK with 200 so Meta does not retry in a loop.
         return jsonify({'status': 'error'}), 200
 
 
@@ -1702,13 +1808,15 @@ def index():
 def health():
     """Simple health-check endpoint for Railway / uptime monitors."""
     return jsonify({
-        'status':    'ok',
-        'version':   BUILD_VERSION,
-        'timestamp': now_local().isoformat(),
-        'model':     GEMINI_MODEL,
-        'gemini':    bool(GEMINI_API_KEY),
-        'whatsapp':  bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
-        'calendar':  bool(GOOGLE_CREDENTIALS),
+        'status':         'ok',
+        'version':        BUILD_VERSION,
+        'timestamp':      now_local().isoformat(),
+        'model':          GEMINI_MODEL,
+        'gemini':         bool(GEMINI_API_KEY),
+        'whatsapp':       bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
+        'calendar':       bool(GOOGLE_CREDENTIALS),
+        'allowlist':      len(ALLOWED_USERS),
+        'admins':         len(ADMIN_USERS),
     }), 200
 
 
@@ -1728,17 +1836,22 @@ def _log_startup_config() -> None:
         logger.warning('Missing env vars (related features will be disabled): %s', ', '.join(missing))
     if not APP_SECRET:
         logger.warning('APP_SECRET not set — webhook signature verification is OFF')
+    if ALLOWED_USERS:
+        logger.info('[MULTI] Allowlist active: %d number(s) permitted', len(ALLOWED_USERS))
+    else:
+        logger.warning('[MULTI] ALLOWED_USERS not set — ANYONE who messages the bot will be served.')
+    if ADMIN_USERS:
+        logger.info('[MULTI] Admins: %d number(s)', len(ADMIN_USERS))
+    else:
+        logger.warning('[MULTI] ADMIN_USERS not set — the "חבר יומן" command is disabled.')
+    sa = _service_account_email()
+    if sa:
+        logger.info('[MULTI] Service account (share calendars with this): %s', sa)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # ██  Dashboard REST API  ██
 # ═══════════════════════════════════════════════════════════════════════
-#
-# אבטחה: כל בקשה מה-Dashboard חייבת לשלוח Header:
-#   X-Dashboard-Key: <הערך שהגדרת ב-Railway כ-DASHBOARD_API_KEY>
-#
-# ═══════════════════════════════════════════════════════════════════════
-
 DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
 
 
@@ -1769,9 +1882,8 @@ def api_dashboard():
     if not user_id:
         return jsonify({'error': 'user_id required'}), 400
 
-    # תקציב חודש נוכחי
     budget_rows = get_all_budget_summary(user_id)
-    limits      = get_all_budget_limits()
+    limits      = get_all_budget_limits(user_id)   # [MULTI] per-user
     budget = []
     for cat, total in budget_rows:
         budget.append({
@@ -1781,14 +1893,11 @@ def api_dashboard():
             'limit':    limits.get(cat, 0),
         })
 
-    # משימות פתוחות
     active = get_active_tasks(user_id)
     tasks  = [{'id': t[0], 'quadrant': t[1], 'description': t[2]} for t in active]
 
-    # סטטיסטיקת השלמה (חודש נוכחי)
     completed, total_tasks = get_tasks_completion_stats(user_id)
 
-    # תנועות אחרונות — 50 האחרונות בחודש הנוכחי
     current_month = now_local().strftime('%Y-%m')
     with _connect() as conn:
         rows = conn.execute(
@@ -1922,19 +2031,26 @@ def api_delete_task_route(task_id):
     return jsonify({'status': 'ok', 'task_id': task_id}), 200
 
 
-# ─── PUT /api/budget-limits ──────────────────────────────────────────────────
+# ─── PUT /api/budget-limits?user_id=<PHONE> ─────────────────────────────────
 @app.route('/api/budget-limits', methods=['PUT'])
 def api_set_budget_limits():
-    """עדכן מגבלות תקציב מהדשבורד. Body: { "מזון": 3000, "רכב": 2000, ... }"""
+    """עדכן מגבלות תקציב מהדשבורד (פר-משתמש).
+    Body: { "מזון": 3000, "רכב": 2000, ... }  +  ?user_id=<PHONE>
+    (אפשר גם לשלוח user_id בתוך ה-body.)"""
     err = _require_dashboard_key()
     if err:
         return err
+    user_id = _get_user_id()
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
     data    = request.get_json(silent=True) or {}
     updated = []
     for cat, amt in data.items():
+        if cat == 'user_id':
+            continue
         if cat in BUDGET_CATEGORIES_HE and cat != 'הכנסה':
             try:
-                set_budget_limit(cat, float(amt))
+                set_budget_limit(cat, float(amt), user_id)   # [MULTI] per-user
                 updated.append(cat)
             except (TypeError, ValueError):
                 pass
