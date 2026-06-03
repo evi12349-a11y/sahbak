@@ -10,8 +10,22 @@ Stack:
   • SQLite (WAL)                          — budget / tasks / context storage
 
 ════════════════════════════════════════════════════════════════════════
-WHAT CHANGED IN THIS REVISION  (r3 — multi-user hardening)
+WHAT CHANGED  (r4 — conversation memory, smarter time/date, households)
 ════════════════════════════════════════════════════════════════════════
+r4 additions on top of r3:
+  • CONVERSATION MEMORY: the bot now remembers the last few turns per account
+    (30-min window), so multi-turn requests work — "what time?" -> "10-12" is
+    understood as one continuing request instead of being forgotten.
+  • SMARTER TIME/DATE: "10" -> 10:00, ranges like "10-12" -> start 10:00 for
+    120 min, "for two hours" -> duration honoured. Events now support a
+    duration_minutes (default 60) instead of a hard-coded 1 hour.
+  • HOUSEHOLD SHARING: two or more phones can share ONE account (calendar +
+    budget + tasks) via the USER_ALIASES env var or the admin command
+    "שתף <phone> עם <primary>". Everyone else stays fully isolated.
+
+────────────────────────────────────────────────────────────────────────
+r3 — multi-user hardening
+────────────────────────────────────────────────────────────────────────
 This build makes the bot safe and correct for MULTIPLE users (friends),
 fixing three places where data used to "leak" between people, and adds a
 proper onboarding flow for newcomers. Tags: [MULTI].
@@ -91,7 +105,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-02-r3'
+BUILD_VERSION = '2026-06-02-r4'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -143,6 +157,18 @@ try:
 except Exception:
     logger.warning('USER_CALENDARS is not valid JSON — ignoring it.')
     USER_CALENDARS = {}
+
+# USER_ALIASES: optional JSON bootstrap for shared "household" accounts — maps
+# a member's phone to the account it shares with (usually the primary's phone).
+# Both phones then share budget, tasks AND calendar.
+#   e.g. USER_ALIASES={"972502222222":"972501111111"}
+try:
+    USER_ALIASES = json.loads(os.getenv('USER_ALIASES', '{}'))
+    if not isinstance(USER_ALIASES, dict):
+        raise ValueError('USER_ALIASES must be a JSON object')
+except Exception:
+    logger.warning('USER_ALIASES is not valid JSON — ignoring it.')
+    USER_ALIASES = {}
 
 # DB path defaults to ./data/sahbak.db (works locally AND on Railway).
 # To survive redeploys on Railway, attach a Volume and point DB_PATH at its
@@ -231,6 +257,13 @@ MAX_MEDIA_BYTES = 18 * 1024 * 1024
 
 # Keep the dedup table from growing forever — drop ids older than this.
 PROCESSED_TTL_DAYS = 3
+
+# Conversation memory: how much recent context to feed the AI so multi-turn
+# requests work (e.g. bot asks "what time?", user replies "10-12", and the bot
+# understands it as the same request rather than forgetting everything).
+CONV_MAX_TURNS  = 12   # keep the last 12 turns (~6 exchanges)
+CONV_WINDOW_MIN = 30   # only include turns from the last 30 minutes
+CONV_TTL_HOURS  = 24   # purge rows older than this
 
 
 # ═════════════════════════════════════════════
@@ -391,6 +424,21 @@ def init_db() -> None:
                 user_id     TEXT PRIMARY KEY,
                 calendar_id TEXT NOT NULL
             );
+
+            -- [MULTI] household sharing: member phone -> shared account id.
+            CREATE TABLE IF NOT EXISTS user_aliases (
+                user_id    TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL
+            );
+
+            -- conversation memory for multi-turn understanding.
+            CREATE TABLE IF NOT EXISTS conversations (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
         ''')
 
         # 2) Per-user budget limits (handles migration from old global table).
@@ -406,6 +454,8 @@ def init_db() -> None:
                 ON budget (user_id, date);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_completed
                 ON tasks (user_id, completed);
+            CREATE INDEX IF NOT EXISTS idx_conv_user
+                ON conversations (user_id, id);
         ''')
 
         conn.commit()
@@ -414,12 +464,14 @@ def init_db() -> None:
 
 def _cleanup_processed_messages() -> None:
     cutoff = (now_local() - timedelta(days=PROCESSED_TTL_DAYS)).isoformat()
+    conv_cutoff = (now_local() - timedelta(hours=CONV_TTL_HOURS)).isoformat()
     try:
         with _connect() as conn:
             conn.execute('DELETE FROM processed_messages WHERE created_at < ?', (cutoff,))
+            conn.execute('DELETE FROM conversations WHERE created_at < ?', (conv_cutoff,))
             conn.commit()
     except Exception:
-        logger.exception('processed_messages cleanup failed')
+        logger.exception('cleanup failed')
 
 
 def mark_message_seen(message_id: str) -> bool:
@@ -499,6 +551,41 @@ def calendar_id_for(user_id: str) -> str | None:
     return get_user_calendar(user_id)
 
 
+# ── [MULTI] Household sharing (account aliases) ──
+
+def resolve_account(phone: str) -> str:
+    """Map a real phone number to its shared 'household' account id, if any.
+    Household members share budget/tasks/calendar/memory under one account id.
+    Non-members resolve to their own phone (full isolation)."""
+    if not phone:
+        return phone
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT account_id FROM user_aliases WHERE user_id = ?', (phone,)
+            ).fetchone()
+        if row:
+            return row[0]
+    except Exception:
+        logger.exception('resolve_account lookup failed for %s', phone)
+    return USER_ALIASES.get(str(phone), phone)
+
+
+def set_user_alias(user_id: str, account_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO user_aliases (user_id, account_id) VALUES (?, ?)',
+            (user_id, account_id)
+        )
+        conn.commit()
+
+
+def delete_user_alias(user_id: str) -> None:
+    with _connect() as conn:
+        conn.execute('DELETE FROM user_aliases WHERE user_id = ?', (user_id,))
+        conn.commit()
+
+
 # ── Context helpers ──────────────────────────
 
 def get_user_context(user_id: str) -> dict | None:
@@ -522,6 +609,55 @@ def delete_user_context(user_id: str) -> None:
     with _connect() as conn:
         conn.execute('DELETE FROM contexts WHERE user_id = ?', (user_id,))
         conn.commit()
+
+
+# ── Conversation memory (multi-turn understanding) ──
+
+def append_conversation(user_id: str, role: str, content: str) -> None:
+    """Store one turn (role='user' or 'model') so follow-ups have context."""
+    if not user_id or not content:
+        return
+    try:
+        with _connect() as conn:
+            conn.execute(
+                'INSERT INTO conversations (user_id, role, content, created_at) '
+                'VALUES (?, ?, ?, ?)',
+                (user_id, role, content[:4000], now_local().isoformat())
+            )
+            conn.commit()
+    except Exception:
+        logger.exception('append_conversation failed for %s', user_id)
+
+
+def get_recent_conversation(user_id: str) -> list[tuple]:
+    """Last few (role, content) turns within the time window, oldest-first.
+    Leading 'model' turns are dropped — Gemini requires history to begin with
+    a user turn."""
+    cutoff = (now_local() - timedelta(minutes=CONV_WINDOW_MIN)).isoformat()
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                '''SELECT role, content FROM conversations
+                   WHERE user_id = ? AND created_at >= ?
+                   ORDER BY id DESC LIMIT ?''',
+                (user_id, cutoff, CONV_MAX_TURNS)
+            ).fetchall()
+    except Exception:
+        logger.exception('get_recent_conversation failed for %s', user_id)
+        return []
+    turns = list(reversed(rows))
+    while turns and turns[0][0] != 'user':
+        turns.pop(0)
+    return turns
+
+
+def clear_conversation(user_id: str) -> None:
+    try:
+        with _connect() as conn:
+            conn.execute('DELETE FROM conversations WHERE user_id = ?', (user_id,))
+            conn.commit()
+    except Exception:
+        logger.exception('clear_conversation failed for %s', user_id)
 
 
 # ── Budget helpers  [MULTI: now per-user] ────
@@ -721,7 +857,8 @@ def _parse_event_datetime(start_time_iso: str) -> datetime | None:
 
 
 def process_calendar_ai(title: str, start_time_iso: str,
-                        location: str | None, user_id: str) -> str:
+                        location: str | None, user_id: str,
+                        duration_minutes: int = 60) -> str:
     # [MULTI] Resolve THIS user's own calendar. If they have none connected,
     # refuse — never silently write a friend's event onto the owner's calendar.
     cal_id = calendar_id_for(user_id)
@@ -748,7 +885,7 @@ def process_calendar_ai(title: str, start_time_iso: str,
     if start_time < now_local() - timedelta(minutes=1):
         past_note = '\n⚠️ שים לב: הזמן שביקשת כבר עבר — קבעתי בכל זאת. לשינוי כתוב לי תאריך חדש.'
 
-    end_time = start_time + timedelta(hours=1)
+    end_time = start_time + timedelta(minutes=duration_minutes)
     event: dict = {
         'summary': title,
         'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE_NAME},
@@ -766,7 +903,8 @@ def process_calendar_ai(title: str, start_time_iso: str,
         return (
             f'האירוע נוצר בהצלחה! 📅\n'
             f'כותרת: {title}\n'
-            f'יום {weekday}, {start_time.strftime("%d/%m/%Y בשעה %H:%M")}'
+            f'יום {weekday}, {start_time.strftime("%d/%m/%Y")} '
+            f'{start_time.strftime("%H:%M")}–{end_time.strftime("%H:%M")}'
             + (f'\nמיקום: {location}' if location else '') +
             f'\nקישור: {link}'
             f'{past_note}'
@@ -850,20 +988,29 @@ def _build_tools() -> list:
         _make_function_declaration(
             'create_calendar_event',
             'יצירת אירוע ביומן גוגל. השתמש בזה כשהמשתמש מבקש לקבוע פגישה, '
-            'תור, אירוע או תזכורת עם זמן מסוים.',
+            'תור, אירוע, בוחן או תזכורת עם זמן מסוים.',
             {
                 'type': 'object',
                 'properties': {
                     'title': {
                         'type': 'string',
-                        'description': 'כותרת האירוע (למשל "פגישה עם דני").',
+                        'description': 'כותרת האירוע (למשל "פגישה עם דני", "בוחן באינפי").',
                     },
                     'start_time': {
                         'type': 'string',
                         'description': (
-                            'זמן ההתחלה בפורמט ISO 8601 ללא אזור זמן, '
-                            'למשל "2026-06-01T09:00:00". חשב תאריכים יחסיים '
-                            '("מחר", "יום שלישי", "עוד שעה") לפי הזמן הנוכחי שניתן לך.'
+                            'זמן ההתחלה בפורמט ISO 8601 מלא עם שניות וללא אזור זמן, '
+                            'למשל "2026-06-15T10:00:00". "10" או "ב-10" = 10:00. '
+                            'טווח כמו "10-12" → התחלה ב-10:00. תאריך בפורמט יום/חודש '
+                            '("15/06") או יחסי ("מחר", "יום שלישי") — חשב לפי הזמן '
+                            'הנוכחי שניתן לך.'
+                        ),
+                    },
+                    'duration_minutes': {
+                        'type': 'integer',
+                        'description': (
+                            'משך האירוע בדקות. "למשך שעתיים"=120, "חצי שעה"=30, '
+                            'טווח "10-12"=120. אם המשתמש לא ציין משך — 60.'
                         ),
                     },
                     'location': {
@@ -976,9 +1123,20 @@ def _system_instruction() -> str:
     return (
         'אתה "סחבק", עוזר אישי חכם וידידותי בוואטסאפ שעוזר בניהול יומן, משימות '
         'ותקציב. אתה מדבר עברית, בקצרה ובחום.\n\n'
-        f'הזמן הנוכחי: {now.strftime("%Y-%m-%d %H:%M")} (יום {weekday}).\n'
-        'השתמש בזמן הזה כדי לחשב תאריכים יחסיים כמו "מחר", "מחרתיים", '
-        '"יום ראשון הבא" או "עוד שעתיים".\n\n'
+        f'הזמן הנוכחי: {now.strftime("%Y-%m-%d %H:%M")} (יום {weekday}).\n\n'
+        'הנחיות לתאריכים ולשעות:\n'
+        '• תאריכים יחסיים ("מחר", "מחרתיים", "יום ראשון הבא", "עוד שעתיים") — '
+        'חשב לפי הזמן הנוכחי שלמעלה.\n'
+        '• פורמט תאריך עברי הוא יום/חודש: "15/06" או "ב-15 ביוני" = 15 ביוני.\n'
+        '• שעה: "10" או "ב-10" פירושו 10:00. "8 וחצי" = 08:30. "רבע ל-9" = 08:45.\n'
+        '• טווח שעות כמו "10-12" או "בין 10 ל-12" = התחלה ב-10:00 ומשך 120 דקות.\n'
+        '• "למשך שעתיים" = duration_minutes=120. אם לא צוין משך — 60 דקות.\n\n'
+        'שיחה רב-תורית (חשוב מאוד!):\n'
+        '• ההודעות הקודמות בשיחה ניתנות לך. אם בהודעה הנוכחית חסר פרט (כותרת, '
+        'תאריך או שעה) אבל הוא כבר הופיע קודם בשיחה — קח אותו מההיסטוריה ובצע את '
+        'הפעולה. אל תשאל שוב על מה שכבר נאמר.\n'
+        '• ברגע שיש לך מספיק מידע — בצע מיד. אל תשאל שאלות מיותרות. אם חסר רק '
+        'פרט קטן, השתמש בברירת מחדל סבירה במקום לשאול.\n\n'
         'כשהמשתמש מבקש פעולה (הוצאה, משימה, אירוע, שאילתה) — קרא לכלי המתאים. '
         'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים '
         '(למשל גם לקבוע פגישה וגם להוסיף משימה).\n'
@@ -1028,16 +1186,29 @@ def _extract_calls_and_text(response) -> tuple[list[tuple[str, dict]], str]:
     return [], ' '.join(c.strip() for c in text_chunks).strip()
 
 
-def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
-    """Send a free-form Hebrew message to Gemini. Returns (tool_calls, reply_text)."""
+def _build_contents(text: str, history) -> list:
+    """Turn recent (role, content) turns + the current message into Gemini's
+    multi-turn `contents` format (list of dict content blocks)."""
+    contents = []
+    for role, content in (history or []):
+        contents.append({'role': role, 'parts': [{'text': content}]})
+    contents.append({'role': 'user', 'parts': [{'text': text}]})
+    return contents
+
+
+def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], str]:
+    """Send a free-form Hebrew message PLUS recent conversation history to
+    Gemini. Returns (tool_calls, reply_text)."""
     client = get_genai_client()
     if not client:
         return [], 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'
 
+    contents = _build_contents(text, history)
+
     def _call():
         return client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=text,
+            contents=contents,
             config=_router_config(),
         )
 
@@ -1059,7 +1230,7 @@ def get_ai_tool_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
             except Exception:
                 cfg = types.GenerateContentConfig(**cfg_kwargs)
             return client.models.generate_content(
-                model=GEMINI_MODEL, contents=text, config=cfg)
+                model=GEMINI_MODEL, contents=contents, config=cfg)
         resp2 = call_with_retry(_plain, what='Gemini (plain fallback)',
                                 max_attempts=2, base_delay=0.5, max_total=4.0)
         _, text2 = _extract_calls_and_text(resp2)
@@ -1120,7 +1291,13 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     if not start_time_iso:
         return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
     location = (args.get('location') or '').strip() or None
-    return process_calendar_ai(title, start_time_iso, location, user_id)  # [MULTI]
+    try:
+        duration = int(args.get('duration_minutes') or 60)
+    except (TypeError, ValueError):
+        duration = 60
+    if duration <= 0:
+        duration = 60
+    return process_calendar_ai(title, start_time_iso, location, user_id, duration)  # [MULTI]
 
 
 def _tool_complete_task(args: dict, user_id: str) -> str:
@@ -1411,6 +1588,11 @@ _SET_BUDGET_RE = re.compile(
 _LINK_CAL_RE   = re.compile(r'^(?:חבר|קשר)\s+יומן\s+(\+?[\d\s\-()]{6,})\s+(\S+@\S+)\s*$')
 _UNLINK_CAL_RE = re.compile(r'^נתק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
 
+# [MULTI] Admin-only household sharing (no redeploy):
+#   "שתף 972502222222 עם 972501111111"   /   "בטל שיתוף 972502222222"
+_LINK_ALIAS_RE   = re.compile(r'^שתף\s+(\+?[\d\s\-()]{6,})\s+עם\s+(\+?[\d\s\-()]{6,})\s*$')
+_UNLINK_ALIAS_RE = re.compile(r'^בטל\s+שיתוף\s+(\+?[\d\s\-()]{6,})\s*$')
+
 
 def _try_admin_command(text: str, user_id: str) -> str | None:
     """Handle admin-only commands. Returns a reply if handled, else None."""
@@ -1433,6 +1615,25 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         target = _normalize_phone(m.group(1))
         delete_user_calendar(target)
         return f'🔌 ניתקתי את היומן של {target}.'
+
+    m = _LINK_ALIAS_RE.match(t)
+    if m:
+        member  = _normalize_phone(m.group(1))
+        primary = _normalize_phone(m.group(2))
+        if not member or not primary:
+            return 'מספר לא תקין. נסה: שתף 972502222222 עם 972501111111'
+        if member == primary:
+            return 'אי אפשר לשתף מספר עם עצמו.'
+        set_user_alias(member, primary)
+        return (f'✅ שיתפתי משק בית.\n{member} עכשיו חולק נתונים (יומן, תקציב '
+                f'ומשימות) עם החשבון של {primary}.\n'
+                f'(ודא שהיומן המשותף מחובר ל-{primary} עם "חבר יומן".)')
+
+    m = _UNLINK_ALIAS_RE.match(t)
+    if m:
+        member = _normalize_phone(m.group(1))
+        delete_user_alias(member)
+        return f'🔌 ביטלתי את השיתוף של {member}. מעכשיו הנתונים שלו נפרדים.'
 
     return None
 
@@ -1476,7 +1677,7 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 # Message Processing
 # ─────────────────────────────────────────────
 
-def process_message(text: str, user_id: str) -> str:
+def process_message(text: str, user_id: str, admin_phone: str | None = None) -> str:
     text = (text or '').strip()
     if not text:
         return 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
@@ -1509,8 +1710,9 @@ def process_message(text: str, user_id: str) -> str:
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
-    # ── [MULTI] Admin commands (calendar linking, etc.) ──
-    admin = _try_admin_command(text, user_id)
+    # ── [MULTI] Admin commands (calendar linking, household sharing) ──
+    # Admin status is checked against the REAL phone, not a shared account id.
+    admin = _try_admin_command(text, admin_phone or user_id)
     if admin is not None:
         return admin
 
@@ -1519,9 +1721,10 @@ def process_message(text: str, user_id: str) -> str:
     if shortcut is not None:
         return shortcut
 
-    # ── AI routing via Function Calling ──────
+    # ── AI routing with conversation memory (multi-turn understanding) ──
+    history = get_recent_conversation(user_id)
     try:
-        tool_calls, reply_text = get_ai_tool_calls(text)
+        tool_calls, reply_text = get_ai_tool_calls(text, history)
     except Exception:
         logger.exception('AI router permanently failed for user %s', user_id)
         return ('יש כרגע עומס זמני על שרתי ה-AI 🛠️\n'
@@ -1529,15 +1732,16 @@ def process_message(text: str, user_id: str) -> str:
 
     if tool_calls:
         results = [execute_tool(name, args, user_id) for name, args in tool_calls]
-        combined = '\n\n'.join(r for r in results if r)
-        if combined:
-            return combined
-        return 'בוצע ✅'
+        reply = '\n\n'.join(r for r in results if r) or 'בוצע ✅'
+    elif reply_text:
+        reply = reply_text
+    else:
+        reply = 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
 
-    if reply_text:
-        return reply_text
-
-    return 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
+    # Remember this exchange so follow-up messages have context.
+    append_conversation(user_id, 'user', text)
+    append_conversation(user_id, 'model', reply)
+    return reply
 
 
 def process_media_message(message: dict, user_id: str) -> str:
@@ -1709,22 +1913,26 @@ SEND_MEDIA_ACK = os.getenv('SEND_MEDIA_ACK', 'true').lower() in ('true', '1', 'y
 def _handle_message_safely(message: dict, from_number: str) -> None:
     """Runs on the thread pool: build the reply and send it."""
     try:
-        # [MULTI] Greet brand-new users once and walk them through calendar
-        # setup, so their events never silently land on someone else's calendar.
+        # [MULTI] Resolve a shared-household account (if this phone is linked).
+        # Data ops use account_id; replies & onboarding go to the real phone.
+        account_id = resolve_account(from_number)
+
+        # [MULTI] Greet brand-new users (by their real phone) once, and walk
+        # them through calendar setup so events never land on someone else.
         if register_if_new_user(from_number):
-            send_whatsapp_message(from_number, get_onboarding_message(from_number))
+            send_whatsapp_message(from_number, get_onboarding_message(account_id))
 
         msg_type = message.get('type', '')
         if msg_type == 'text':
             text = message.get('text', {}).get('body', '')
             if text and text.strip():
-                response = process_message(text, from_number)
+                response = process_message(text, account_id, admin_phone=from_number)
             else:
                 response = 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
         elif msg_type in MEDIA_TYPES:
             if SEND_MEDIA_ACK:
                 send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
-            response = process_media_message(message, from_number)
+            response = process_media_message(message, account_id)
         else:
             response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, הקלטה או קובץ.'
         send_whatsapp_message(from_number, response)
@@ -1844,6 +2052,8 @@ def _log_startup_config() -> None:
         logger.info('[MULTI] Admins: %d number(s)', len(ADMIN_USERS))
     else:
         logger.warning('[MULTI] ADMIN_USERS not set — the "חבר יומן" command is disabled.')
+    if USER_ALIASES:
+        logger.info('[MULTI] Household aliases (env): %d', len(USER_ALIASES))
     sa = _service_account_email()
     if sa:
         logger.info('[MULTI] Service account (share calendars with this): %s', sa)
