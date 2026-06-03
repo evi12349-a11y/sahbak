@@ -10,8 +10,14 @@ Stack:
   • SQLite (WAL)                          — budget / tasks / context storage
 
 ════════════════════════════════════════════════════════════════════════
-WHAT CHANGED  (r4 — conversation memory, smarter time/date, households)
+WHAT CHANGED  (r5 — model-agnostic thinking config)
 ════════════════════════════════════════════════════════════════════════
+r5: the Gemini model is now safely swappable via the GEMINI_MODEL env var.
+The "minimal thinking" setting adapts to the model generation — Gemini 3.x
+uses thinking_level (minimal); Gemini 2.5 uses thinking_budget=0 — with
+graceful fallbacks across SDK versions. No code edit needed to change models;
+just set GEMINI_MODEL (e.g. gemini-3.1-flash-lite or gemini-3.5-flash).
+
 r4 additions on top of r3:
   • CONVERSATION MEMORY: the bot now remembers the last few turns per account
     (30-min window), so multi-turn requests work — "what time?" -> "10-12" is
@@ -105,7 +111,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-02-r4'
+BUILD_VERSION = '2026-06-02-r5'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -130,6 +136,10 @@ CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')  # legacy fallback on
 APP_SECRET           = os.getenv('APP_SECRET')
 GEMINI_API_KEY       = os.getenv('GEMINI_API_KEY')
 
+# To switch models, just set the GEMINI_MODEL env var on Railway (no code
+# change). Good free-tier options: 'gemini-3.1-flash-lite' (cheapest/fastest,
+# great for this bot), 'gemini-3.5-flash' (higher quality, GA), or the current
+# default 'gemini-2.5-flash'. The thinking config below adapts to the model.
 GEMINI_MODEL         = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 WHATSAPP_API_VERSION = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
 TIMEZONE_NAME        = os.getenv('TIMEZONE', 'Asia/Jerusalem')
@@ -1104,17 +1114,51 @@ def _get_tools():
     return _TOOLS
 
 
+def _is_gemini_3_plus(model: str) -> bool:
+    """True for Gemini 3.x / 4.x+ (which use thinking_level instead of
+    thinking_budget). False for 2.5 and earlier."""
+    m = re.search(r'gemini-(\d+)', (model or '').lower())
+    return bool(m) and int(m.group(1)) >= 3
+
+
+def _minimal_thinking_config():
+    """A 'think as little as possible' setting that works across model
+    generations and SDK versions. Gemini 3.x uses thinking_level; Gemini 2.5
+    uses thinking_budget. Returns None if neither is supported (then thinking
+    just stays at the model default — the response parser handles that fine)."""
+    if _is_gemini_3_plus(GEMINI_MODEL):
+        for level in ('minimal', 'low'):
+            try:
+                return types.ThinkingConfig(thinking_level=level)
+            except Exception:
+                continue
+        try:
+            return types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
+        except Exception:
+            return None
+    try:
+        return types.ThinkingConfig(thinking_budget=0)
+    except Exception:
+        return None
+
+
+def _build_generate_config(**kwargs):
+    """GenerateContentConfig with a minimal-thinking setting when supported."""
+    thinking = _minimal_thinking_config()
+    if thinking is not None:
+        try:
+            return types.GenerateContentConfig(thinking_config=thinking, **kwargs)
+        except Exception:
+            pass
+    return types.GenerateContentConfig(**kwargs)
+
+
 def _router_config():
-    base_kwargs = dict(
+    return _build_generate_config(
         system_instruction=_system_instruction(),
         tools=_get_tools(),
         temperature=0.0,  # deterministic routing
     )
-    try:
-        thinking = types.ThinkingConfig(thinking_budget=0)
-        return types.GenerateContentConfig(thinking_config=thinking, **base_kwargs)
-    except Exception:
-        return types.GenerateContentConfig(**base_kwargs)
 
 
 def _system_instruction() -> str:
@@ -1222,13 +1266,8 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
                    'Retrying once without tools for a text reply. msg=%r', text[:120])
     try:
         def _plain():
-            cfg_kwargs = dict(system_instruction=_system_instruction(), temperature=0.3)
-            try:
-                cfg = types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    **cfg_kwargs)
-            except Exception:
-                cfg = types.GenerateContentConfig(**cfg_kwargs)
+            cfg = _build_generate_config(
+                system_instruction=_system_instruction(), temperature=0.3)
             return client.models.generate_content(
                 model=GEMINI_MODEL, contents=contents, config=cfg)
         resp2 = call_with_retry(_plain, what='Gemini (plain fallback)',
