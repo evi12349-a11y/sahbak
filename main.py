@@ -10,62 +10,76 @@ Stack:
   • SQLite (WAL)                          — budget / tasks / context storage
 
 ════════════════════════════════════════════════════════════════════════
-WHAT CHANGED  (r5 — model-agnostic thinking config)
+WHAT CHANGED  (r6 — reliability & multi-user fixes)
 ════════════════════════════════════════════════════════════════════════
-r5: the Gemini model is now safely swappable via the GEMINI_MODEL env var.
-The "minimal thinking" setting adapts to the model generation — Gemini 3.x
-uses thinking_level (minimal); Gemini 2.5 uses thinking_budget=0 — with
-graceful fallbacks across SDK versions. No code edit needed to change models;
-just set GEMINI_MODEL (e.g. gemini-3.1-flash-lite or gemini-3.5-flash).
+r6 fixes the issues observed in production on 2026-06-11:
 
-r4 additions on top of r3:
-  • CONVERSATION MEMORY: the bot now remembers the last few turns per account
-    (30-min window), so multi-turn requests work — "what time?" -> "10-12" is
-    understood as one continuing request instead of being forgotten.
-  • SMARTER TIME/DATE: "10" -> 10:00, ranges like "10-12" -> start 10:00 for
-    120 min, "for two hours" -> duration honoured. Events now support a
-    duration_minutes (default 60) instead of a hard-coded 1 hour.
-  • HOUSEHOLD SHARING: two or more phones can share ONE account (calendar +
-    budget + tasks) via the USER_ALIASES env var or the admin command
-    "שתף <phone> עם <primary>". Everyone else stays fully isolated.
+  1. [FIX] DB PERSISTENCE GUARD. The #1 root cause of "friend's calendar
+     won't connect": DB_PATH was never set on Railway, so the SQLite DB
+     (including the user_calendars table written by "חבר יומן") lived on
+     the container's EPHEMERAL disk and was wiped on every deploy.
+     The bot now screams about this at startup, in /health, and in the
+     new "אבחון" admin command. ACTION REQUIRED: set DB_PATH to a path on
+     the attached Volume (e.g. /data/sahbak.db) and re-run "חבר יומן".
 
-────────────────────────────────────────────────────────────────────────
-r3 — multi-user hardening
-────────────────────────────────────────────────────────────────────────
-This build makes the bot safe and correct for MULTIPLE users (friends),
-fixing three places where data used to "leak" between people, and adds a
-proper onboarding flow for newcomers. Tags: [MULTI].
+  2. [FIX] MODEL FALLBACK. The deploy log showed gemini-3.5-flash
+     returning 503 UNAVAILABLE ("high demand") even after retries → user
+     saw "יש עומס זמני". The router (and all multimodal calls) now fall
+     back automatically to GEMINI_FALLBACK_MODEL (default:
+     gemini-2.5-flash) when the primary model is overloaded.
 
-  1. [MULTI] PER-USER CALENDARS. Previously every event from every user was
-     written to a single CALENDAR_ID (the owner's calendar) — so a friend's
-     "meeting tomorrow" landed on YOUR calendar. Now each user writes to THEIR
-     OWN calendar. If a user has no calendar connected yet, the bot REFUSES to
-     create the event (instead of silently dumping it on the owner) and tells
-     them how to connect.
+  3. [NEW] RECURRING EVENTS. "תוסיף באופן קבוע לחודש הקרוב ביום שלישי
+     16-19 תרגול" previously made the model fire several separate
+     create_calendar_event calls (each failing / duplicating). There is
+     now a real `recurrence` (RRULE) parameter — ONE call creates a
+     repeating Google Calendar event (FREQ=WEEKLY;COUNT=4 etc).
 
-  2. [MULTI] PER-USER BUDGET LIMITS. The budget_limits table had no user_id,
-     so "set food budget 3000" changed the limit for EVERYONE. It is now keyed
-     by (user_id, category). Old global table is migrated/rebuilt automatically.
+  4. [FIX] DUPLICATED REPLIES. Identical results from multiple tool calls
+     are de-duplicated, so the "no calendar connected" message can never
+     appear 3× in one bubble again.
 
-  3. [MULTI] ALLOWLIST. Optional ALLOWED_USERS env var. If set, anyone not on
-     the list is silently ignored — protecting your Gemini quota and calendar
-     from strangers who get hold of the number.
+  5. [NEW] BULK TASK ACTIONS. complete_task / delete_task now accept a
+     LIST of tasks (task_queries) plus an `all` flag, and the numeric
+     follow-up flow accepts several numbers at once ("1 3 5") or "הכל".
+     No more completing tasks one... by... one.
 
-  4. [MULTI] NEW-USER ONBOARDING. The first time someone ever messages the bot,
-     they get a friendly welcome that walks them through connecting their
-     personal calendar (it even prints the exact service-account email to share
-     with). They can use tasks/budget immediately.
+  6. [NEW] CANCEL EXPENSES FROM WHATSAPP. New delete_expense +
+     show_transactions tools: "בטל את ההוצאה האחרונה", "מחק את ההוצאה של
+     ההמבורגר", "תראה לי את התנועות האחרונות". Same numeric-choice flow
+     as tasks when ambiguous.
 
-  5. [MULTI] LIVE CALENDAR LINKING (no redeploy). An admin (ADMIN_USERS) can
-     connect a friend's calendar straight from WhatsApp:
-         חבר יומן 972501234567 friend@gmail.com
-     Mappings are stored in the DB, so you never have to redeploy to add a
-     friend. The USER_CALENDARS env var still works as a bootstrap (handy for
-     the owner's own calendar).
+  7. [NEW] LIVE CALENDAR DIAGNOSTICS (admin):
+        בדוק יומן 972501234567   ← does a real read test + write test
+                                    against the mapped calendar and
+                                    reports the exact failure (404 = not
+                                    shared / wrong address, 403 = missing
+                                    "Make changes to events" permission).
+        אבחון                     ← full system status (DB persistence,
+                                    model, mapped calendars, counts).
 
-Everything from the previous revision (thinking disabled for the router,
-bulletproof response parsing, fast deterministic shortcuts, tightened retry,
-cached calendar service, busy_timeout on every connection) is preserved.
+  8. [FIX] PRECISE CALENDAR ERRORS. Real HttpError status codes are now
+     parsed: the user is told exactly whether the calendar isn't shared
+     (404) or lacks write permission (403), instead of a generic error.
+
+  9. [FIX] OWNER FALLBACK. If an ADMIN user has no mapped calendar, the
+     legacy CALENDAR_ID env var is used (so the owner is never locked out
+     of his own bot after a DB wipe).
+
+ 10. [FIX] Calendar service no longer "latches" dead forever after one
+     transient failure — it retries after a 5-minute cooldown.
+
+ 11. Calendar events now include default Google reminders (useDefault),
+     so "תשלח לי תזכורת ביומן" actually pops a notification on the
+     user's phone via Google Calendar.
+
+r5: Gemini model swappable via GEMINI_MODEL env var; thinking config
+adapts per model generation (3.x → thinking_level, 2.5 → thinking_budget).
+
+r4: conversation memory (30-min window), smarter time/date parsing,
+duration_minutes support, household sharing (USER_ALIASES / "שתף").
+
+r3: multi-user hardening — per-user calendars, per-user budget limits,
+allowlist, onboarding, live calendar linking via "חבר יומן".
 """
 from __future__ import annotations  # makes type hints version-proof (3.9+)
 
@@ -88,6 +102,7 @@ from flask import Flask, request, jsonify
 # Google Calendar (google-api-python-client + google-auth)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Gemini — new unified SDK (`google-genai`). Replaces the deprecated
 # `google-generativeai` package (legacy SDK deprecated 2025-11-30).
@@ -111,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-02-r5'
+BUILD_VERSION = '2026-06-11-r6'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -132,17 +147,19 @@ VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
 WHATSAPP_TOKEN       = os.getenv('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID      = os.getenv('PHONE_NUMBER_ID')
 GOOGLE_CREDENTIALS   = os.getenv('GOOGLE_CREDENTIALS')
-CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')  # legacy fallback only
+CALENDAR_ID          = os.getenv('CALENDAR_ID', 'primary')  # legacy owner fallback
 APP_SECRET           = os.getenv('APP_SECRET')
 GEMINI_API_KEY       = os.getenv('GEMINI_API_KEY')
 
 # To switch models, just set the GEMINI_MODEL env var on Railway (no code
-# change). Good free-tier options: 'gemini-3.1-flash-lite' (cheapest/fastest,
-# great for this bot), 'gemini-3.5-flash' (higher quality, GA), or the current
-# default 'gemini-2.5-flash'. The thinking config below adapts to the model.
-GEMINI_MODEL         = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
-WHATSAPP_API_VERSION = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
-TIMEZONE_NAME        = os.getenv('TIMEZONE', 'Asia/Jerusalem')
+# change). GEMINI_FALLBACK_MODEL is tried automatically whenever the primary
+# model is overloaded (503) or rate-limited — this is what saves the bot when
+# Google announces "high demand" on a flash model.
+GEMINI_MODEL          = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
+WHATSAPP_API_VERSION  = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
+# Railway often sets TZ rather than TIMEZONE — accept both.
+TIMEZONE_NAME         = os.getenv('TIMEZONE') or os.getenv('TZ') or 'Asia/Jerusalem'
 
 # ── [MULTI] Multi-user access control & calendar mapping ──────────────────
 # ALLOWED_USERS: comma-separated phone numbers (in WhatsApp format, e.g.
@@ -181,9 +198,12 @@ except Exception:
     USER_ALIASES = {}
 
 # DB path defaults to ./data/sahbak.db (works locally AND on Railway).
-# To survive redeploys on Railway, attach a Volume and point DB_PATH at its
-# mount path, e.g. DB_PATH=/app/data/sahbak.db
-DB_FILE = os.getenv('DB_PATH', os.path.join('data', 'sahbak.db'))
+# ⚠️ CRITICAL ON RAILWAY: without DB_PATH pointing INTO the attached Volume's
+# mount path (e.g. DB_PATH=/data/sahbak.db), the DB lives on ephemeral
+# container storage and is WIPED ON EVERY DEPLOY — including all calendar
+# links created with "חבר יומן", budget history and tasks.
+DB_FILE       = os.getenv('DB_PATH', os.path.join('data', 'sahbak.db'))
+DB_PERSISTENT = bool(os.getenv('DB_PATH'))
 
 # How many webhooks we are willing to process concurrently. A bounded pool
 # protects the box from an unbounded thread explosion if many messages arrive
@@ -275,6 +295,10 @@ CONV_MAX_TURNS  = 12   # keep the last 12 turns (~6 exchanges)
 CONV_WINDOW_MIN = 30   # only include turns from the last 30 minutes
 CONV_TTL_HOURS  = 24   # purge rows older than this
 
+# How long to wait before re-trying to build the Google Calendar service
+# after a failure (was: latched dead forever until restart).
+CALENDAR_RETRY_COOLDOWN_SEC = 300
+
 
 # ═════════════════════════════════════════════
 # Retry — Exponential backoff with jitter
@@ -285,7 +309,7 @@ _RETRYABLE_NEEDLES = (
     'rate limit', 'rate-limit', 'resource exhausted', 'resource_exhausted',
     'quota exceeded', 'overloaded', 'unavailable', 'try again later',
     'temporarily unavailable', 'deadline exceeded', 'service unavailable',
-    '429', '503',
+    'high demand', '429', '503',
 )
 
 
@@ -469,7 +493,8 @@ def init_db() -> None:
         ''')
 
         conn.commit()
-    logger.info('Database initialised at %s', DB_FILE)
+    logger.info('Database initialised at %s (persistent volume: %s)',
+                DB_FILE, 'YES' if DB_PERSISTENT else 'NO — see DB_PATH warning!')
 
 
 def _cleanup_processed_messages() -> None:
@@ -557,8 +582,20 @@ def delete_user_calendar(user_id: str) -> None:
 
 
 def calendar_id_for(user_id: str) -> str | None:
-    """Public helper used by the calendar flow."""
-    return get_user_calendar(user_id)
+    """Public helper used by the calendar flow.
+
+    Resolution order:
+      1. DB / USER_CALENDARS mapping for this account.
+      2. [r6] OWNER FALLBACK: if this account is an admin and the legacy
+         CALENDAR_ID env var points at a real calendar, use it — so the
+         owner is never locked out of his own bot (e.g. after a DB wipe).
+    """
+    cal = get_user_calendar(user_id)
+    if cal:
+        return cal
+    if user_id in ADMIN_USERS and CALENDAR_ID and CALENDAR_ID != 'primary':
+        return CALENDAR_ID
+    return None
 
 
 # ── [MULTI] Household sharing (account aliases) ──
@@ -745,6 +782,52 @@ def get_all_budget_summary(user_id: str) -> list[tuple]:
     return rows
 
 
+def get_recent_transactions(user_id: str, limit: int = 10) -> list[dict]:
+    """[r6] Most recent transactions this month (newest first) — used for
+    'show transactions' and for cancelling an expense from WhatsApp."""
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, category, amount, date, description
+               FROM budget
+               WHERE user_id = ? AND strftime('%Y-%m', date) = ?
+               ORDER BY id DESC LIMIT ?""",
+            (user_id, current_month, limit)
+        ).fetchall()
+    return [
+        {'id': r[0], 'category': r[1], 'amount': r[2],
+         'date': r[3], 'description': r[4] or r[1]}
+        for r in rows
+    ]
+
+
+def delete_expense_by_id(expense_id: int, user_id: str) -> dict | None:
+    """[r6] Delete one transaction (scoped to the user). Returns the deleted
+    row's details for the confirmation message, or None if not found."""
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT id, category, amount, date, description FROM budget '
+            'WHERE id = ? AND user_id = ?',
+            (expense_id, user_id)
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute('DELETE FROM budget WHERE id = ? AND user_id = ?',
+                     (expense_id, user_id))
+        conn.commit()
+    return {'id': row[0], 'category': row[1], 'amount': row[2],
+            'date': row[3], 'description': row[4] or row[1]}
+
+
+def _format_tx(t: dict) -> str:
+    """One transaction as a short Hebrew line: [id] emoji desc: ±amt (dd/mm)."""
+    emoji = BUDGET_CATEGORIES_HE.get(t['category'], '💵')
+    sign  = '+' if t['amount'] > 0 else '-'
+    d     = t['date']
+    when  = f'{d[8:10]}/{d[5:7]}' if len(d) >= 10 else d
+    return f"[{t['id']}] {emoji} {t['description']}: {sign}{abs(t['amount']):,.0f} ש\"ח ({when})"
+
+
 # ── Task helpers ─────────────────────────────
 
 def add_task(quadrant: str, description: str, user_id: str) -> None:
@@ -817,17 +900,20 @@ def find_tasks_by_text(query: str, user_id: str) -> list[tuple]:
 # Google Calendar
 # ─────────────────────────────────────────────
 _calendar_service = None
-_calendar_service_failed = False
+_calendar_failed_at = 0.0   # [r6] cooldown instead of latching dead forever
 
 
 def get_calendar_service():
-    global _calendar_service, _calendar_service_failed
+    global _calendar_service, _calendar_failed_at
     if _calendar_service is not None:
         return _calendar_service
-    if _calendar_service_failed:
+    # [r6] If the last build attempt failed, wait out the cooldown — but DO
+    # retry afterwards (previously one transient failure killed the calendar
+    # until the next restart).
+    if _calendar_failed_at and (time.time() - _calendar_failed_at) < CALENDAR_RETRY_COOLDOWN_SEC:
         return None
     if not GOOGLE_CREDENTIALS:
-        _calendar_service_failed = True
+        _calendar_failed_at = time.time()
         return None
     try:
         creds_dict  = json.loads(GOOGLE_CREDENTIALS)
@@ -836,10 +922,11 @@ def get_calendar_service():
         )
         _calendar_service = build('calendar', 'v3', credentials=credentials,
                                   cache_discovery=False)
+        _calendar_failed_at = 0.0
         return _calendar_service
     except Exception:
         logger.exception('Failed to build calendar service')
-        _calendar_service_failed = True
+        _calendar_failed_at = time.time()
         return None
 
 
@@ -855,6 +942,17 @@ def _service_account_email() -> str | None:
         return None
 
 
+def _http_status(exc: Exception) -> int | None:
+    """Pull the HTTP status code out of a googleapiclient HttpError,
+    tolerating client-library version differences."""
+    status = getattr(exc, 'status_code', None)
+    if isinstance(status, int):
+        return status
+    resp = getattr(exc, 'resp', None)
+    status = getattr(resp, 'status', None)
+    return status if isinstance(status, int) else None
+
+
 def _parse_event_datetime(start_time_iso: str) -> datetime | None:
     """Parse the AI-supplied start time and make it timezone-aware (Israel)."""
     try:
@@ -866,14 +964,52 @@ def _parse_event_datetime(start_time_iso: str) -> datetime | None:
     return dt
 
 
+# ── [r6] Recurrence (RRULE) helpers ───────────
+
+def _normalize_rrule(raw: str | None) -> str | None:
+    """Validate/normalise an AI-supplied recurrence rule. Returns a clean
+    'RRULE:...' string, or None if missing/invalid (event stays one-off)."""
+    r = (raw or '').strip()
+    if not r:
+        return None
+    if not r.upper().startswith('RRULE:'):
+        r = 'RRULE:' + r
+    if not re.search(r'FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)', r.upper()):
+        logger.warning('Ignoring invalid recurrence rule: %r', raw)
+        return None
+    return r
+
+
+def _recurrence_summary_he(rrule: str) -> str:
+    """Short Hebrew summary of an RRULE for the confirmation message."""
+    r = rrule.upper()
+    freq_map = {'DAILY': 'כל יום', 'WEEKLY': 'כל שבוע',
+                'MONTHLY': 'כל חודש', 'YEARLY': 'כל שנה'}
+    out = next((v for k, v in freq_map.items() if f'FREQ={k}' in r), 'אירוע חוזר')
+    m = re.search(r'INTERVAL=(\d+)', r)
+    if m and int(m.group(1)) > 1:
+        unit = {'כל יום': 'ימים', 'כל שבוע': 'שבועות',
+                'כל חודש': 'חודשים', 'כל שנה': 'שנים'}.get(out, '')
+        out = f'כל {m.group(1)} {unit}'.strip()
+    m = re.search(r'COUNT=(\d+)', r)
+    if m:
+        out += f' ({m.group(1)} פעמים)'
+    m = re.search(r'UNTIL=(\d{8})', r)
+    if m:
+        d = m.group(1)
+        out += f' עד {d[6:8]}/{d[4:6]}/{d[0:4]}'
+    return out
+
+
 def process_calendar_ai(title: str, start_time_iso: str,
                         location: str | None, user_id: str,
-                        duration_minutes: int = 60) -> str:
+                        duration_minutes: int = 60,
+                        recurrence: str | None = None) -> str:
     # [MULTI] Resolve THIS user's own calendar. If they have none connected,
     # refuse — never silently write a friend's event onto the owner's calendar.
     cal_id = calendar_id_for(user_id)
+    sa     = _service_account_email()
     if not cal_id:
-        sa = _service_account_email()
         share = f'\nשתף את היומן שלך עם:\n{sa}\n(הרשאת "ביצוע שינויים באירועים")' if sa else ''
         return (
             'עדיין לא חיברתי לך יומן אישי 📅\n'
@@ -900,9 +1036,19 @@ def process_calendar_ai(title: str, start_time_iso: str,
         'summary': title,
         'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE_NAME},
         'end':   {'dateTime': end_time.isoformat(),   'timeZone': TIMEZONE_NAME},
+        # [r6] inherit the calendar's default notifications, so the user's
+        # phone actually pops a reminder ("תשלח לי תזכורת ביומן").
+        'reminders': {'useDefault': True},
     }
     if location:
         event['location'] = location
+
+    # [r6] Recurring events — ONE event with an RRULE instead of the model
+    # firing several separate create calls.
+    rrule = _normalize_rrule(recurrence)
+    if rrule:
+        event['recurrence'] = [rrule]
+
     try:
         created = call_with_retry(
             lambda: service.events().insert(calendarId=cal_id, body=event).execute(),
@@ -910,19 +1056,144 @@ def process_calendar_ai(title: str, start_time_iso: str,
         )
         link    = created.get('htmlLink', 'לא זמין')
         weekday = HEB_WEEKDAYS[start_time.weekday()]
+        recur_line = f'\n🔁 {_recurrence_summary_he(rrule)}' if rrule else ''
         return (
             f'האירוע נוצר בהצלחה! 📅\n'
             f'כותרת: {title}\n'
             f'יום {weekday}, {start_time.strftime("%d/%m/%Y")} '
             f'{start_time.strftime("%H:%M")}–{end_time.strftime("%H:%M")}'
+            f'{recur_line}'
             + (f'\nמיקום: {location}' if location else '') +
             f'\nקישור: {link}'
             f'{past_note}'
         )
+    except HttpError as e:
+        # [r6] Tell the user (and the admin reading the chat) EXACTLY what's
+        # wrong, instead of a generic "calendar error".
+        status = _http_status(e)
+        logger.exception('Calendar insert failed (user=%s, cal=%s, status=%s)',
+                         user_id, cal_id, status)
+        if status == 404:
+            return (
+                '❌ לא הצלחתי לגשת ליומן המחובר אליך:\n'
+                f'{cal_id}\n'
+                'כנראה שהיומן עדיין לא שותף עם חשבון השירות (או שהכתובת שגויה).\n'
+                + (f'שתף את היומן עם:\n{sa}\n'
+                   'בהרשאת "ביצוע שינויים באירועים" — ונסה שוב.' if sa else '')
+            )
+        if status == 403:
+            return (
+                '❌ יש לי גישה ליומן שלך אבל *אין לי הרשאת כתיבה*.\n'
+                'ביומן Google: הגדרות ושיתוף ← מצא את חשבון השירות ← שנה את '
+                'ההרשאה ל-"ביצוע שינויים באירועים" — ונסה שוב.'
+            )
+        return (f'שגיאה ביצירת האירוע (קוד {status or "?"}). '
+                'מנהל הבוט יכול להריץ "בדוק יומן" כדי לאבחן.')
     except Exception:
         logger.exception('Calendar insert failed (user=%s, cal=%s)', user_id, cal_id)
         return ('שגיאה ביצירת אירוע. ודא שהיומן שלך משותף עם חשבון השירות '
                 'עם הרשאת עריכה.')
+
+
+def _admin_check_calendar(target_phone: str) -> str:
+    """[r6] Live diagnostic: verify we can READ and WRITE the calendar mapped
+    to a phone number. Run by an admin: בדוק יומן 9725...  Reports the exact
+    failure so 'it just doesn't work' becomes a one-line fix."""
+    account = resolve_account(target_phone)
+    lines = [f'🔍 בדיקת יומן עבור {target_phone}'
+             + (f' (חשבון משותף: {account})' if account != target_phone else '')]
+
+    cal = calendar_id_for(account)
+    if not cal:
+        lines.append('❌ אין יומן ממופה למספר הזה.')
+        lines.append('חבר אותו עם:')
+        lines.append(f'חבר יומן {target_phone} their.email@gmail.com')
+        if not DB_PERSISTENT:
+            lines.append('⚠️ DB_PATH לא מוגדר ב-Railway — חיבורי יומן נמחקים '
+                         'בכל דיפלוי! שלח "אבחון".')
+        return '\n'.join(lines)
+
+    lines.append(f'יומן ממופה: {cal}')
+    service = get_calendar_service()
+    if not service:
+        lines.append('❌ אין חיבור ל-Google Calendar (בדוק GOOGLE_CREDENTIALS).')
+        return '\n'.join(lines)
+
+    sa = _service_account_email()
+
+    # 1) Read test
+    try:
+        service.events().list(calendarId=cal, maxResults=1).execute()
+        lines.append('✅ קריאה מהיומן — עובדת')
+    except HttpError as e:
+        status = _http_status(e)
+        if status == 404:
+            lines.append('❌ קריאה נכשלה (404): היומן לא משותף עם חשבון השירות '
+                         'או שהכתובת שגויה.')
+            if sa:
+                lines.append(f'בקש מהמשתמש לשתף את היומן עם:\n{sa}')
+        else:
+            lines.append(f'❌ קריאה נכשלה (קוד {status}).')
+        return '\n'.join(lines)
+    except Exception as e:  # noqa: BLE001
+        lines.append(f'❌ קריאה נכשלה: {e}')
+        return '\n'.join(lines)
+
+    # 2) Write test — insert a tiny test event and delete it immediately.
+    try:
+        start = now_local() + timedelta(minutes=2)
+        end   = start + timedelta(minutes=5)
+        ev = service.events().insert(calendarId=cal, body={
+            'summary': 'בדיקת חיבור סחבק ✅ (יימחק אוטומטית)',
+            'start': {'dateTime': start.isoformat(), 'timeZone': TIMEZONE_NAME},
+            'end':   {'dateTime': end.isoformat(),   'timeZone': TIMEZONE_NAME},
+        }).execute()
+        try:
+            service.events().delete(calendarId=cal, eventId=ev['id']).execute()
+        except Exception:
+            logger.warning('Could not delete test event %s on %s', ev.get('id'), cal)
+        lines.append('✅ כתיבה ליומן — עובדת. הכל תקין! 🎉')
+    except HttpError as e:
+        status = _http_status(e)
+        if status == 403:
+            lines.append('❌ כתיבה נכשלה (403): היומן משותף אבל בהרשאת צפייה בלבד.')
+            lines.append('המשתמש צריך לשנות את ההרשאה ל-"ביצוע שינויים באירועים".')
+        else:
+            lines.append(f'❌ כתיבה נכשלה (קוד {status}).')
+    except Exception as e:  # noqa: BLE001
+        lines.append(f'❌ כתיבה נכשלה: {e}')
+    return '\n'.join(lines)
+
+
+def _admin_system_diag() -> str:
+    """[r6] One-shot system status for the admin: אבחון"""
+    users = cals = aliases = '?'
+    try:
+        with _connect() as conn:
+            users   = conn.execute('SELECT COUNT(*) FROM known_users').fetchone()[0]
+            cals    = conn.execute('SELECT COUNT(*) FROM user_calendars').fetchone()[0]
+            aliases = conn.execute('SELECT COUNT(*) FROM user_aliases').fetchone()[0]
+    except Exception:
+        logger.exception('diag DB query failed')
+    sa = _service_account_email()
+    lines = [
+        f'🛠️ *אבחון סחבק* — {BUILD_VERSION}',
+        f'מודל: {GEMINI_MODEL} | גיבוי: {GEMINI_FALLBACK_MODEL}',
+        f'DB: {DB_FILE}',
+        ('✅ DB יושב על Volume (DB_PATH מוגדר)' if DB_PERSISTENT else
+         '❌ *DB_PATH לא מוגדר!* הנתונים (כולל חיבורי יומן) נמחקים בכל דיפלוי.\n'
+         '   ב-Railway: Volume ← העתק את ה-Mount Path ← הוסף משתנה\n'
+         '   DB_PATH=<mount-path>/sahbak.db'),
+        f'משתמשים: {users} | יומנים מחוברים: {cals} (DB) + {len(USER_CALENDARS)} (env) '
+        f'| שיתופי בית: {aliases}',
+        f'Allowlist: {len(ALLOWED_USERS)} | Admins: {len(ADMIN_USERS)}',
+        f'חשבון שירות: {sa or "—"}',
+        f'WhatsApp: {"✅" if (WHATSAPP_TOKEN and PHONE_NUMBER_ID) else "❌"} | '
+        f'Calendar creds: {"✅" if GOOGLE_CREDENTIALS else "❌"} | '
+        f'Webhook signature: {"✅" if APP_SECRET else "כבוי"}',
+        'בדיקת יומן חיה: "בדוק יומן <מספר>"',
+    ]
+    return '\n'.join(lines)
 
 
 # ═════════════════════════════════════════════
@@ -972,6 +1243,33 @@ def _build_tools() -> list:
             },
         ),
         _make_function_declaration(
+            'delete_expense',
+            'ביטול / מחיקה של הוצאה או הכנסה שכבר נרשמה. השתמש בזה כשהמשתמש '
+            'מבקש לבטל, למחוק או לתקן רישום כספי — למשל "בטל את ההוצאה '
+            'האחרונה", "מחק את ההוצאה של ההמבורגר", "רשמתי בטעות".',
+            {
+                'type': 'object',
+                'properties': {
+                    'last': {
+                        'type': 'boolean',
+                        'description': 'true אם המשתמש מבקש לבטל את הרישום האחרון.',
+                    },
+                    'query': {
+                        'type': 'string',
+                        'description': 'מילות חיפוש בתיאור ההוצאה (למשל "המבורגר", "דלק").',
+                    },
+                },
+                'required': [],
+            },
+        ),
+        _make_function_declaration(
+            'show_transactions',
+            'הצגת התנועות הכספיות האחרונות של החודש (הוצאות והכנסות) עם '
+            'המספרים שלהן. השתמש כשהמשתמש מבקש לראות תנועות, רישומים אחרונים, '
+            'או רוצה לבחור רישום לביטול.',
+            {'type': 'object', 'properties': {}, 'required': []},
+        ),
+        _make_function_declaration(
             'add_task',
             'הוספת משימה לרשימת המטלות לפי מטריצת אייזנהאואר. השתמש בזה כשהמשתמש '
             'מבקש להוסיף משימה, לזכור לעשות משהו, או לשים תזכורת למטלה.',
@@ -997,8 +1295,11 @@ def _build_tools() -> list:
         ),
         _make_function_declaration(
             'create_calendar_event',
-            'יצירת אירוע ביומן גוגל. השתמש בזה כשהמשתמש מבקש לקבוע פגישה, '
-            'תור, אירוע, בוחן או תזכורת עם זמן מסוים.',
+            'יצירת אירוע ביומן גוגל (כולל אירועים חוזרים). השתמש בזה כשהמשתמש '
+            'מבקש לקבוע פגישה, תור, אירוע, בוחן או תזכורת עם זמן מסוים. '
+            'עבור בקשה חוזרת ("כל שבוע", "באופן קבוע", "כל יום שלישי לחודש '
+            'הקרוב") — קרא לכלי *פעם אחת בלבד* עם הפרמטר recurrence, ולא '
+            'בכמה קריאות נפרדות.',
             {
                 'type': 'object',
                 'properties': {
@@ -1013,14 +1314,25 @@ def _build_tools() -> list:
                             'למשל "2026-06-15T10:00:00". "10" או "ב-10" = 10:00. '
                             'טווח כמו "10-12" → התחלה ב-10:00. תאריך בפורמט יום/חודש '
                             '("15/06") או יחסי ("מחר", "יום שלישי") — חשב לפי הזמן '
-                            'הנוכחי שניתן לך.'
+                            'הנוכחי שניתן לך. באירוע חוזר — זה זמן המופע הראשון.'
                         ),
                     },
                     'duration_minutes': {
                         'type': 'integer',
                         'description': (
                             'משך האירוע בדקות. "למשך שעתיים"=120, "חצי שעה"=30, '
-                            'טווח "10-12"=120. אם המשתמש לא ציין משך — 60.'
+                            'טווח "10-12"=120, "16-19"=180. אם המשתמש לא ציין משך — 60.'
+                        ),
+                    },
+                    'recurrence': {
+                        'type': 'string',
+                        'description': (
+                            'כלל חזרה בפורמט RRULE עבור אירוע חוזר בלבד. '
+                            'דוגמאות: "RRULE:FREQ=WEEKLY;COUNT=4" = כל שבוע, 4 פעמים '
+                            '(מתאים ל"כל שבוע לחודש הקרוב"); '
+                            '"RRULE:FREQ=DAILY;COUNT=30" = כל יום לחודש; '
+                            '"RRULE:FREQ=WEEKLY" = כל שבוע ללא הגבלה. '
+                            'העדף תמיד COUNT על UNTIL. אם האירוע חד-פעמי — השמט לגמרי.'
                         ),
                     },
                     'location': {
@@ -1033,17 +1345,24 @@ def _build_tools() -> list:
         ),
         _make_function_declaration(
             'complete_task',
-            'סימון משימה קיימת כהושלמה. השתמש בזה כשהמשתמש אומר שסיים, ביצע '
-            'או השלים מטלה כלשהי.',
+            'סימון משימה אחת או יותר כהושלמו. השתמש בזה כשהמשתמש אומר שסיים, '
+            'ביצע או השלים מטלות. אם המשתמש סיים כמה משימות — העבר את כולן '
+            'ברשימה אחת (task_queries) בקריאה אחת.',
             {
                 'type': 'object',
                 'properties': {
-                    'task_query': {
-                        'type': 'string',
+                    'task_queries': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
                         'description': (
-                            'תיאור או מילות מפתח של המשימה שהושלמה (למשל "חלב", '
-                            '"להתקשר לרופא"). אם המשתמש לא פירט איזו, השאר ריק.'
+                            'רשימת תיאורים/מילות מפתח של המשימות שהושלמו '
+                            '(למשל ["חלב", "להתקשר לרופא"]). אפשר גם משימה אחת. '
+                            'אם המשתמש לא פירט איזו — השאר ריק.'
                         ),
+                    },
+                    'all': {
+                        'type': 'boolean',
+                        'description': 'true אם המשתמש סיים את *כל* המשימות.',
                     },
                 },
                 'required': [],
@@ -1051,14 +1370,20 @@ def _build_tools() -> list:
         ),
         _make_function_declaration(
             'delete_task',
-            'מחיקת משימה מהרשימה (לא סימון כהושלמה, אלא הסרה מוחלטת). השתמש בזה '
-            'כשהמשתמש מבקש למחוק, להסיר או לבטל משימה.',
+            'מחיקת משימה אחת או יותר מהרשימה (הסרה מוחלטת, לא סימון כהושלמה). '
+            'השתמש בזה כשהמשתמש מבקש למחוק, להסיר או לבטל משימות. אם ביקש '
+            'למחוק כמה — העבר את כולן ברשימה אחת בקריאה אחת.',
             {
                 'type': 'object',
                 'properties': {
-                    'task_query': {
-                        'type': 'string',
-                        'description': 'תיאור או מילות מפתח של המשימה למחיקה.',
+                    'task_queries': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': 'רשימת תיאורים/מילות מפתח של המשימות למחיקה.',
+                    },
+                    'all': {
+                        'type': 'boolean',
+                        'description': 'true אם המשתמש מבקש למחוק את *כל* המשימות.',
                     },
                 },
                 'required': [],
@@ -1121,12 +1446,12 @@ def _is_gemini_3_plus(model: str) -> bool:
     return bool(m) and int(m.group(1)) >= 3
 
 
-def _minimal_thinking_config():
+def _minimal_thinking_config(model: str):
     """A 'think as little as possible' setting that works across model
     generations and SDK versions. Gemini 3.x uses thinking_level; Gemini 2.5
     uses thinking_budget. Returns None if neither is supported (then thinking
     just stays at the model default — the response parser handles that fine)."""
-    if _is_gemini_3_plus(GEMINI_MODEL):
+    if _is_gemini_3_plus(model):
         for level in ('minimal', 'low'):
             try:
                 return types.ThinkingConfig(thinking_level=level)
@@ -1142,9 +1467,9 @@ def _minimal_thinking_config():
         return None
 
 
-def _build_generate_config(**kwargs):
+def _build_generate_config(model: str, **kwargs):
     """GenerateContentConfig with a minimal-thinking setting when supported."""
-    thinking = _minimal_thinking_config()
+    thinking = _minimal_thinking_config(model)
     if thinking is not None:
         try:
             return types.GenerateContentConfig(thinking_config=thinking, **kwargs)
@@ -1153,12 +1478,42 @@ def _build_generate_config(**kwargs):
     return types.GenerateContentConfig(**kwargs)
 
 
-def _router_config():
+def _router_config(model: str):
     return _build_generate_config(
+        model,
         system_instruction=_system_instruction(),
         tools=_get_tools(),
         temperature=0.0,  # deterministic routing
     )
+
+
+def _generate_with_fallback(build_call, *, what: str,
+                            max_attempts: int = 3, base_delay: float = 0.6,
+                            max_total: float = 6.0):
+    """[r6] Run a Gemini call with the primary model; if it keeps failing with
+    a TRANSIENT error (503 overloaded / 429 quota), automatically retry the
+    whole thing once with GEMINI_FALLBACK_MODEL. `build_call(model)` must
+    perform the actual API call for the given model name."""
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+    last_exc = None
+    for i, mdl in enumerate(models):
+        try:
+            return call_with_retry(
+                lambda m=mdl: build_call(m),
+                what=f'{what} [{mdl}]',
+                max_attempts=max_attempts, base_delay=base_delay, max_total=max_total,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if i + 1 < len(models) and _is_retryable_error(exc):
+                logger.warning('%s: model %s unavailable (%s) — falling back to %s',
+                               what, mdl, exc, models[i + 1])
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def _system_instruction() -> str:
@@ -1173,8 +1528,22 @@ def _system_instruction() -> str:
         'חשב לפי הזמן הנוכחי שלמעלה.\n'
         '• פורמט תאריך עברי הוא יום/חודש: "15/06" או "ב-15 ביוני" = 15 ביוני.\n'
         '• שעה: "10" או "ב-10" פירושו 10:00. "8 וחצי" = 08:30. "רבע ל-9" = 08:45.\n'
-        '• טווח שעות כמו "10-12" או "בין 10 ל-12" = התחלה ב-10:00 ומשך 120 דקות.\n'
+        '• טווח שעות כמו "10-12" או "בין 10 ל-12" = התחלה ב-10:00 ומשך 120 דקות. '
+        '"16-19" = התחלה ב-16:00 ומשך 180 דקות.\n'
         '• "למשך שעתיים" = duration_minutes=120. אם לא צוין משך — 60 דקות.\n\n'
+        'אירועים חוזרים (חשוב!):\n'
+        '• "כל שבוע", "באופן קבוע", "כל יום שלישי", "כל יום" — זה אירוע חוזר: '
+        'קרא ל-create_calendar_event *פעם אחת בלבד* עם recurrence מתאים. '
+        'לעולם אל תיצור כמה אירועים נפרדים בכמה קריאות.\n'
+        '• "לחודש הקרוב" בתדירות שבועית = RRULE:FREQ=WEEKLY;COUNT=4. '
+        'בתדירות יומית = RRULE:FREQ=DAILY;COUNT=30.\n'
+        '• start_time באירוע חוזר = המופע הראשון הקרוב (למשל יום שלישי הבא).\n\n'
+        'משימות:\n'
+        '• אם המשתמש סיים/מחק כמה משימות — העבר את כולן ב-task_queries '
+        'בקריאה אחת. "סיימתי הכל" → all=true.\n\n'
+        'כסף:\n'
+        '• ביטול/מחיקה/תיקון של רישום כספי — קרא ל-delete_expense '
+        '("בטל את ההוצאה האחרונה" → last=true).\n\n'
         'שיחה רב-תורית (חשוב מאוד!):\n'
         '• ההודעות הקודמות בשיחה ניתנות לך. אם בהודעה הנוכחית חסר פרט (כותרת, '
         'תאריך או שעה) אבל הוא כבר הופיע קודם בשיחה — קח אותו מההיסטוריה ובצע את '
@@ -1182,7 +1551,7 @@ def _system_instruction() -> str:
         '• ברגע שיש לך מספיק מידע — בצע מיד. אל תשאל שאלות מיותרות. אם חסר רק '
         'פרט קטן, השתמש בברירת מחדל סבירה במקום לשאול.\n\n'
         'כשהמשתמש מבקש פעולה (הוצאה, משימה, אירוע, שאילתה) — קרא לכלי המתאים. '
-        'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים '
+        'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים שונים '
         '(למשל גם לקבוע פגישה וגם להוסיף משימה).\n'
         'אם המשתמש רק משוחח, שואל שאלה כללית או אומר שלום — ענה בטקסט קצר '
         'וחביב בלי לקרוא לכלי. תמיד תן תשובה כלשהי — לעולם אל תשתוק.'
@@ -1242,22 +1611,19 @@ def _build_contents(text: str, history) -> list:
 
 def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], str]:
     """Send a free-form Hebrew message PLUS recent conversation history to
-    Gemini. Returns (tool_calls, reply_text)."""
+    Gemini. Returns (tool_calls, reply_text). Falls back to a secondary model
+    automatically when the primary is overloaded (503/429)."""
     client = get_genai_client()
     if not client:
         return [], 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'
 
     contents = _build_contents(text, history)
 
-    def _call():
-        return client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=_router_config(),
-        )
-
-    response = call_with_retry(_call, what='Gemini (router)',
-                               max_attempts=3, base_delay=0.6, max_total=6.0)
+    response = _generate_with_fallback(
+        lambda mdl: client.models.generate_content(
+            model=mdl, contents=contents, config=_router_config(mdl)),
+        what='Gemini (router)', max_attempts=3, base_delay=0.6, max_total=6.0,
+    )
     calls, reply_text = _extract_calls_and_text(response)
     if calls or reply_text:
         return calls, reply_text
@@ -1265,13 +1631,13 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
     logger.warning('Router returned empty content (200 but no call/text). '
                    'Retrying once without tools for a text reply. msg=%r', text[:120])
     try:
-        def _plain():
-            cfg = _build_generate_config(
-                system_instruction=_system_instruction(), temperature=0.3)
-            return client.models.generate_content(
-                model=GEMINI_MODEL, contents=contents, config=cfg)
-        resp2 = call_with_retry(_plain, what='Gemini (plain fallback)',
-                                max_attempts=2, base_delay=0.5, max_total=4.0)
+        resp2 = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(
+                model=mdl, contents=contents,
+                config=_build_generate_config(
+                    mdl, system_instruction=_system_instruction(), temperature=0.3)),
+            what='Gemini (plain fallback)', max_attempts=2, base_delay=0.5, max_total=4.0,
+        )
         _, text2 = _extract_calls_and_text(resp2)
         if text2:
             return [], text2
@@ -1313,6 +1679,54 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
     return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}* ({label}): {amt:,.0f} ש"ח{alert}'
 
 
+def _tool_delete_expense(args: dict, user_id: str) -> str:
+    """[r6] Cancel a recorded expense/income straight from WhatsApp."""
+    txs = get_recent_transactions(user_id, 15)
+    if not txs:
+        return 'אין תנועות החודש לביטול.'
+
+    last  = bool(args.get('last'))
+    query = (args.get('query') or '').strip()
+
+    if last and not query:
+        row = delete_expense_by_id(txs[0]['id'], user_id)
+        if row:
+            return f'🗑️ ביטלתי את הרישום האחרון:\n{_format_tx(row)}'
+        return 'לא הצלחתי לבטל. נסה "תנועות אחרונות".'
+
+    if query:
+        ql = query.lower()
+        matches = [t for t in txs
+                   if ql in (t['description'] or '').lower()
+                   or ql in t['category'].lower()]
+        if len(matches) == 1:
+            row = delete_expense_by_id(matches[0]['id'], user_id)
+            if row:
+                return f'🗑️ ביטלתי:\n{_format_tx(row)}'
+            return 'לא הצלחתי לבטל. נסה "תנועות אחרונות".'
+        candidates = matches if matches else txs
+    else:
+        candidates = txs
+
+    set_user_context(user_id, {'type': 'delete_expense'})
+    msg = '*איזו תנועה לבטל? (שלח את המספר, אפשר כמה)*\n\n'
+    for t in candidates[:12]:
+        msg += _format_tx(t) + '\n'
+    msg += '\n(או "ביטול")'
+    return msg
+
+
+def _tool_show_transactions(args: dict, user_id: str) -> str:
+    txs = get_recent_transactions(user_id, 10)
+    if not txs:
+        return 'אין תנועות החודש.'
+    msg = '*תנועות אחרונות החודש*\n\n'
+    for t in txs:
+        msg += _format_tx(t) + '\n'
+    msg += '\nלביטול: "בטל את ההוצאה של ..." או "בטל הוצאה אחרונה"'
+    return msg
+
+
 def _tool_add_task(args: dict, user_id: str) -> str:
     quad = (args.get('quadrant') or '').strip()
     desc = (args.get('description') or '').strip()
@@ -1336,55 +1750,120 @@ def _tool_create_event(args: dict, user_id: str) -> str:
         duration = 60
     if duration <= 0:
         duration = 60
-    return process_calendar_ai(title, start_time_iso, location, user_id, duration)  # [MULTI]
+    recurrence = args.get('recurrence')   # [r6] recurring events
+    return process_calendar_ai(title, start_time_iso, location, user_id,
+                               duration, recurrence)
+
+
+def _collect_task_queries(args: dict) -> list[str]:
+    """[r6] Gather task search terms from either the new list parameter or
+    the legacy single-string parameter."""
+    queries: list[str] = []
+    raw = args.get('task_queries')
+    if isinstance(raw, list):
+        queries += [str(q).strip() for q in raw if str(q).strip()]
+    single = (args.get('task_query') or '').strip()
+    if single:
+        queries.append(single)
+    seen: set[str] = set()
+    return [q for q in queries if not (q in seen or seen.add(q))]
+
+
+def _task_picker_message(user_id: str, ctype: str, header: str) -> str:
+    """List active tasks and arm the numeric-choice context."""
+    candidates = get_active_tasks(user_id)
+    set_user_context(user_id, {'type': ctype})
+    msg = f'*{header}*\n\n'
+    for tid, quad, desc in candidates:
+        preview = desc[:40] + ('…' if len(desc) > 40 else '')
+        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
+    msg += '\n(או "ביטול")'
+    return msg
 
 
 def _tool_complete_task(args: dict, user_id: str) -> str:
-    query   = (args.get('task_query') or '').strip()
-    matches = find_tasks_by_text(query, user_id)
-
     if not get_active_tasks(user_id):
         return 'אין משימות פתוחות לסיים! 🎉'
 
-    if query and len(matches) == 1:
-        tid, _quad, desc = matches[0]
-        if mark_task_completed(tid, user_id):
-            preview = desc[:50] + ('…' if len(desc) > 50 else '')
-            return f'מעולה! 🎉 סימנתי כהושלם:\n[{tid}] {preview}'
-        return 'לא הצלחתי לסמן את המשימה. נסה "סטטוס משימות".'
+    # [r6] "סיימתי הכל"
+    if args.get('all') is True:
+        n = 0
+        for tid, _q, _d in get_active_tasks(user_id):
+            if mark_task_completed(tid, user_id):
+                n += 1
+        return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו. שולחן נקי!'
 
-    candidates = matches if matches else get_active_tasks(user_id)
-    set_user_context(user_id, {'type': 'complete_task'})
-    msg = '*איזו משימה סיימת? (שלח את המספר)*\n\n'
-    for tid, quad, desc in candidates:
-        preview = desc[:40] + ('…' if len(desc) > 40 else '')
-        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
-    msg += '\n(או "ביטול")'
-    return msg
+    queries = _collect_task_queries(args)
+    done: list[tuple[int, str]] = []
+    ambiguous = False
+
+    # [r6] Resolve every query; act on unambiguous matches immediately.
+    for q in queries:
+        matches = find_tasks_by_text(q, user_id)
+        if len(matches) == 1:
+            tid, _quad, desc = matches[0]
+            if mark_task_completed(tid, user_id):
+                done.append((tid, desc))
+        else:
+            ambiguous = True
+
+    parts: list[str] = []
+    if done:
+        lines = '\n'.join(f'[{tid}] {d[:50]}' + ('…' if len(d) > 50 else '')
+                          for tid, d in done)
+        head = 'מעולה! 🎉 סימנתי כהושלם:' if len(done) == 1 else \
+               f'מעולה! 🎉 סימנתי {len(done)} משימות כהושלמו:'
+        parts.append(f'{head}\n{lines}')
+
+    if ambiguous or not queries:
+        if get_active_tasks(user_id):
+            parts.append(_task_picker_message(
+                user_id, 'complete_task',
+                'איזו משימה סיימת? (אפשר כמה מספרים, או "הכל")'))
+
+    return '\n\n'.join(parts) if parts else 'לא מצאתי משימה מתאימה. נסה "סטטוס משימות".'
 
 
 def _tool_delete_task(args: dict, user_id: str) -> str:
-    query   = (args.get('task_query') or '').strip()
-    matches = find_tasks_by_text(query, user_id)
-
     if not get_active_tasks(user_id):
         return 'אין משימות פתוחות למחוק.'
 
-    if query and len(matches) == 1:
-        tid, _quad, desc = matches[0]
-        if delete_task_by_id(tid, user_id):
-            preview = desc[:50] + ('…' if len(desc) > 50 else '')
-            return f'🗑️ נמחקה המשימה:\n[{tid}] {preview}'
-        return 'לא הצלחתי למחוק את המשימה. נסה "סטטוס משימות".'
+    # [r6] "מחק הכל"
+    if args.get('all') is True:
+        n = 0
+        for tid, _q, _d in get_active_tasks(user_id):
+            if delete_task_by_id(tid, user_id):
+                n += 1
+        return f'🗑️ נמחקו {n} משימות. הרשימה ריקה.'
 
-    candidates = matches if matches else get_active_tasks(user_id)
-    set_user_context(user_id, {'type': 'delete_task'})
-    msg = '*איזו משימה למחוק? (שלח את המספר)*\n\n'
-    for tid, quad, desc in candidates:
-        preview = desc[:40] + ('…' if len(desc) > 40 else '')
-        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
-    msg += '\n(או "ביטול")'
-    return msg
+    queries = _collect_task_queries(args)
+    deleted: list[tuple[int, str]] = []
+    ambiguous = False
+
+    for q in queries:
+        matches = find_tasks_by_text(q, user_id)
+        if len(matches) == 1:
+            tid, _quad, desc = matches[0]
+            if delete_task_by_id(tid, user_id):
+                deleted.append((tid, desc))
+        else:
+            ambiguous = True
+
+    parts: list[str] = []
+    if deleted:
+        lines = '\n'.join(f'[{tid}] {d[:50]}' + ('…' if len(d) > 50 else '')
+                          for tid, d in deleted)
+        head = '🗑️ נמחקה המשימה:' if len(deleted) == 1 else \
+               f'🗑️ נמחקו {len(deleted)} משימות:'
+        parts.append(f'{head}\n{lines}')
+
+    if ambiguous or not queries:
+        if get_active_tasks(user_id):
+            parts.append(_task_picker_message(
+                user_id, 'delete_task',
+                'איזו משימה למחוק? (אפשר כמה מספרים, או "הכל")'))
+
+    return '\n\n'.join(parts) if parts else 'לא מצאתי משימה מתאימה. נסה "סטטוס משימות".'
 
 
 def _tool_set_limit(args: dict, user_id: str) -> str:
@@ -1405,6 +1884,8 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
     """Dispatch a single validated tool call to its handler."""
     handlers = {
         'add_expense':            _tool_add_expense,
+        'delete_expense':         _tool_delete_expense,
+        'show_transactions':      _tool_show_transactions,
         'add_task':               _tool_add_task,
         'create_calendar_event':  _tool_create_event,
         'complete_task':          _tool_complete_task,
@@ -1438,8 +1919,8 @@ def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: st
     if caption:
         contents.append(f'הערת המשתמש: {caption}')
     try:
-        response = call_with_retry(
-            lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
+        response = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(model=mdl, contents=contents),
             what='Gemini (image)', max_attempts=3, base_delay=0.8, max_total=10.0,
         )
         _, out = _extract_calls_and_text(response)
@@ -1454,9 +1935,9 @@ def transcribe_audio_with_ai(audio_data: bytes | None, mime_type: str) -> str | 
     if not client or not audio_data:
         return None
     try:
-        response = call_with_retry(
-            lambda: client.models.generate_content(
-                model=GEMINI_MODEL,
+        response = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(
+                model=mdl,
                 contents=[
                     'תמלל את ההקלטה הבאה לעברית. החזר אך ורק את הטקסט המתומלל, ללא הסברים.',
                     types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/ogg'),
@@ -1483,9 +1964,9 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
                 'אני יכול לקרוא כרגע רק PDF או קובצי טקסט. '
                 'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
     try:
-        response = call_with_retry(
-            lambda: client.models.generate_content(
-                model=GEMINI_MODEL,
+        response = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(
+                model=mdl,
                 contents=[
                     'סכם בקצרה בעברית את תוכן המסמך הבא, בנקודות עיקריות וברורות.',
                     types.Part.from_bytes(data=doc_data, mime_type=mime_type),
@@ -1627,6 +2108,10 @@ _SET_BUDGET_RE = re.compile(
 _LINK_CAL_RE   = re.compile(r'^(?:חבר|קשר)\s+יומן\s+(\+?[\d\s\-()]{6,})\s+(\S+@\S+)\s*$')
 _UNLINK_CAL_RE = re.compile(r'^נתק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
 
+# [r6] Admin-only live calendar diagnostic:
+#   "בדוק יומן 972501234567"
+_CHECK_CAL_RE  = re.compile(r'^בדוק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
+
 # [MULTI] Admin-only household sharing (no redeploy):
 #   "שתף 972502222222 עם 972501111111"   /   "בטל שיתוף 972502222222"
 _LINK_ALIAS_RE   = re.compile(r'^שתף\s+(\+?[\d\s\-()]{6,})\s+עם\s+(\+?[\d\s\-()]{6,})\s*$')
@@ -1639,6 +2124,18 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         return None
     t = text.strip()
 
+    # [r6] Full system diagnostic
+    if t in ('אבחון', 'סטטוס מערכת', 'diag', 'debug'):
+        return _admin_system_diag()
+
+    # [r6] Live read/write test of a user's mapped calendar
+    m = _CHECK_CAL_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        if not target:
+            return 'מספר לא תקין. נסה: בדוק יומן 972501234567'
+        return _admin_check_calendar(target)
+
     m = _LINK_CAL_RE.match(t)
     if m:
         target = _normalize_phone(m.group(1))
@@ -1646,8 +2143,12 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         if not target:
             return 'מספר לא תקין. נסה: חבר יומן 972501234567 someone@gmail.com'
         set_user_calendar(target, email)
-        return (f'✅ חיברתי יומן.\nמספר: {target}\nיומן: {email}\n'
-                f'(ודא שהוא שיתף את היומן עם חשבון השירות עם הרשאת עריכה.)')
+        reply = (f'✅ חיברתי יומן.\nמספר: {target}\nיומן: {email}\n'
+                 f'לבדיקה חיה: בדוק יומן {target}')
+        if not DB_PERSISTENT:
+            reply += ('\n⚠️ אזהרה: DB_PATH לא מוגדר — החיבור הזה יימחק בדיפלוי '
+                      'הבא! שלח "אבחון" לפרטים.')
+        return reply
 
     m = _UNLINK_CAL_RE.match(t)
     if m:
@@ -1697,6 +2198,10 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
              'רשימת משימות', 'המשימות שלי', 'מטלות', 'todo', 'משימות פתוחות'):
         return get_task_status(user_id)
 
+    # [r6] quick access to recent transactions
+    if t in ('תנועות', 'תנועות אחרונות', 'רישומים אחרונים', 'הוצאות אחרונות'):
+        return _tool_show_transactions({}, user_id)
+
     m = _SET_BUDGET_RE.match(t)
     if m:
         cat = m.group(1).strip()
@@ -1716,6 +2221,62 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 # Message Processing
 # ─────────────────────────────────────────────
 
+def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
+    """[r6] Shared numeric-choice flow for complete_task / delete_task /
+    delete_expense. Accepts several numbers at once ("1 3 5" / "1,3,5") and
+    the word "הכל" for tasks."""
+    # "הכל" — complete/delete every open task
+    if ctype in ('complete_task', 'delete_task') and re.search(r'הכל', text):
+        n = 0
+        for tid, _q, _d in get_active_tasks(user_id):
+            ok = (mark_task_completed(tid, user_id) if ctype == 'complete_task'
+                  else delete_task_by_id(tid, user_id))
+            if ok:
+                n += 1
+        delete_user_context(user_id)
+        if ctype == 'complete_task':
+            return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו.'
+        return f'🗑️ נמחקו {n} משימות. הרשימה ריקה.'
+
+    ids = [int(x) for x in re.findall(r'\d+', text)]
+    if not ids:
+        what = {'complete_task': 'שסיימת',
+                'delete_task':   'למחיקה',
+                'delete_expense': 'לביטול'}.get(ctype, '')
+        return f'שלח רק את המספר {what} — אפשר גם כמה מספרים (או "ביטול").'
+
+    ok_lines: list[str] = []
+    bad_ids:  list[int] = []
+    for item_id in ids:
+        if ctype == 'complete_task':
+            if mark_task_completed(item_id, user_id):
+                ok_lines.append(f'משימה {item_id} ✅')
+            else:
+                bad_ids.append(item_id)
+        elif ctype == 'delete_task':
+            if delete_task_by_id(item_id, user_id):
+                ok_lines.append(f'משימה {item_id} 🗑️')
+            else:
+                bad_ids.append(item_id)
+        elif ctype == 'delete_expense':
+            row = delete_expense_by_id(item_id, user_id)
+            if row:
+                ok_lines.append(_format_tx(row))
+            else:
+                bad_ids.append(item_id)
+
+    if ok_lines:
+        delete_user_context(user_id)
+        head = {'complete_task': 'מעולה! 🎉 סומנו כהושלמו:',
+                'delete_task':   '🗑️ נמחקו:',
+                'delete_expense': '🗑️ בוטלו:'}[ctype]
+        msg = head + '\n' + '\n'.join(ok_lines)
+        if bad_ids:
+            msg += f'\n(לא נמצאו: {", ".join(map(str, bad_ids))})'
+        return msg
+    return 'לא מצאתי פריט עם המספרים האלה. נסה שוב (או "ביטול").'
+
+
 def process_message(text: str, user_id: str, admin_phone: str | None = None) -> str:
     text = (text or '').strip()
     if not text:
@@ -1729,27 +2290,21 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
-        if ctype in ('complete_task', 'delete_task'):
-            match = re.search(r'(\d+)', text)
-            if not match:
-                action = 'שסיימת' if ctype == 'complete_task' else 'למחיקה'
-                return f'שלח רק את המספר של המשימה {action} (או "ביטול").'
-            task_id = int(match.group(1))
-            if ctype == 'complete_task':
-                ok = mark_task_completed(task_id, user_id)
-                done_msg = f'מעולה! 🎉 משימה {task_id} סומנה כהושלמה.'
-            else:
-                ok = delete_task_by_id(task_id, user_id)
-                done_msg = f'🗑️ משימה {task_id} נמחקה.'
-            if ok:
-                delete_user_context(user_id)
-                return done_msg
-            return 'לא מצאתי משימה עם המספר הזה. נסה שוב (או "ביטול").'
+        if ctype in ('complete_task', 'delete_task', 'delete_expense'):
+            # [r6.1] Only treat the reply as a numeric choice if it really is
+            # one ("3", "1 4 7", "משימה 2", "הכל"). If the user changed topic
+            # ("תקבע פגישה מחר ב-10"), drop the pending picker instead of
+            # hijacking its digits as task/expense IDs.
+            leftover = re.sub(r'[\d\s,.\-]+', '', text)
+            if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'משימה', 'משימות',
+                            'מספר', 'תנועה', 'הוצאה'):
+                return _handle_numeric_context(ctype, text, user_id)
+            delete_user_context(user_id)   # picker abandoned — fall through
 
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
-    # ── [MULTI] Admin commands (calendar linking, household sharing) ──
+    # ── [MULTI] Admin commands (calendar linking, diagnostics, sharing) ──
     # Admin status is checked against the REAL phone, not a shared account id.
     admin = _try_admin_command(text, admin_phone or user_id)
     if admin is not None:
@@ -1770,8 +2325,18 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                 'הבקשה שלך לא אבדה — נסה לשלוח אותה שוב עוד כמה שניות.')
 
     if tool_calls:
-        results = [execute_tool(name, args, user_id) for name, args in tool_calls]
-        reply = '\n\n'.join(r for r in results if r) or 'בוצע ✅'
+        # [r6] De-duplicate identical results — when the model fires the same
+        # tool several times (e.g. recurring-event misuse, or several events
+        # all hitting the "no calendar" refusal), the user gets ONE message
+        # instead of the same text 3×.
+        results: list[str] = []
+        seen: set[str] = set()
+        for name, args in tool_calls:
+            r = execute_tool(name, args, user_id)
+            if r and r not in seen:
+                seen.add(r)
+                results.append(r)
+        reply = '\n\n'.join(results) or 'בוצע ✅'
     elif reply_text:
         reply = reply_text
     else:
@@ -1836,7 +2401,7 @@ def get_task_status(user_id: str) -> str:
                 status += f'  [{tid}] {preview}\n'
             status += '\n'
     status += f'סה"כ: {len(active_tasks)} פתוחות | {completed}/{total} הושלמו החודש\n'
-    status += '(לסיום: "סיימתי [שם המשימה]" · למחיקה: "מחק [שם המשימה]")'
+    status += '(לסיום: "סיימתי X ו-Y" · למחיקה: "מחק X" · אפשר כמה ביחד!)'
     return status
 
 
@@ -1883,6 +2448,7 @@ def get_welcome_message() -> str:
         'אהלן! אני *סחבק* — העוזר האישי שלך 🤖\n\n'
         'פשוט כתוב לי בחופשי:\n\n'
         '📅 *יומן:* "תקבע לי פגישה עם דני מחר ב-8"\n'
+        '🔁 *קבוע:* "קבע כל יום שלישי 16-19 אימון לחודש הקרוב"\n'
         '✅ *משימות:* "שים לי משימה דחופה לקנות חלב"\n'
         '💵 *תקציב:* "אכלתי המבורגר ב-70 שקל"\n\n'
         'אפשר גם לשלוח לי *הקלטה קולית*, *תמונה* או *קובץ PDF* 🎤📷📄\n\n'
@@ -1927,13 +2493,16 @@ def get_help_menu() -> str:
         '*תפריט עזרה — סחבק* 🤖\n\n'
         'דבר איתי חופשי, אני מבין שפה טבעית:\n'
         '• "קבע פגישה עם רופא השיניים ביום ראשון ב-10"\n'
+        '• "קבע כל יום שלישי 16-19 תרגול לחודש הקרוב" 🔁\n'
         '• "תוסיף משימה חשובה להכין מצגת"\n'
         '• "שילמתי 250 על דלק"\n'
-        '• "סיימתי את המשימה של החלב"\n\n'
+        '• "סיימתי את החלב ואת המצגת" (כמה ביחד!)\n'
+        '• "בטל את ההוצאה האחרונה"\n\n'
         '*אפשר גם לבקש כמה דברים בהודעה אחת!*\n\n'
         '*פקודות מהירות:*\n'
         '• "סטטוס משימות" / "מה יש לי לעשות"\n'
         '• "סטטוס כלכלי" / "מאזן"\n'
+        '• "תנועות אחרונות"\n'
         '• "הגדר תקציב מזון 3000"\n'
         '• "מחק משימה ..." · "ביטול"\n\n'
         '*קטגוריות תקציב:*\n'
@@ -2059,11 +2628,14 @@ def health():
         'version':        BUILD_VERSION,
         'timestamp':      now_local().isoformat(),
         'model':          GEMINI_MODEL,
+        'fallback_model': GEMINI_FALLBACK_MODEL,
         'gemini':         bool(GEMINI_API_KEY),
         'whatsapp':       bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
         'calendar':       bool(GOOGLE_CREDENTIALS),
         'allowlist':      len(ALLOWED_USERS),
         'admins':         len(ADMIN_USERS),
+        'db_path':        DB_FILE,
+        'db_persistent':  DB_PERSISTENT,   # False = data wiped on every deploy!
     }), 200
 
 
@@ -2072,8 +2644,9 @@ def health():
 # ─────────────────────────────────────────────
 
 def _log_startup_config() -> None:
-    logger.info('סחבק starting — build=%s, model=%s, whatsapp_api=%s, workers=%d',
-                BUILD_VERSION, GEMINI_MODEL, WHATSAPP_API_VERSION, MAX_WORKERS)
+    logger.info('סחבק starting — build=%s, model=%s (fallback=%s), whatsapp_api=%s, workers=%d',
+                BUILD_VERSION, GEMINI_MODEL, GEMINI_FALLBACK_MODEL,
+                WHATSAPP_API_VERSION, MAX_WORKERS)
     missing = [name for name, val in {
         'WHATSAPP_TOKEN':  WHATSAPP_TOKEN,
         'PHONE_NUMBER_ID': PHONE_NUMBER_ID,
@@ -2083,6 +2656,18 @@ def _log_startup_config() -> None:
         logger.warning('Missing env vars (related features will be disabled): %s', ', '.join(missing))
     if not APP_SECRET:
         logger.warning('APP_SECRET not set — webhook signature verification is OFF')
+
+    # [r6] THE critical warning. Without DB_PATH on the Volume, every deploy
+    # wipes calendar links, tasks, budget history and conversation memory.
+    if not DB_PERSISTENT:
+        logger.warning('=' * 70)
+        logger.warning('DB_PATH is NOT set! The SQLite DB (%s) lives on EPHEMERAL', DB_FILE)
+        logger.warning('container storage and is WIPED ON EVERY DEPLOY — including all')
+        logger.warning('calendar links created with "חבר יומן", budget data and tasks.')
+        logger.warning('FIX: in Railway, open the attached Volume, copy its Mount Path,')
+        logger.warning('and add a service variable:  DB_PATH=<mount-path>/sahbak.db')
+        logger.warning('=' * 70)
+
     if ALLOWED_USERS:
         logger.info('[MULTI] Allowlist active: %d number(s) permitted', len(ALLOWED_USERS))
     else:
@@ -2147,24 +2732,11 @@ def api_dashboard():
 
     completed, total_tasks = get_tasks_completion_stats(user_id)
 
-    current_month = now_local().strftime('%Y-%m')
-    with _connect() as conn:
-        rows = conn.execute(
-            """SELECT id, category, amount, date, description
-               FROM budget
-               WHERE user_id = ? AND strftime('%Y-%m', date) = ?
-               ORDER BY id DESC LIMIT 50""",
-            (user_id, current_month)
-        ).fetchall()
-    transactions = [
-        {'id': r[0], 'category': r[1], 'amount': r[2],
-         'date': r[3], 'description': r[4]}
-        for r in rows
-    ]
+    transactions = get_recent_transactions(user_id, 50)   # [r6] shared helper
 
     return jsonify({
         'user_id':         user_id,
-        'month':           current_month,
+        'month':           now_local().strftime('%Y-%m'),
         'budget_summary':  budget,
         'budget_limits':   limits,
         'tasks':           tasks,
@@ -2209,22 +2781,17 @@ def api_add_expense():
 # ─── DELETE /api/expense/<id>?user_id=<PHONE> ───────────────────────────────
 @app.route('/api/expense/<int:expense_id>', methods=['DELETE'])
 def api_delete_expense(expense_id):
-    """מחיקת תנועה לפי ID."""
+    """מחיקת תנועה לפי ID — [r6] עכשיו דרך אותו helper של הבוט."""
     err = _require_dashboard_key()
     if err:
         return err
     user_id = _get_user_id()
     if not user_id:
         return jsonify({'error': 'user_id required'}), 400
-    with _connect() as conn:
-        cur = conn.execute(
-            'DELETE FROM budget WHERE id = ? AND user_id = ?',
-            (expense_id, user_id)
-        )
-        conn.commit()
-    if cur.rowcount == 0:
+    row = delete_expense_by_id(expense_id, user_id)
+    if not row:
         return jsonify({'error': 'expense not found'}), 404
-    return jsonify({'status': 'ok', 'expense_id': expense_id}), 200
+    return jsonify({'status': 'ok', 'expense_id': expense_id, 'deleted': row}), 200
 
 
 # ─── POST /api/tasks ─────────────────────────────────────────────────────────
