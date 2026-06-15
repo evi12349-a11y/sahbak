@@ -977,6 +977,11 @@ def _normalize_rrule(raw: str | None) -> str | None:
     if not re.search(r'FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)', r.upper()):
         logger.warning('Ignoring invalid recurrence rule: %r', raw)
         return None
+    # [FIX] Google Calendar rejects a *bare* UNTIL date (YYYYMMDD) on a TIMED
+    # event with HTTP 400 — it must be a UTC datetime. Promote "UNTIL=20260714"
+    # → "UNTIL=20260714T235959Z" so an "…עד ה-15 ביולי" recurrence won't fail
+    # silently. An already-full UNTIL (…T…Z) is left untouched by the (?!T).
+    r = re.sub(r'(UNTIL=)(\d{8})(?!T)', r'\1\2T235959Z', r, flags=re.IGNORECASE)
     return r
 
 
@@ -2225,8 +2230,8 @@ def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
     """[r6] Shared numeric-choice flow for complete_task / delete_task /
     delete_expense. Accepts several numbers at once ("1 3 5" / "1,3,5") and
     the word "הכל" for tasks."""
-    # "הכל" — complete/delete every open task
-    if ctype in ('complete_task', 'delete_task') and re.search(r'הכל', text):
+    # "הכל"/"הכול" — complete/delete every open task (both spellings).
+    if ctype in ('complete_task', 'delete_task') and re.search(r'הכו?ל', text):
         n = 0
         for tid, _q, _d in get_active_tasks(user_id):
             ok = (mark_task_completed(tid, user_id) if ctype == 'complete_task'
@@ -2296,8 +2301,8 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             # ("תקבע פגישה מחר ב-10"), drop the pending picker instead of
             # hijacking its digits as task/expense IDs.
             leftover = re.sub(r'[\d\s,.\-]+', '', text)
-            if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'משימה', 'משימות',
-                            'מספר', 'תנועה', 'הוצאה'):
+            if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'אתהכול', 'ו', 'וגם',
+                            'משימה', 'משימות', 'מספר', 'תנועה', 'הוצאה'):
                 return _handle_numeric_context(ctype, text, user_id)
             delete_user_context(user_id)   # picker abandoned — fall through
 
@@ -2587,25 +2592,31 @@ def webhook():
         if not messages:
             return jsonify({'status': 'ignored'}), 200
 
-        message     = messages[0]
-        from_number = message.get('from', '')
-        message_id  = message.get('id', '')
+        # [FIX] WhatsApp may batch several inbound messages in ONE webhook.
+        # Process EVERY message — not just messages[0] — so nothing is silently
+        # dropped. Each gets its own allowlist + dedup check before dispatch.
+        queued = 0
+        for message in messages:
+            from_number = message.get('from', '')
+            message_id  = message.get('id', '')
 
-        if not from_number:
-            return jsonify({'status': 'ignored'}), 200
+            if not from_number:
+                continue
 
-        # [MULTI] Allowlist: if configured, silently ignore anyone not on it.
-        # Protects your Gemini quota and your calendar from strangers.
-        if ALLOWED_USERS and from_number not in ALLOWED_USERS:
-            logger.info('Ignoring message from non-allowed number %s', from_number)
-            return jsonify({'status': 'ignored'}), 200
+            # [MULTI] Allowlist: if configured, silently ignore anyone not on it.
+            # Protects your Gemini quota and your calendar from strangers.
+            if ALLOWED_USERS and from_number not in ALLOWED_USERS:
+                logger.info('Ignoring message from non-allowed number %s', from_number)
+                continue
 
-        if not mark_message_seen(message_id):
-            logger.info('Duplicate message %s ignored', message_id)
-            return jsonify({'status': 'duplicate'}), 200
+            if not mark_message_seen(message_id):
+                logger.info('Duplicate message %s ignored', message_id)
+                continue
 
-        _executor.submit(_handle_message_safely, message, from_number)
-        return jsonify({'status': 'ok'}), 200
+            _executor.submit(_handle_message_safely, message, from_number)
+            queued += 1
+
+        return jsonify({'status': 'ok', 'queued': queued}), 200
 
     except (IndexError, KeyError) as exc:
         logger.warning('Malformed webhook payload: %s', exc)
