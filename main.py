@@ -2226,8 +2226,9 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         target = _normalize_phone(m.group(1))
         if not target:
             return 'מספר לא תקין. נסה: קישור 972501234567'
-        return (f'🔗 לוח בקרה אישי עבור {target}:\n' + _dash_link(target) +
-                '\nשלח לו את הקישור — הוא יראה רק את הנתונים שלו.')
+        # LRM (U+200E) before the URL → WhatsApp renders the full "https" in RTL.
+        return (f'🔗 לוח בקרה אישי עבור {target} — שלח לו, הוא יראה רק את הנתונים שלו:\n\n'
+                '‎' + _dash_link(target))
 
     return None
 
@@ -2373,8 +2374,11 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     # ── Personal dashboard link (any user) ──
     # Each user gets their OWN link with a scoped token — shows only their data.
     if text.lower() in ('קישור', 'לינק', 'דשבורד', 'האתר שלי', 'link', 'dashboard'):
-        return ('🔗 לוח הבקרה האישי שלך:\n' + _dash_link(user_id) +
-                '\n\nשמור את הקישור — הוא אישי ומציג רק את הנתונים שלך.')
+        # URL goes LAST, alone on its line, prefixed with U+200E (LRM) so
+        # WhatsApp's RTL layout renders the full "https://" without clipping
+        # the leading "h" against the preceding Hebrew text.
+        return ('🔗 לוח הבקרה האישי שלך — שמור אותו, הוא מציג רק את הנתונים שלך:\n\n'
+                '‎' + _dash_link(user_id))
 
     # ── [MULTI] Admin commands (calendar linking, diagnostics, sharing) ──
     # Admin status is checked against the REAL phone, not a shared account id.
