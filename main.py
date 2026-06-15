@@ -1223,6 +1223,7 @@ def _admin_system_diag() -> str:
         f'| שיתופי בית: {aliases}',
         f'Allowlist: {len(ALLOWED_USERS)} | Admins: {len(ADMIN_USERS)}',
         f'חשבון שירות: {sa or "—"}',
+        f'כתובת דשבורד: {PUBLIC_BASE_URL or "(נתיב יחסי — הגדר PUBLIC_URL)"}',
         f'WhatsApp: {"✅" if (WHATSAPP_TOKEN and PHONE_NUMBER_ID) else "❌"} | '
         f'Calendar creds: {"✅" if GOOGLE_CREDENTIALS else "❌"} | '
         f'Webhook signature: {"✅" if APP_SECRET else "כבוי"}',
@@ -2070,6 +2071,12 @@ def _post_whatsapp(payload: dict) -> bool:
         return False
 
 
+# Sentinel that forces the text AFTER it into a SEPARATE WhatsApp bubble. Used
+# to send a URL in its own pure-ASCII bubble — when Hebrew shares the bubble,
+# WhatsApp's RTL layout visually clips the URL's leading character ("h").
+BUBBLE_BREAK = '\x1e'
+
+
 def send_whatsapp_message(to: str, message: str) -> bool:
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error('WhatsApp credentials not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)')
@@ -2077,14 +2084,20 @@ def send_whatsapp_message(to: str, message: str) -> bool:
     if not message:
         return False
     ok = True
-    for chunk in _split_for_whatsapp(message):
-        payload = {
-            'messaging_product': 'whatsapp',
-            'to':                to,
-            'type':              'text',
-            'text':              {'body': chunk},
-        }
-        ok = _post_whatsapp(payload) and ok
+    # Each BUBBLE_BREAK-separated segment becomes its own message bubble; each
+    # segment is then further length-split for the 4096-char limit.
+    for segment in message.split(BUBBLE_BREAK):
+        segment = segment.strip()
+        if not segment:
+            continue
+        for chunk in _split_for_whatsapp(segment):
+            payload = {
+                'messaging_product': 'whatsapp',
+                'to':                to,
+                'type':              'text',
+                'text':              {'body': chunk},
+            }
+            ok = _post_whatsapp(payload) and ok
     return ok
 
 
@@ -2226,9 +2239,10 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         target = _normalize_phone(m.group(1))
         if not target:
             return 'מספר לא תקין. נסה: קישור 972501234567'
-        # URL FIRST so WhatsApp's RTL layout can't clip the leading "h".
-        return (_dash_link(target) +
-                f'\n\n🔗 לוח בקרה אישי עבור {target} — שלח לו, יראה רק את הנתונים שלו.')
+        # URL in its OWN pure-ASCII bubble (after BUBBLE_BREAK) so WhatsApp's
+        # RTL layout can't clip the leading "h".
+        return (f'🔗 לוח בקרה אישי עבור {target} — שלח לו, יראה רק את הנתונים שלו:'
+                + BUBBLE_BREAK + _dash_link(target))
 
     return None
 
@@ -2374,11 +2388,11 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     # ── Personal dashboard link (any user) ──
     # Each user gets their OWN link with a scoped token — shows only their data.
     if text.lower() in ('קישור', 'לינק', 'דשבורד', 'האתר שלי', 'link', 'dashboard'):
-        # URL goes FIRST — nothing precedes "https", so WhatsApp's RTL layout
-        # cannot clip the leading "h". Visible ASCII only (an invisible LRM
-        # marker gets stripped when the file is copied into GitHub).
-        return (_dash_link(user_id) +
-                '\n\n🔗 לוח הבקרה האישי שלך — שמור את הקישור, מציג רק את הנתונים שלך.')
+        # Send the URL in its OWN pure-ASCII bubble (after BUBBLE_BREAK). A
+        # bubble with no Hebrew renders left-to-right, so WhatsApp can't clip
+        # the URL's leading "h".
+        return ('🔗 לוח הבקרה האישי שלך — שמור את הקישור, מציג רק את הנתונים שלך:'
+                + BUBBLE_BREAK + _dash_link(user_id))
 
     # ── [MULTI] Admin commands (calendar linking, diagnostics, sharing) ──
     # Admin status is checked against the REAL phone, not a shared account id.
@@ -2773,9 +2787,21 @@ DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
 # Public base URL of THIS service — used to build shareable per-user dashboard
 # links. Railway injects RAILWAY_PUBLIC_DOMAIN automatically; PUBLIC_URL lets
 # you override (custom domain). Empty → a relative path is returned instead.
-PUBLIC_BASE_URL = (os.getenv('PUBLIC_URL')
-                   or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}"
-                       if os.getenv('RAILWAY_PUBLIC_DOMAIN') else '')).rstrip('/')
+def _clean_base_url(raw: str) -> str:
+    """Force a clean https:// base URL. Tolerates a MISSING or MALFORMED scheme
+    — e.g. 'ttps://…' accidentally pasted from a clipped WhatsApp link, or a
+    bare domain — so a broken PUBLIC_URL can never produce a broken link."""
+    raw = (raw or '').strip().rstrip('/')
+    if not raw:
+        return ''
+    raw = re.sub(r'^[a-zA-Z]*:?//', '', raw)   # drop any (mal)formed scheme
+    return 'https://' + raw
+
+
+PUBLIC_BASE_URL = _clean_base_url(
+    os.getenv('PUBLIC_URL')
+    or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}"
+        if os.getenv('RAILWAY_PUBLIC_DOMAIN') else ''))
 
 # The dashboard HTML lives next to this file in the repo and is served by Flask
 # (same origin as the API → zero CORS and a real, shareable URL).
