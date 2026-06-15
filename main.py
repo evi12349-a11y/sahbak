@@ -97,7 +97,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 # Google Calendar (google-api-python-client + google-auth)
 from google.oauth2 import service_account
@@ -553,17 +553,32 @@ def register_if_new_user(user_id: str) -> bool:
 
 def get_user_calendar(user_id: str) -> str | None:
     """The calendar id we should write to for this user. DB first, then the
-    USER_CALENDARS env bootstrap. None means 'no calendar connected'."""
+    USER_CALENDARS env bootstrap.
+
+    [FIX] Tolerant of phone-format differences (+, spaces, dashes, a leading 0)
+    on BOTH sides, so "I'm connected but the bot says I'm not" can never be
+    caused by a mere formatting mismatch between what WhatsApp sends and the
+    key you typed. Also guards against an empty/blank stored calendar_id.
+    None means 'no calendar connected'.
+    """
+    norm = _normalize_phone(str(user_id))
     try:
         with _connect() as conn:
             row = conn.execute(
-                'SELECT calendar_id FROM user_calendars WHERE user_id = ?', (user_id,)
+                'SELECT calendar_id FROM user_calendars WHERE user_id IN (?, ?)',
+                (str(user_id), norm)
             ).fetchone()
-        if row:
+        if row and row[0]:
             return row[0]
     except Exception:
         logger.exception('get_user_calendar lookup failed for %s', user_id)
-    return USER_CALENDARS.get(str(user_id))
+    # env bootstrap — exact key first, then a phone-normalised match.
+    if str(user_id) in USER_CALENDARS:
+        return USER_CALENDARS[str(user_id)]
+    for k, v in USER_CALENDARS.items():
+        if _normalize_phone(str(k)) == norm:
+            return v
+    return None
 
 
 def set_user_calendar(user_id: str, calendar_id: str) -> None:
@@ -1130,6 +1145,15 @@ def _admin_check_calendar(target_phone: str) -> str:
     try:
         service.events().list(calendarId=cal, maxResults=1).execute()
         lines.append('✅ קריאה מהיומן — עובדת')
+        # Echo WHICH calendar this really is. A top cause of "events don't show
+        # up" is a mapped address that points at a DIFFERENT calendar (or a
+        # different timezone) than the one the user is actually looking at.
+        try:
+            meta = service.calendars().get(calendarId=cal).execute()
+            lines.append(f'📛 שם היומן: {meta.get("summary", "?")}')
+            lines.append(f'🕐 אזור זמן: {meta.get("timeZone", "?")}')
+        except Exception:
+            logger.warning('calendars().get failed for %s', cal)
     except HttpError as e:
         status = _http_status(e)
         if status == 404:
@@ -1144,20 +1168,26 @@ def _admin_check_calendar(target_phone: str) -> str:
         lines.append(f'❌ קריאה נכשלה: {e}')
         return '\n'.join(lines)
 
-    # 2) Write test — insert a tiny test event and delete it immediately.
+    # 2) Write test — leave a REAL, visible event so the admin can confirm
+    # with their OWN EYES where it lands. If the link opens but the event is
+    # NOT in your calendar grid, the mapped address isn't the calendar you
+    # view (wrong id) — that's the silent "it says success but nothing shows".
     try:
         start = now_local() + timedelta(minutes=2)
-        end   = start + timedelta(minutes=5)
+        end   = start + timedelta(minutes=12)
         ev = service.events().insert(calendarId=cal, body={
-            'summary': 'בדיקת חיבור סחבק ✅ (יימחק אוטומטית)',
+            'summary': 'בדיקת חיבור סחבק ✅ (אפשר למחוק)',
             'start': {'dateTime': start.isoformat(), 'timeZone': TIMEZONE_NAME},
             'end':   {'dateTime': end.isoformat(),   'timeZone': TIMEZONE_NAME},
         }).execute()
-        try:
-            service.events().delete(calendarId=cal, eventId=ev['id']).execute()
-        except Exception:
-            logger.warning('Could not delete test event %s on %s', ev.get('id'), cal)
-        lines.append('✅ כתיבה ליומן — עובדת. הכל תקין! 🎉')
+        link = ev.get('htmlLink', '')
+        lines.append('✅ כתיבה ליומן — עובדת!')
+        lines.append(f'📅 קבעתי אירוע בדיקה ל-{start.strftime("%H:%M")} (12 דק׳) — '
+                     'פתח עכשיו את היומן שלך ובדוק שהוא מופיע שם.')
+        lines.append('אם הוא *לא* מופיע אצלך אבל הקישור כן נפתח — סימן שהבוט כותב '
+                     'ליומן אחר מזה שאתה צופה בו (כתובת ממופה שגויה).')
+        if link:
+            lines.append(f'🔗 {link}')
     except HttpError as e:
         status = _http_status(e)
         if status == 403:
@@ -1198,6 +1228,12 @@ def _admin_system_diag() -> str:
         f'Webhook signature: {"✅" if APP_SECRET else "כבוי"}',
         'בדיקת יומן חיה: "בדוק יומן <מספר>"',
     ]
+    # [FIX] Loudly flag a USER_CALENDARS env that is SET but did not parse —
+    # a silent {} (smart quotes / hidden char) makes every non-admin user look
+    # "not connected" while the admin still works via CALENDAR_ID.
+    if os.getenv('USER_CALENDARS') and not USER_CALENDARS:
+        lines.append('⚠️ USER_CALENDARS מוגדר אבל לא נקרא (JSON שבור — אולי '
+                     'מרכאות חכמות). הזן מחדש עם מרכאות ישרות " בלבד.')
     return '\n'.join(lines)
 
 
@@ -2117,6 +2153,10 @@ _UNLINK_CAL_RE = re.compile(r'^נתק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
 #   "בדוק יומן 972501234567"
 _CHECK_CAL_RE  = re.compile(r'^בדוק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
 
+# Admin-only: generate a participant's personal dashboard link:
+#   "קישור 972501234567"
+_LINK_DASH_RE  = re.compile(r'^(?:קישור|לינק|דשבורד)\s+(\+?[\d\s\-()]{6,})\s*$')
+
 # [MULTI] Admin-only household sharing (no redeploy):
 #   "שתף 972502222222 עם 972501111111"   /   "בטל שיתוף 972502222222"
 _LINK_ALIAS_RE   = re.compile(r'^שתף\s+(\+?[\d\s\-()]{6,})\s+עם\s+(\+?[\d\s\-()]{6,})\s*$')
@@ -2179,6 +2219,15 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         member = _normalize_phone(m.group(1))
         delete_user_alias(member)
         return f'🔌 ביטלתי את השיתוף של {member}. מעכשיו הנתונים שלו נפרדים.'
+
+    # Generate someone else's personal dashboard link (to send them).
+    m = _LINK_DASH_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        if not target:
+            return 'מספר לא תקין. נסה: קישור 972501234567'
+        return (f'🔗 לוח בקרה אישי עבור {target}:\n' + _dash_link(target) +
+                '\nשלח לו את הקישור — הוא יראה רק את הנתונים שלו.')
 
     return None
 
@@ -2308,6 +2357,24 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
 
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
+
+    # ── Self-ID diagnostic (available to ANY user) ──
+    # The #1 tool for "I'm connected but the bot says I'm not": shows EXACTLY
+    # the phone number the bot sees + the calendar mapped to it. If the number
+    # here differs from your USER_CALENDARS key, THAT is the bug.
+    if text.lower() in ('מי אני', 'מי אני?', 'whoami', 'איזה מספר אני', 'המספר שלי'):
+        real = admin_phone or user_id
+        cal  = calendar_id_for(user_id)
+        note = f'\nחשבון משותף: {user_id}' if user_id != real else ''
+        return ('🆔 כך אני רואה אותך:\n'
+                f'המספר שלך: {real}{note}\n'
+                f'יומן ממופה: {cal or "אין ❌ — המספר לא תואם למיפוי ב-USER_CALENDARS"}')
+
+    # ── Personal dashboard link (any user) ──
+    # Each user gets their OWN link with a scoped token — shows only their data.
+    if text.lower() in ('קישור', 'לינק', 'דשבורד', 'האתר שלי', 'link', 'dashboard'):
+        return ('🔗 לוח הבקרה האישי שלך:\n' + _dash_link(user_id) +
+                '\n\nשמור את הקישור — הוא אישי ומציג רק את הנתונים שלך.')
 
     # ── [MULTI] Admin commands (calendar linking, diagnostics, sharing) ──
     # Admin status is checked against the REAL phone, not a shared account id.
@@ -2699,21 +2766,74 @@ def _log_startup_config() -> None:
 # ═══════════════════════════════════════════════════════════════════════
 DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
 
+# Public base URL of THIS service — used to build shareable per-user dashboard
+# links. Railway injects RAILWAY_PUBLIC_DOMAIN automatically; PUBLIC_URL lets
+# you override (custom domain). Empty → a relative path is returned instead.
+PUBLIC_BASE_URL = (os.getenv('PUBLIC_URL')
+                   or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}"
+                       if os.getenv('RAILWAY_PUBLIC_DOMAIN') else '')).rstrip('/')
 
-def _require_dashboard_key():
-    """מחזיר None אם המפתח תקין, response שגיאה אחרת."""
-    if not DASHBOARD_API_KEY:
-        return jsonify({'error': 'DASHBOARD_API_KEY not configured on server'}), 503
-    key = request.headers.get('X-Dashboard-Key', '')
-    if not hmac.compare_digest(key, DASHBOARD_API_KEY):
-        return jsonify({'error': 'unauthorized'}), 401
-    return None
+# The dashboard HTML lives next to this file in the repo and is served by Flask
+# (same origin as the API → zero CORS and a real, shareable URL).
+DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'dashboard.html')
 
 
 def _get_user_id():
     """user_id מה-query string או מה-JSON body."""
     return (request.args.get('user_id') or
             (request.get_json(silent=True) or {}).get('user_id', ''))
+
+
+def _dash_token(user_id) -> str:
+    """A per-user token (HMAC of the user_id with the master secret). It grants
+    access to EXACTLY one user_id, so every participant's link shows only their
+    own data and the master DASHBOARD_API_KEY never leaves the server."""
+    secret = (DASHBOARD_API_KEY or APP_SECRET or VERIFY_TOKEN or 'sahbak')
+    return hmac.new(secret.encode('utf-8'), str(user_id).encode('utf-8'),
+                    hashlib.sha256).hexdigest()[:20]
+
+
+def _dash_link(user_id) -> str:
+    """Shareable personal dashboard URL for a user (with their scoped token)."""
+    path = f'/dashboard?user_id={user_id}&token={_dash_token(user_id)}'
+    return (PUBLIC_BASE_URL + path) if PUBLIC_BASE_URL else path
+
+
+def _require_dashboard_key():
+    """Authorise a dashboard API call. Accepts EITHER the master
+    DASHBOARD_API_KEY header (full access — you/admin) OR a per-user token
+    scoped to exactly the user_id in this request (participants see only their
+    own data). Returns None if OK, else a Flask error response."""
+    if not DASHBOARD_API_KEY:
+        return jsonify({'error': 'DASHBOARD_API_KEY not configured on server'}), 503
+    key = request.headers.get('X-Dashboard-Key', '')
+    if key and hmac.compare_digest(key, DASHBOARD_API_KEY):
+        return None
+    user_id = str(_get_user_id() or '')
+    token   = (request.args.get('token') or request.headers.get('X-Dash-Token', ''))
+    if user_id and token and hmac.compare_digest(token, _dash_token(user_id)):
+        return None
+    return jsonify({'error': 'unauthorized'}), 401
+
+
+@app.route('/dashboard', methods=['GET'])
+def dashboard_page():
+    """Serve the dashboard HTML from THIS service (same origin as the API → no
+    CORS, no stale-URL problems). Per-user link: ?user_id=<phone>&token=<token>
+    — generate it with the bot command "קישור". The master key is never put in
+    the page; only the scoped token is injected."""
+    user_id = (request.args.get('user_id') or request.args.get('u') or '').strip()
+    token   = (request.args.get('token')   or request.args.get('t') or '').strip()
+    try:
+        with open(DASHBOARD_HTML_PATH, encoding='utf-8') as f:
+            html = f.read()
+    except FileNotFoundError:
+        return ('dashboard.html חסר בפריסה — יש להעלות אותו לריפו ליד main.py.'), 404
+    cfg = {'url': '', 'key': '', 'userId': user_id, 'token': token}
+    inject = '<script>window.__SAHBAK_CFG__=' + json.dumps(cfg) + ';</script>'
+    html = html.replace('</head>', inject + '\n</head>', 1)
+    return Response(html, mimetype='text/html; charset=utf-8')
 
 
 # ─── GET /api/dashboard?user_id=<PHONE> ─────────────────────────────────────
