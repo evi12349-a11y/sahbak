@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r8'
+BUILD_VERSION = '2026-06-15-r10'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -691,10 +691,26 @@ def delete_user_context(user_id: str) -> None:
 
 # ── Conversation memory (multi-turn understanding) ──
 
+def _looks_degenerate(s: str) -> bool:
+    """Detect LLM repetition-loop garbage (e.g. '291a291a291a…' ×1000): a long
+    string built almost entirely from one short repeated unit. Used to keep such
+    output from reaching the user OR being stored in conversation memory — where
+    it would be replayed to the model and perpetuate itself."""
+    if not s:
+        return False
+    t = re.sub(r'\s+', '', s)
+    if len(t) < 200:
+        return False
+    grams = {t[i:i + 6] for i in range(len(t) - 6)}
+    return len(grams) / len(t) < 0.05   # <5% unique 6-grams ⇒ repetition loop
+
+
 def append_conversation(user_id: str, role: str, content: str) -> None:
     """Store one turn (role='user' or 'model') so follow-ups have context."""
     if not user_id or not content:
         return
+    if _looks_degenerate(content):   # never store repetition-loop garbage —
+        return                       # replaying it would perpetuate the loop
     try:
         with _connect() as conn:
             conn.execute(
@@ -1574,8 +1590,9 @@ def _router_config(model: str):
         model,
         system_instruction=_system_instruction(),
         tools=_get_tools(),
-        temperature=0.0,  # deterministic routing
-    )
+        temperature=0.0,        # deterministic routing
+        max_output_tokens=1024, # hard cap — a runaway repetition loop can't fill
+    )                           # the bubble; router output is a tool call / short text
 
 
 def _generate_with_fallback(build_call, *, what: str,
@@ -2021,6 +2038,57 @@ def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: st
         return 'לא הצלחתי לעבד את התמונה. שלח הודעת טקסט ואעזור לך 😊'
 
 
+def process_image_message(image_data: bytes | None, mime_type: str,
+                          caption: str, user_id: str) -> str:
+    """[NEW] Smart image handling: run the IMAGE itself through the tool-calling
+    router (same tools + current-date system prompt as text), so a photo of an
+    event/receipt is ACTED ON directly (create_calendar_event / add_expense),
+    not merely described. The result is also stored in conversation memory, so a
+    text follow-up like 'תוסיף את זה ליומן' has the context it was missing."""
+    client = get_genai_client()
+    if not client or not image_data:
+        return describe_image_with_ai(image_data, mime_type, caption)
+    cap = (caption or '').strip()
+    instr = (
+        'זו תמונה שהמשתמש שלח בוואטסאפ. '
+        + (f'הערת המשתמש: "{cap}". ' if cap else '')
+        + 'אם יש בתמונה אירוע (הזמנה, פוסטר, תור או פגישה) עם תאריך ושעה — '
+          'קרא ל-create_calendar_event עם הכותרת, התאריך והשעה מהתמונה. '
+          'אם יש בתמונה קבלה/חשבונית עם סכום — קרא ל-add_expense. '
+          'אחרת, תאר את התמונה בקצרה וברור בעברית.'
+    )
+    try:
+        response = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(
+                model=mdl,
+                contents=[instr, types.Part.from_bytes(
+                    data=image_data, mime_type=mime_type or 'image/jpeg')],
+                config=_router_config(mdl)),
+            what='Gemini (image router)', max_attempts=3, base_delay=0.8, max_total=12.0,
+        )
+    except Exception:
+        logger.exception('Image router failed — falling back to plain description')
+        return describe_image_with_ai(image_data, mime_type, caption)
+
+    calls, text = _extract_calls_and_text(response)
+    if calls:
+        results: list[str] = []
+        seen: set[str] = set()
+        for name, args in calls:
+            r = execute_tool(name, args, user_id)
+            if r and r not in seen:
+                seen.add(r)
+                results.append(r)
+        reply = '\n\n'.join(results) or 'בוצע ✅'
+    else:
+        reply = f'📷 {text}' if text else 'לא הצלחתי לנתח את התמונה.'
+
+    # Remember it, so a follow-up like "תוסיף את האירוע הזה ליומן" has context.
+    append_conversation(user_id, 'user', (f'[המשתמש שלח תמונה] {cap}').strip())
+    append_conversation(user_id, 'model', reply)
+    return reply
+
+
 def transcribe_audio_with_ai(audio_data: bytes | None, mime_type: str) -> str | None:
     client = get_genai_client()
     if not client or not audio_data:
@@ -2429,6 +2497,12 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     # The #1 tool for "I'm connected but the bot says I'm not": shows EXACTLY
     # the phone number the bot sees + the calendar mapped to it. If the number
     # here differs from your USER_CALENDARS key, THAT is the bug.
+    # Clear this account's conversation memory — the instant cure for a stuck
+    # repetition-loop that keeps replaying garbage from history.
+    if text.lower() in ('נקה שיחה', 'אפס שיחה', 'איפוס שיחה', 'שכח', 'reset', 'clear'):
+        clear_conversation(user_id)
+        return '🧹 ניקיתי את זיכרון השיחה. אפשר להתחיל מחדש.'
+
     if text.lower() in ('מי אני', 'מי אני?', 'whoami', 'איזה מספר אני', 'המספר שלי'):
         real = admin_phone or user_id
         cal  = calendar_id_for(user_id)
@@ -2475,11 +2549,11 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         seen: set[str] = set()
         for name, args in tool_calls:
             r = execute_tool(name, args, user_id)
-            if r and r not in seen:
+            if r and r not in seen and not _looks_degenerate(r):
                 seen.add(r)
                 results.append(r)
         reply = '\n\n'.join(results) or 'בוצע ✅'
-    elif reply_text:
+    elif reply_text and not _looks_degenerate(reply_text):
         reply = reply_text
     else:
         reply = 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
@@ -2505,7 +2579,7 @@ def process_media_message(message: dict, user_id: str) -> str:
         return 'הקובץ גדול מדי לעיבוד (מעל ~18MB). שלח גרסה קטנה יותר או את הטקסט ישירות.'
 
     if msg_type == 'image':
-        return describe_image_with_ai(media_data, mime_type, caption)
+        return process_image_message(media_data, mime_type, caption, user_id)
 
     if msg_type == 'audio':
         transcript = transcribe_audio_with_ai(media_data, mime_type)
