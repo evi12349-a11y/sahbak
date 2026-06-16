@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r10'
+BUILD_VERSION = '2026-06-15-r11'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1546,19 +1546,27 @@ def _get_tools():
     return _TOOLS
 
 
+def _gemini_version(model: str) -> tuple[int, int]:
+    """(major, minor) of a Gemini model name: 'gemini-2.5-flash' → (2, 5),
+    'gemini-1.5-pro' → (1, 5). (0, 0) if unrecognised."""
+    m = re.search(r'gemini-(\d+)(?:\.(\d+))?', (model or '').lower())
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (0, 0)
+
+
 def _is_gemini_3_plus(model: str) -> bool:
-    """True for Gemini 3.x / 4.x+ (which use thinking_level instead of
-    thinking_budget). False for 2.5 and earlier."""
-    m = re.search(r'gemini-(\d+)', (model or '').lower())
-    return bool(m) and int(m.group(1)) >= 3
+    """True for Gemini 3.x / 4.x+ (which use thinking_level)."""
+    return _gemini_version(model)[0] >= 3
 
 
 def _minimal_thinking_config(model: str):
-    """A 'think as little as possible' setting that works across model
-    generations and SDK versions. Gemini 3.x uses thinking_level; Gemini 2.5
-    uses thinking_budget. Returns None if neither is supported (then thinking
-    just stays at the model default — the response parser handles that fine)."""
-    if _is_gemini_3_plus(model):
+    """A 'think as little as possible' setting that adapts per model generation:
+    Gemini 3.x → thinking_level; Gemini 2.5 → thinking_budget=0; Gemini 2.0 / 1.5
+    and older → NO thinking config (they don't support it, and sending one can
+    make the API reject the call). Returns None when nothing applies — a default-
+    thinking reply is handled fine by the parser.
+    [FIX] This is what lets ANY fallback model (incl. gemini-1.5-pro) work."""
+    ver = _gemini_version(model)
+    if ver[0] >= 3:
         for level in ('minimal', 'low'):
             try:
                 return types.ThinkingConfig(thinking_level=level)
@@ -1568,10 +1576,12 @@ def _minimal_thinking_config(model: str):
             return types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
         except Exception:
             return None
-    try:
-        return types.ThinkingConfig(thinking_budget=0)
-    except Exception:
-        return None
+    if ver >= (2, 5):          # only 2.5+ (pre-3) supports thinking_budget
+        try:
+            return types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            return None
+    return None                # 2.0 / 1.5 / unknown — send no thinking config
 
 
 def _build_generate_config(model: str, **kwargs):
