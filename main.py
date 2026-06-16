@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r7'
+BUILD_VERSION = '2026-06-15-r8'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1216,6 +1216,39 @@ def _admin_check_calendar(target_phone: str) -> str:
     return '\n'.join(lines)
 
 
+def _admin_check_ai() -> str:
+    """[diag] Live Gemini test — reveals the REAL cause behind the generic
+    'עומס זמני' message (wrong API key vs quota vs genuine overload), per model.
+    Run by an admin: בדוק AI"""
+    client = get_genai_client()
+    if not client:
+        return '❌ GEMINI_API_KEY לא מוגדר בכלל ב-Railway.'
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+    lines = ['🤖 בדיקת AI חיה:']
+    for mdl in models:
+        try:
+            resp = client.models.generate_content(
+                model=mdl, contents='ענה במילה אחת בלבד: אישור')
+            _, txt = _extract_calls_and_text(resp)
+            lines.append(f'✅ {mdl} — עובד ({(txt or "").strip()[:25] or "ok"})')
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            low = msg.lower()
+            hint = ''
+            if any(k in low for k in ('api_key', 'api key', 'api-key', 'permission',
+                                      'unauthorized', '401', '403', 'invalid', 'not valid')):
+                hint = '\n   ← מפתח GEMINI_API_KEY שגוי/לא מורשה (הכי סביר אחרי החלפה)'
+            elif any(k in low for k in ('429', 'quota', 'resource_exhausted',
+                                        'exhausted', 'rate limit')):
+                hint = '\n   ← חריגת מכסה (quota) — המפתח חינמי/מוגבל; הפעל חיוב בפרויקט'
+            elif any(k in low for k in ('503', 'overload', 'unavailable', 'high demand')):
+                hint = '\n   ← המודל עמוס באמת (503) — הפולבק אמור לעזור'
+            lines.append(f'❌ {mdl} — {type(e).__name__}: {msg[:130]}{hint}')
+    return '\n'.join(lines)
+
+
 def _admin_system_diag() -> str:
     """[r6] One-shot system status for the admin: אבחון"""
     users = cals = aliases = '?'
@@ -2201,6 +2234,9 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
     # [r6] Full system diagnostic
     if t in ('אבחון', 'סטטוס מערכת', 'diag', 'debug'):
         return _admin_system_diag()
+
+    if t.lower() in ('בדוק ai', 'בדוק בינה', 'בדיקת ai', 'check ai', 'test ai'):
+        return _admin_check_ai()
 
     # [r6] Live read/write test of a user's mapped calendar
     m = _CHECK_CAL_RE.match(t)
