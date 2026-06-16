@@ -615,22 +615,38 @@ def calendar_id_for(user_id: str) -> str | None:
 
 # ── [MULTI] Household sharing (account aliases) ──
 
-def resolve_account(phone: str) -> str:
-    """Map a real phone number to its shared 'household' account id, if any.
-    Household members share budget/tasks/calendar/memory under one account id.
-    Non-members resolve to their own phone (full isolation)."""
-    if not phone:
-        return phone
+def _raw_alias(phone: str) -> str | None:
+    """One-hop alias lookup (DB first, then env). None if the phone has none."""
     try:
         with _connect() as conn:
             row = conn.execute(
                 'SELECT account_id FROM user_aliases WHERE user_id = ?', (phone,)
             ).fetchone()
-        if row:
+        if row and row[0]:
             return row[0]
     except Exception:
         logger.exception('resolve_account lookup failed for %s', phone)
-    return USER_ALIASES.get(str(phone), phone)
+    return USER_ALIASES.get(str(phone))
+
+
+def resolve_account(phone: str) -> str:
+    """Map a real phone number to its shared 'household' account id, if any.
+    Household members share budget/tasks/calendar/memory under one account id.
+    Non-members resolve to their own phone (full isolation).
+
+    [GUARD] If two phones are aliased to EACH OTHER (A→B and B→A — a common
+    mistake when running 'שתף' in both directions), naive resolution would SWAP
+    them instead of merging. We detect that 2-cycle and collapse BOTH to a
+    single stable anchor (the smaller id), so a circular alias still shares one
+    account rather than crossing the two over."""
+    if not phone:
+        return phone
+    acc = _raw_alias(phone)
+    if not acc or acc == phone:
+        return phone
+    if _raw_alias(acc) == phone:            # A→B and B→A → merge, don't swap
+        return min(str(phone), str(acc))
+    return acc
 
 
 def set_user_alias(user_id: str, account_id: str) -> None:
