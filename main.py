@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r13'
+BUILD_VERSION = '2026-06-15-r15'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -2102,83 +2102,158 @@ def describe_image_with_ai(image_data: bytes | None, mime_type: str, caption: st
         return 'לא הצלחתי לעבד את התמונה. שלח הודעת טקסט ואעזור לך 😊'
 
 
+def _extract_image_structured(image_data: bytes, mime_type: str, caption: str) -> dict:
+    """ONE multimodal call → structured JSON describing the image:
+      {"kind":"expenses"|"event"|"other",
+       "expenses":[{"amount":<₪>,"category":"<VALID_CATEGORIES>","description":"<short>"}],
+       "event":{"title","start_time":"YYYY-MM-DDTHH:MM:SS","duration_minutes","location"},
+       "text":"<short Hebrew description>"}
+    Parsed defensively (strips ``` fences / surrounding prose). {} on failure."""
+    client = get_genai_client()
+    prompt = (
+        'נתח את התמונה והחזר *אך ורק* JSON תקין (בלי טקסט נוסף) במבנה:\n'
+        '{"kind":"expenses"|"event"|"other",'
+        '"expenses":[{"amount":<מספר בשקלים>,"category":"<קטגוריה>","description":"<קצר>"}],'
+        '"event":{"title":"","start_time":"YYYY-MM-DDTHH:MM:SS","duration_minutes":60,"location":""},'
+        '"text":"<תיאור קצר בעברית>"}\n'
+        f'קטגוריות מותרות בלבד: {", ".join(VALID_CATEGORIES)}.\n'
+        'אם זו קבלה או דף עסקאות (בנק/אשראי) — kind="expenses", וחלץ את *כל* '
+        'השורות: כל עסקה בנפרד עם הסכום בשקלים (מספר חיובי), קטגוריה מתאימה לפי '
+        'שם בית העסק, ותיאור קצר (שם העסק). אל תכלול שורות סיכום/יתרה/כותרת.\n'
+        'אם זו הזמנה/אירוע עם תאריך ושעה — kind="event".\n'
+        'אחרת — kind="other" עם text קצר.\n'
+        f'התאריך הנוכחי: {now_local().strftime("%Y-%m-%d")}.'
+        + (f'\nהערת המשתמש: "{caption}".' if caption else '')
+    )
+    response = _generate_with_fallback(
+        lambda mdl: client.models.generate_content(
+            model=mdl,
+            contents=[prompt, types.Part.from_bytes(
+                data=image_data, mime_type=mime_type or 'image/jpeg')],
+            config=_build_generate_config(mdl, temperature=0.0, max_output_tokens=2048)),
+        what='Gemini (image extract)', max_attempts=3, base_delay=0.8, max_total=14.0,
+    )
+    _, txt = _extract_calls_and_text(response)
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', (txt or '').strip(),
+                 flags=re.IGNORECASE).strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        try:
+            data = json.loads(m.group(0)) if m else {}
+        except Exception:
+            logger.warning('image extract: non-JSON reply %r', raw[:200])
+            data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _valid_expense_items(raw_items) -> list[dict]:
+    """Keep only well-formed expense rows from the model's JSON."""
+    items: list[dict] = []
+    for e in (raw_items or []):
+        if not isinstance(e, dict):
+            continue
+        try:
+            amt = abs(float(e.get('amount', 0)))
+        except (TypeError, ValueError):
+            continue
+        cat  = (e.get('category') or '').strip()
+        desc = (e.get('description') or '').strip() or cat
+        if amt > 0 and cat in BUDGET_CATEGORIES_HE:
+            items.append({'amount': amt, 'category': cat, 'description': desc})
+    return items
+
+
+def _confirm_expenses_message(items: list[dict]) -> str:
+    """The confirmation prompt for 1+ image-extracted transactions."""
+    total = sum(i['amount'] for i in items)
+    lines = []
+    for i in items[:25]:
+        emoji = BUDGET_CATEGORIES_HE.get(i['category'], '💵')
+        d = i['description']
+        extra = f' — {d}' if d and d != i['category'] else ''
+        lines.append(f'{emoji} {i["category"]}: {i["amount"]:,.0f} ש"ח{extra}')
+    if len(items) > 25:
+        lines.append(f'…ועוד {len(items) - 25}')
+    if len(items) == 1:
+        head, foot = '📷 זיהיתי הוצאה מהתמונה:', '\n\nלרשום? *כן* / *לא*.'
+    else:
+        head = f'📷 זיהיתי {len(items)} תנועות מהתמונה (סה"כ {total:,.0f} ש"ח):'
+        foot = '\n\nלרשום את כולן? *כן* / *לא*.'
+    return f'{head}\n' + '\n'.join(lines) + foot
+
+
+def _record_confirmed_expenses(items: list[dict], user_id: str) -> str:
+    """Write a confirmed batch of image-extracted transactions to the budget."""
+    n, total = 0, 0.0
+    for it in (items or []):
+        try:
+            cat = it['category']
+            amt = abs(float(it['amount']))
+            if amt <= 0 or cat not in BUDGET_CATEGORIES_HE:
+                continue
+            signed = amt if cat in POSITIVE_CATEGORIES else -amt
+            add_expense(cat, signed, now_local().isoformat(),
+                        it.get('description', '') or cat, user_id)
+            n += 1
+            total += amt
+        except Exception:
+            logger.exception('batch expense add failed for %r', it)
+    if not n:
+        return 'לא הצלחתי לרשום את התנועות 🤔 נסה שוב.'
+    word = 'תנועה' if n == 1 else 'תנועות'
+    return f'✅ נרשמו {n} {word} (סה"כ {total:,.0f} ש"ח).\nשלח "מאזן" לסיכום.'
+
+
 def process_image_message(image_data: bytes | None, mime_type: str,
                           caption: str, user_id: str) -> str:
-    """[NEW] Smart image handling: run the IMAGE itself through the tool-calling
-    router (same tools + current-date system prompt as text), so a photo of an
-    event/receipt is ACTED ON directly (create_calendar_event / add_expense),
-    not merely described. The result is also stored in conversation memory, so a
-    text follow-up like 'תוסיף את זה ליומן' has the context it was missing."""
+    """[r14] Smart image handling via ONE structured multimodal call:
+      • receipt OR full bank/credit statement → extract EVERY transaction →
+        CONFIRM, then add them all (each to its category).
+      • event/invitation → create the calendar event.
+      • anything else → a short description.
+    Money is NEVER auto-written from an image — it always waits for the user's
+    'כן' (the confirm_expenses context in process_message). Safe by construction."""
     client = get_genai_client()
+    cap = (caption or '').strip()
     if not client or not image_data:
         return describe_image_with_ai(image_data, mime_type, caption)
-    cap = (caption or '').strip()
-    instr = (
-        'זו תמונה שהמשתמש שלח בוואטסאפ. '
-        + (f'הערת המשתמש: "{cap}". ' if cap else '')
-        + 'אם יש בתמונה אירוע (הזמנה, פוסטר, תור או פגישה) עם תאריך ושעה — '
-          'קרא ל-create_calendar_event עם הכותרת, התאריך והשעה מהתמונה. '
-          'אם יש בתמונה קבלה/חשבונית — קרא ל-add_expense עם הסכום ה*סופי* '
-          '(סך הכל לתשלום — לא פריט בודד ולא ביניים), שייך לקטגוריה המתאימה '
-          'לפי שם העסק או הפריטים, ותן תיאור קצר (שם העסק). הסכום בשקלים. '
-          'אחרת, תאר את התמונה בקצרה וברור בעברית.'
-    )
     try:
-        response = _generate_with_fallback(
-            lambda mdl: client.models.generate_content(
-                model=mdl,
-                contents=[instr, types.Part.from_bytes(
-                    data=image_data, mime_type=mime_type or 'image/jpeg')],
-                config=_router_config(mdl)),
-            what='Gemini (image router)', max_attempts=3, base_delay=0.8, max_total=12.0,
-        )
+        data = _extract_image_structured(image_data, mime_type, cap)
     except Exception:
-        logger.exception('Image router failed — falling back to plain description')
+        logger.exception('Image extract failed — falling back to description')
         return describe_image_with_ai(image_data, mime_type, caption)
 
-    calls, text = _extract_calls_and_text(response)
+    kind = (data.get('kind') or '').strip().lower()
 
-    # [NEW] Expense from a receipt photo → CONFIRM before recording. Vision can
-    # misread a total or category, so money is NEVER auto-written from an image:
-    # we show what we understood and wait for the user's "כן" (handled by the
-    # confirm_expense context in process_message). Safe by construction.
-    for name, args in calls:
-        if name == 'add_expense':
+    # ── Expenses (one receipt, or a whole statement) → confirm before writing ──
+    if kind == 'expenses':
+        items = _valid_expense_items(data.get('expenses'))
+        if items:
+            set_user_context(user_id, {'type': 'confirm_expenses', 'items': items})
+            return _confirm_expenses_message(items)
+
+    # ── A single calendar event ──
+    if kind == 'event':
+        ev = data.get('event') or {}
+        start = ev.get('start_time') if isinstance(ev, dict) else None
+        if start and _parse_event_datetime(start):
             try:
-                amt = abs(float(args.get('amount', 0)))
+                dur = int(ev.get('duration_minutes') or 60)
             except (TypeError, ValueError):
-                amt = 0.0
-            cat  = (args.get('category') or '').strip()
-            desc = (args.get('description') or '').strip() or cat
-            if amt > 0 and cat in BUDGET_CATEGORIES_HE:
-                set_user_context(user_id, {'type': 'confirm_expense', 'amount': amt,
-                                           'category': cat, 'description': desc})
-                emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
-                extra = f' ({desc})' if desc and desc != cat else ''
-                label = ('הכנסה' if cat == 'הכנסה'
-                         else 'חיסכון' if cat == 'חיסכון' else 'הוצאה')
-                return (f'📷 זיהיתי {label} מהתמונה:\n'
-                        f'{emoji} *{cat}* — {amt:,.0f} ש"ח{extra}\n\n'
-                        'לרשום? כתוב *כן* לאישור, או *לא* לביטול.')
-            break  # an expense was meant but couldn't be parsed — describe instead
+                dur = 60
+            reply = process_calendar_ai((ev.get('title') or 'אירוע').strip(), start,
+                                        (ev.get('location') or '').strip() or None,
+                                        user_id, dur if dur > 0 else 60)
+            append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
+            append_conversation(user_id, 'model', reply)
+            return reply
 
-    if calls:
-        results: list[str] = []
-        seen: set[str] = set()
-        for name, args in calls:
-            if name == 'add_expense':
-                continue   # money from an image always goes through confirmation
-            r = execute_tool(name, args, user_id)
-            if r and r not in seen and not _looks_degenerate(r):
-                seen.add(r)
-                results.append(r)
-        reply = '\n\n'.join(results) if results else (
-            f'📷 {text}' if text else 'לא הצלחתי לנתח את התמונה.')
-    else:
-        reply = f'📷 {text}' if text else 'לא הצלחתי לנתח את התמונה.'
-
-    # Remember it, so a follow-up like "תוסיף את האירוע הזה ליומן" has context.
-    append_conversation(user_id, 'user', (f'[המשתמש שלח תמונה] {cap}').strip())
+    # ── Anything else → description ──
+    txt = (data.get('text') or '').strip()
+    reply = f'📷 {txt}' if txt else describe_image_with_ai(image_data, mime_type, caption)
+    append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
     append_conversation(user_id, 'model', reply)
     return reply
 
@@ -2573,10 +2648,11 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
-        if ctype == 'confirm_expense':
-            # Confirm an expense the bot extracted from a RECEIPT IMAGE. Strict
-            # on purpose: a reply that contains a DIGIT is treated as a possible
-            # correction (not a blind "yes"), so we never record a wrong amount.
+        if ctype in ('confirm_expense', 'confirm_expenses'):
+            # Confirm expense(s) the bot extracted from a RECEIPT or STATEMENT
+            # image. Strict on purpose: a reply containing a DIGIT is treated as
+            # a possible correction (not a blind "yes"), so we never record a
+            # wrong amount.
             clean = re.sub(r'[\s!.,?]+', '', text).lower()
             has_digit = any(c.isdigit() for c in text)
             yes = (not has_digit and (clean.startswith(('כן', 'אשר', 'אוקי'))
@@ -2584,6 +2660,8 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             no = clean.startswith('לא') or clean in ('בטל', 'ביטול', 'no', 'n', '❌')
             if yes:
                 delete_user_context(user_id)
+                if ctype == 'confirm_expenses':
+                    return _record_confirmed_expenses(context.get('items') or [], user_id)
                 return _tool_add_expense(
                     {'amount': context.get('amount'), 'category': context.get('category'),
                      'description': context.get('description', '')}, user_id)
@@ -2884,7 +2962,10 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
                 send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
             response = process_media_message(message, account_id)
         else:
-            response = 'סוג הודעה זה אינו נתמך עדיין. שלח טקסט, תמונה, הקלטה או קובץ.'
+            logger.warning('Unsupported message type "%s" from %s', msg_type, from_number)
+            response = (f'קיבלתי הודעה מסוג שאני עדיין לא יודע לקרוא ({msg_type or "לא ידוע"}).\n'
+                        'אם זו קבלה/הוצאה — צלם *צילום מסך* רגיל ושלח אותו כ*תמונה* '
+                        '(לא דרך "העבר"/שיתוף מהאפליקציה) — ואז אקרא ואוסיף אותה.')
         send_whatsapp_message(from_number, response)
     except Exception:
         logger.exception('Failed to handle message from %s', from_number)
