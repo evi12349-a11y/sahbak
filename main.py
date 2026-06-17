@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r11'
+BUILD_VERSION = '2026-06-15-r13'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -254,9 +254,19 @@ def _normalize_phone(raw: str) -> str:
 BUDGET_CATEGORIES_HE = {
     'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️',
     'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚',
-    'בילויים': '🎉', 'קניות': '🛒', 'הכנסה': '💰',
+    'בילויים': '🎉', 'קניות': '🛒', 'חיסכון': '🐷', 'הכנסה': '💰',
 }
 VALID_CATEGORIES = list(BUDGET_CATEGORIES_HE.keys())
+# 'חיסכון' (savings) and 'הכנסה' (income) are stored as POSITIVE amounts that
+# accumulate; every other category is a spend (stored negative).
+POSITIVE_CATEGORIES = {'הכנסה', 'חיסכון'}
+
+# Optional event colours — Hebrew name → Google Calendar colorId (1-11).
+CALENDAR_COLORS_HE = {
+    'אדום': '11', 'כתום': '6', 'צהוב': '5', 'ירוק': '10',
+    'טורקיז': '7', 'תכלת': '7', 'כחול': '9', 'סגול': '3',
+    'ורוד': '4', 'אפור': '8', 'לבנדר': '1', 'ירקרק': '2',
+}
 
 # Sensible defaults used as a FALLBACK whenever a user hasn't set their own
 # limit. They are no longer written to the DB — each user simply inherits
@@ -264,7 +274,7 @@ VALID_CATEGORIES = list(BUDGET_CATEGORIES_HE.keys())
 DEFAULT_BUDGET_LIMITS = {
     'דיור': 5000, 'רכב': 2000, 'נופש': 1500,
     'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500,
-    'בילויים': 800, 'קניות': 1000,
+    'בילויים': 800, 'קניות': 1000, 'חיסכון': 1000,  # חיסכון = יעד חודשי
 }
 
 TASK_QUADRANTS_EMOJI = {
@@ -815,6 +825,19 @@ def get_category_total_spent(category: str, user_id: str) -> float:
     return row[0] if row[0] else 0.0
 
 
+def get_category_total_saved(category: str, user_id: str) -> float:
+    """Sum of POSITIVE entries (savings/income) for a category this month."""
+    current_month = now_local().strftime('%Y-%m')
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT SUM(amount) FROM budget
+               WHERE category = ? AND amount > 0 AND user_id = ?
+                 AND strftime('%Y-%m', date) = ?""",
+            (category, user_id, current_month)
+        ).fetchone()
+    return row[0] if row[0] else 0.0
+
+
 def get_all_budget_summary(user_id: str) -> list[tuple]:
     current_month = now_local().strftime('%Y-%m')
     with _connect() as conn:
@@ -1056,7 +1079,8 @@ def _recurrence_summary_he(rrule: str) -> str:
 def process_calendar_ai(title: str, start_time_iso: str,
                         location: str | None, user_id: str,
                         duration_minutes: int = 60,
-                        recurrence: str | None = None) -> str:
+                        recurrence: str | None = None,
+                        color: str | None = None) -> str:
     # [MULTI] Resolve THIS user's own calendar. If they have none connected,
     # refuse — never silently write a friend's event onto the owner's calendar.
     cal_id = calendar_id_for(user_id)
@@ -1101,6 +1125,12 @@ def process_calendar_ai(title: str, start_time_iso: str,
     if rrule:
         event['recurrence'] = [rrule]
 
+    # [NEW] optional event colour (user-chosen; otherwise Google's default).
+    color_name = (color or '').strip()
+    color_id = CALENDAR_COLORS_HE.get(color_name)
+    if color_id:
+        event['colorId'] = color_id
+
     try:
         created = call_with_retry(
             lambda: service.events().insert(calendarId=cal_id, body=event).execute(),
@@ -1109,6 +1139,7 @@ def process_calendar_ai(title: str, start_time_iso: str,
         link    = created.get('htmlLink', 'לא זמין')
         weekday = HEB_WEEKDAYS[start_time.weekday()]
         recur_line = f'\n🔁 {_recurrence_summary_he(rrule)}' if rrule else ''
+        color_line = f'\n🎨 צבע: {color_name}' if color_id else ''
         return (
             f'האירוע נוצר בהצלחה! 📅\n'
             f'כותרת: {title}\n'
@@ -1116,6 +1147,7 @@ def process_calendar_ai(title: str, start_time_iso: str,
             f'{start_time.strftime("%H:%M")}–{end_time.strftime("%H:%M")}'
             f'{recur_line}'
             + (f'\nמיקום: {location}' if location else '') +
+            f'{color_line}'
             f'\nקישור: {link}'
             f'{past_note}'
         )
@@ -1446,6 +1478,14 @@ def _build_tools() -> list:
                         'type': 'string',
                         'description': 'מיקום האירוע, אם צוין. אחרת השמט.',
                     },
+                    'color': {
+                        'type': 'string',
+                        'enum': ['אדום', 'כתום', 'צהוב', 'ירוק', 'טורקיז', 'כחול',
+                                 'סגול', 'ורוד', 'אפור', 'לבנדר', 'ירקרק'],
+                        'description': ('צבע האירוע ביומן — רק אם המשתמש ביקש צבע '
+                                        'מסוים (למשל "בצבע אדום", "תעשה את זה ירוק"). '
+                                        'אחרת השמט לגמרי.'),
+                    },
                 },
                 'required': ['title', 'start_time'],
             },
@@ -1661,7 +1701,11 @@ def _system_instruction() -> str:
         'בקריאה אחת. "סיימתי הכל" → all=true.\n\n'
         'כסף:\n'
         '• ביטול/מחיקה/תיקון של רישום כספי — קרא ל-delete_expense '
-        '("בטל את ההוצאה האחרונה" → last=true).\n\n'
+        '("בטל את ההוצאה האחרונה" → last=true).\n'
+        '• חיסכון: "חסכתי 500" / "שמתי 500 בצד / בחיסכון" → add_expense עם '
+        'category="חיסכון" (הפרשה לחיסכון — לא הוצאה רגילה).\n\n'
+        'צבע אירוע: רק אם המשתמש ביקש צבע מסוים ("בצבע אדום", "תעשה את זה ירוק") '
+        '— העבר את הפרמטר color ב-create_calendar_event. אחרת אל תעביר אותו כלל.\n\n'
         'שיחה רב-תורית (חשוב מאוד!):\n'
         '• ההודעות הקודמות בשיחה ניתנות לך. אם בהודעה הנוכחית חסר פרט (כותרת, '
         'תאריך או שעה) אבל הוא כבר הופיע קודם בשיחה — קח אותו מההיסטוריה ובצע את '
@@ -1780,11 +1824,20 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
     if cat not in BUDGET_CATEGORIES_HE:
         return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(VALID_CATEGORIES)}'
 
-    signed_amt = amt if cat == 'הכנסה' else -amt
+    signed_amt = amt if cat in POSITIVE_CATEGORIES else -amt
     add_expense(cat, signed_amt, now_local().isoformat(), desc, user_id)
 
     alert = ''
-    if cat != 'הכנסה':
+    if cat == 'חיסכון':
+        goal  = get_budget_limit(cat, user_id)        # יעד החיסכון החודשי
+        saved = get_category_total_saved(cat, user_id)
+        if goal > 0:
+            rem = goal - saved
+            alert = (f'\nנחסכו {saved:,.0f}/{goal:,.0f} ש"ח החודש' +
+                     (f' (עוד {rem:,.0f} ליעד 🎯)' if rem > 0 else ' — היעד הושג! 🎉'))
+        else:
+            alert = f'\nסה"כ נחסך החודש: {saved:,.0f} ש"ח'
+    elif cat != 'הכנסה':
         limit = get_budget_limit(cat, user_id)   # [MULTI] per-user
         if limit > 0:
             spent = get_category_total_spent(cat, user_id)
@@ -1793,7 +1846,7 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
                 alert = f'\n⚠️ חרגת ב-{abs(rem):,.0f} ש"ח מהתקציב של {cat}!'
             else:
                 alert = f'\nנותרו {rem:,.0f} ש"ח בקטגוריה החודש'
-    label = 'הכנסה' if cat == 'הכנסה' else 'הוצאה'
+    label = {'הכנסה': 'הכנסה', 'חיסכון': 'חיסכון'}.get(cat, 'הוצאה')
     return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}* ({label}): {amt:,.0f} ש"ח{alert}'
 
 
@@ -1869,8 +1922,9 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     if duration <= 0:
         duration = 60
     recurrence = args.get('recurrence')   # [r6] recurring events
+    color = args.get('color')             # [NEW] optional event colour
     return process_calendar_ai(title, start_time_iso, location, user_id,
-                               duration, recurrence)
+                               duration, recurrence, color)
 
 
 def _collect_task_queries(args: dict) -> list[str]:
@@ -2064,7 +2118,9 @@ def process_image_message(image_data: bytes | None, mime_type: str,
         + (f'הערת המשתמש: "{cap}". ' if cap else '')
         + 'אם יש בתמונה אירוע (הזמנה, פוסטר, תור או פגישה) עם תאריך ושעה — '
           'קרא ל-create_calendar_event עם הכותרת, התאריך והשעה מהתמונה. '
-          'אם יש בתמונה קבלה/חשבונית עם סכום — קרא ל-add_expense. '
+          'אם יש בתמונה קבלה/חשבונית — קרא ל-add_expense עם הסכום ה*סופי* '
+          '(סך הכל לתשלום — לא פריט בודד ולא ביניים), שייך לקטגוריה המתאימה '
+          'לפי שם העסק או הפריטים, ותן תיאור קצר (שם העסק). הסכום בשקלים. '
           'אחרת, תאר את התמונה בקצרה וברור בעברית.'
     )
     try:
@@ -2081,15 +2137,43 @@ def process_image_message(image_data: bytes | None, mime_type: str,
         return describe_image_with_ai(image_data, mime_type, caption)
 
     calls, text = _extract_calls_and_text(response)
+
+    # [NEW] Expense from a receipt photo → CONFIRM before recording. Vision can
+    # misread a total or category, so money is NEVER auto-written from an image:
+    # we show what we understood and wait for the user's "כן" (handled by the
+    # confirm_expense context in process_message). Safe by construction.
+    for name, args in calls:
+        if name == 'add_expense':
+            try:
+                amt = abs(float(args.get('amount', 0)))
+            except (TypeError, ValueError):
+                amt = 0.0
+            cat  = (args.get('category') or '').strip()
+            desc = (args.get('description') or '').strip() or cat
+            if amt > 0 and cat in BUDGET_CATEGORIES_HE:
+                set_user_context(user_id, {'type': 'confirm_expense', 'amount': amt,
+                                           'category': cat, 'description': desc})
+                emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
+                extra = f' ({desc})' if desc and desc != cat else ''
+                label = ('הכנסה' if cat == 'הכנסה'
+                         else 'חיסכון' if cat == 'חיסכון' else 'הוצאה')
+                return (f'📷 זיהיתי {label} מהתמונה:\n'
+                        f'{emoji} *{cat}* — {amt:,.0f} ש"ח{extra}\n\n'
+                        'לרשום? כתוב *כן* לאישור, או *לא* לביטול.')
+            break  # an expense was meant but couldn't be parsed — describe instead
+
     if calls:
         results: list[str] = []
         seen: set[str] = set()
         for name, args in calls:
+            if name == 'add_expense':
+                continue   # money from an image always goes through confirmation
             r = execute_tool(name, args, user_id)
-            if r and r not in seen:
+            if r and r not in seen and not _looks_degenerate(r):
                 seen.add(r)
                 results.append(r)
-        reply = '\n\n'.join(results) or 'בוצע ✅'
+        reply = '\n\n'.join(results) if results else (
+            f'📷 {text}' if text else 'לא הצלחתי לנתח את התמונה.')
     else:
         reply = f'📷 {text}' if text else 'לא הצלחתי לנתח את התמונה.'
 
@@ -2489,6 +2573,24 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
+        if ctype == 'confirm_expense':
+            # Confirm an expense the bot extracted from a RECEIPT IMAGE. Strict
+            # on purpose: a reply that contains a DIGIT is treated as a possible
+            # correction (not a blind "yes"), so we never record a wrong amount.
+            clean = re.sub(r'[\s!.,?]+', '', text).lower()
+            has_digit = any(c.isdigit() for c in text)
+            yes = (not has_digit and (clean.startswith(('כן', 'אשר', 'אוקי'))
+                   or clean in ('בטח', 'סבבה', 'בסדר', 'yes', 'y', 'ok', 'okay', '👍', '✅', '✓')))
+            no = clean.startswith('לא') or clean in ('בטל', 'ביטול', 'no', 'n', '❌')
+            if yes:
+                delete_user_context(user_id)
+                return _tool_add_expense(
+                    {'amount': context.get('amount'), 'category': context.get('category'),
+                     'description': context.get('description', '')}, user_id)
+            if no:
+                delete_user_context(user_id)
+                return 'בוטל — לא רשמתי כלום 👍'
+            delete_user_context(user_id)   # unclear answer — drop & process normally
         if ctype in ('complete_task', 'delete_task', 'delete_expense'):
             # [r6.1] Only treat the reply as a numeric choice if it really is
             # one ("3", "1 4 7", "משימה 2", "הכל"). If the user changed topic
@@ -2637,13 +2739,25 @@ def get_detailed_budget(user_id: str) -> str:
         return 'אין רשומות לחודש הנוכחי.'
     month   = now_local().strftime('%m/%Y')
     report  = f'*סטטוס כלכלי — {month}*\n\n'
-    total_inc, total_exp = 0.0, 0.0
+    total_inc, total_exp, total_sav = 0.0, 0.0, 0.0
 
     for cat, total in summary:
         emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
         if cat == 'הכנסה':
             total_inc += total
             report += f'{emoji} *{cat}*: +{total:,.0f} ש"ח\n\n'
+        elif cat == 'חיסכון':
+            saved = max(total, 0.0)           # savings stored positive
+            total_sav += saved
+            goal = get_budget_limit(cat, user_id)
+            if goal > 0:
+                perc   = min((saved / goal) * 100, 100)
+                filled = min(int(perc / 10), 10)
+                bar    = '█' * filled + '░' * (10 - filled)
+                done   = ' 🎉' if saved >= goal else ''
+                report += f'{emoji} *{cat}*: {saved:,.0f}/{goal:,.0f} ש"ח 🎯{done}\n{bar} {int(perc)}%\n\n'
+            else:
+                report += f'{emoji} *{cat}*: {saved:,.0f} ש"ח\n\n'
         else:
             spent = abs(total)
             total_exp += spent
@@ -2661,6 +2775,8 @@ def get_detailed_budget(user_id: str) -> str:
     report += '━━━━━━━━━━━━━━━\n'
     report += f'💰 הכנסות: {total_inc:,.0f} ש"ח\n'
     report += f'💸 הוצאות: {total_exp:,.0f} ש"ח\n'
+    if total_sav > 0:
+        report += f'🐷 חיסכון: {total_sav:,.0f} ש"ח\n'
     report += '━━━━━━━━━━━━━━━\n'
     if bal >= 0:
         report += f'✅ *מאזן חיובי*: +{bal:,.0f} ש"ח'
