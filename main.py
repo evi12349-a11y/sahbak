@@ -3239,7 +3239,103 @@ def api_dashboard():
         'transactions':    transactions,
         'timestamp':       now_local().isoformat(),
     }), 200
+# ─── פונקציית רקע לעיבוד Apple Pay ───────────────────────────────────────────
+def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str) -> None:
+    """רץ ברקע (ThreadPool) כדי לא לתקוע את ה-Webhook של האייפון."""
+    try:
+        client = get_genai_client()
+        category = 'קניות'  # ברירת מחדל בטוחה
+        
+        if client and merchant:
+            # מניעת שיוך שגוי להכנסות או חסכונות
+            allowed_cats = [c for c in VALID_CATEGORIES if c not in POSITIVE_CATEGORIES]
+            prompt = (
+                f'לאיזו קטגוריה הכי מתאים לשייך הוצאה בבית העסק "{merchant}"? '
+                f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}. '
+                'החזר אך ורק את שם הקטגוריה.'
+            )
+            try:
+                resp = _generate_with_fallback(
+                    lambda mdl: client.models.generate_content(
+                        model=mdl,
+                        contents=prompt,
+                        config=_build_generate_config(mdl, temperature=0.0, max_output_tokens=15)
+                    ),
+                    what='Apple Pay Categorization', max_attempts=2, base_delay=0.5, max_total=5.0
+                )
+                _, txt = _extract_calls_and_text(resp)
+                raw_reply = (txt or '').strip()
+                
+                # חיפוש חסון (Robust): מוודא שהקטגוריה המורשית נמצאת בתשובה
+                matched_cat = next((c for c in allowed_cats if c in raw_reply), None)
+                if matched_cat:
+                    category = matched_cat
+                else:
+                    logger.info('Apple Pay AI fallback: could not map "%s" to a category. Raw reply: "%s"', merchant, raw_reply)
+            except Exception:
+                logger.exception('Apple Pay AI categorization failed for %s', merchant)
 
+        # רישום ההוצאה למסד הנתונים של החשבון (תומך בשיתוף משקי בית)
+        reply = _tool_add_expense({
+            'amount': amount,
+            'category': category,
+            'description': merchant
+        }, account_id)
+
+        # שליחת הודעת וואטסאפ אקטיבית לטלפון שביצע את הקנייה
+        msg = f"🍏 *Apple Pay (אוטומטי):*\n\n{reply}"
+        send_whatsapp_message(user_id_raw, msg)
+        
+    except Exception:
+        logger.exception('Critical error in background Apple Pay processing for %s', user_id_raw)
+
+
+# ─── POST /api/apple-pay ─────────────────────────────────────────────────────
+@app.route('/api/apple-pay', methods=['POST'])
+def api_apple_pay():
+    """
+    [MULTI] Apple Pay Shortcuts Webhook.
+    מקבל את הנתונים, מאמת אבטחה, מחזיר 200 OK מיידית לאייפון, 
+    ומשגר את העיבוד המורכב ל-ThreadPool קיים.
+    """
+    if not APP_SECRET:
+        return jsonify({'error': 'APP_SECRET not configured'}), 503
+
+    data = request.get_json(silent=True) or {}
+    
+    user_id_raw = str(data.get('user_id', '')).strip()
+    secret      = str(data.get('secret', '')).strip()
+    merchant    = str(data.get('merchant', '')).strip()
+
+    # 1. אימות אבטחה מחמיר כנגד מתקפות תזמון
+    if not user_id_raw or not secret or not hmac.compare_digest(APP_SECRET, secret):
+        logger.warning('Unauthorized Apple Pay webhook attempt for user %s', user_id_raw)
+        return jsonify({'error': 'unauthorized'}), 401
+
+    # 2. ניקוי מחרוזת הסכום (למשל "1,500.50" -> 1500.50)
+    raw_amount = str(data.get('amount', '0')).replace(',', '').strip()
+    try:
+        amount = float(raw_amount)
+    except ValueError:
+        return jsonify({'error': 'invalid amount format'}), 400
+
+    if amount <= 0:
+        return jsonify({'error': 'amount must be positive'}), 400
+
+    # 3. ניתוב לחשבון הראשי (במקרה של "שתף")
+    account_id = resolve_account(user_id_raw)
+
+    # 4. העברת העיבוד לשרשור רקע
+    _executor.submit(
+        _process_apple_pay_background,
+        user_id_raw,
+        account_id,
+        amount,
+        merchant
+    )
+
+    # 5. שחרור האייפון מיידית
+    return jsonify({'status': 'processing_in_background'}), 200
 
 # ─── POST /api/expense ───────────────────────────────────────────────────────
 @app.route('/api/expense', methods=['POST'])
