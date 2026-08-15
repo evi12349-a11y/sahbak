@@ -3298,8 +3298,8 @@ def api_apple_pay():
     מקבל את הנתונים, מאמת אבטחה, מחזיר 200 OK מיידית לאייפון, 
     ומשגר את העיבוד המורכב ל-ThreadPool קיים.
     """
-    if not APP_SECRET:
-        return jsonify({'error': 'APP_SECRET not configured'}), 503
+    if not VERIFY_TOKEN:
+        return jsonify({'error': 'VERIFY_TOKEN not configured'}), 503
 
     data = request.get_json(silent=True) or {}
     
@@ -3308,7 +3308,7 @@ def api_apple_pay():
     merchant    = str(data.get('merchant', '')).strip()
 
     # 1. אימות אבטחה מחמיר כנגד מתקפות תזמון
-    if not user_id_raw or not secret or not hmac.compare_digest(APP_SECRET, secret):
+    if not user_id_raw or not secret or not hmac.compare_digest(VERIFY_TOKEN, secret):
         logger.warning('Unauthorized Apple Pay webhook attempt for user %s', user_id_raw)
         return jsonify({'error': 'unauthorized'}), 401
 
