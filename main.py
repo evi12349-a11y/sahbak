@@ -3240,7 +3240,7 @@ def api_dashboard():
         'timestamp':       now_local().isoformat(),
     }), 200
 # ─── פונקציית רקע לעיבוד Apple Pay ───────────────────────────────────────────
-def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str) -> None:
+def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str, currency: str = 'ILS', original_amount: float | None = None) -> None:
     """רץ ברקע (ThreadPool) כדי לא לתקוע את ה-Webhook של האייפון."""
     try:
         client = get_genai_client()
@@ -3312,17 +3312,25 @@ def api_apple_pay():
         logger.warning('Unauthorized Apple Pay webhook attempt for user %s', user_id_raw)
         return jsonify({'error': 'unauthorized'}), 401
 
-    # 2. ניקוי מחרוזת הסכום (למשל "1,500.50" -> 1500.50)
-    raw_amount = str(data.get('amount', '0')).replace(',', '').strip()
+    # 2. ניקוי מחרוזת הסכום מכל סימן מטבע/פסיק/אות, זיהוי מטבע (USD/ILS) והמרה לשקלים
+    raw_amount_str = str(data.get('amount', '0')).strip()
+    is_usd = ('$' in raw_amount_str) or ('US' in raw_amount_str.upper())
+    clean_amount = re.sub(r'[^\d.]', '', raw_amount_str)
     try:
-        amount = float(raw_amount)
+        amount = float(clean_amount)
     except ValueError:
         return jsonify({'error': 'invalid amount format'}), 400
 
     if amount <= 0:
         return jsonify({'error': 'amount must be positive'}), 400
 
-    # 3. ניתוב לחשבון הראשי (במקרה של "שתף")
+    original_amount = amount
+    currency = 'USD' if is_usd else 'ILS'
+    if is_usd:
+        usd_rate = float(os.environ.get('USD_TO_ILS_RATE', '3.0'))
+        amount = round(amount * usd_rate, 2)
+
+    # 3. כתוב לחשבון הראשי (במקרה של "שתף")
     account_id = resolve_account(user_id_raw)
 
     # 4. העברת העיבוד לשרשור רקע
@@ -3331,7 +3339,9 @@ def api_apple_pay():
         user_id_raw,
         account_id,
         amount,
-        merchant
+        merchant,
+        currency,
+        original_amount
     )
 
     # 5. שחרור האייפון מיידית
