@@ -3275,18 +3275,22 @@ def api_dashboard():
     }), 200
 # ─── פונקציית רקע לעיבוד Apple Pay ───────────────────────────────────────────
 def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str, currency: str = 'ILS', original_amount: float | None = None) -> None:
-    """רץ ברקע (ThreadPool) כדי לא לתקוע את ה-Webhook של האייפון."""
     try:
         client = get_genai_client()
-        category = 'קניות'  # ברירת מחדל בטוחה
+        category = 'קניות'  
         
         if client and merchant:
-            # מניעת שיוך שגוי להכנסות או חסכונות
             allowed_cats = [c for c in VALID_CATEGORIES if c not in POSITIVE_CATEGORIES]
             prompt = (
-                f'לאיזו קטגוריה הכי מתאים לשייך הוצאה בבית העסק "{merchant}"? '
-                f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}. '
-                'החזר אך ורק את שם הקטגוריה.'
+                f'לאיזו קטגוריה הכי מתאים לשייך הוצאה בבית העסק "{merchant}"?\n'
+                f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}.\n\n'
+                'הנחיות סיווג מיוחדות למשק הישראלי:\n'
+                '- סופרמרקטים ומכולות (Superyuda, Shufersal, AM:PM) -> מזון\n'
+                '- תחבורה ודלק (M Thbora, Pango, רכבת, Gett) -> רכב\n'
+                '- מסעדות, בתי קפה ומשלוחים (Wolt, ארומה, McDonald) -> בילויים (או מזון)\n'
+                '- בתי מרקחת וקופ"ח (Super-Pharm, Be) -> בריאות\n'
+                '- ביגוד והנעלה (Zara, Fox) -> קניות\n\n'
+                'החזר אך ורק את שם הקטגוריה המדויק בעברית מתוך הרשימה, ללא שום מילה נוספת או הסבר.'
             )
             try:
                 resp = _generate_with_fallback(
@@ -3300,23 +3304,21 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
                 _, txt = _extract_calls_and_text(resp)
                 raw_reply = (txt or '').strip()
                 
-                # חיפוש חסון (Robust): מוודא שהקטגוריה המורשית נמצאת בתשובה
+                # מוודא שחולצה אך ורק קטגוריה קיימת
                 matched_cat = next((c for c in allowed_cats if c in raw_reply), None)
                 if matched_cat:
                     category = matched_cat
                 else:
-                    logger.info('Apple Pay AI fallback: could not map "%s" to a category. Raw reply: "%s"', merchant, raw_reply)
+                    logger.info('Apple Pay AI fallback: could not map "%s". Raw reply: "%s"', merchant, raw_reply)
             except Exception:
                 logger.exception('Apple Pay AI categorization failed for %s', merchant)
 
-        # רישום ההוצאה למסד הנתונים של החשבון (תומך בשיתוף משקי בית)
         reply = _tool_add_expense({
             'amount': amount,
             'category': category,
             'description': merchant
         }, account_id)
 
-        # שליחת הודעת וואטסאפ אקטיבית לטלפון שביצע את הקנייה
         msg = f"🍏 *Apple Pay (אוטומטי):*\n\n{reply}"
         send_whatsapp_message(user_id_raw, msg)
         
