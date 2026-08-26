@@ -33,7 +33,7 @@
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
-body{font-family:'Heebo',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;font-size:1rem;line-height:1.6}
+body{font-family:'Heebo',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;font-size:1rem;line-height:1.6;padding-bottom:80px}
 button{cursor:pointer;border:none;background:none;font:inherit;color:inherit}
 input,select{font:inherit;color:var(--text)}
 
@@ -63,33 +63,39 @@ input,select{font:inherit;color:var(--text)}
 #btnRefresh svg{transition:transform .6s ease}
 #btnRefresh.spin svg{transform:rotate(360deg)}
 
-/* ─── Modal ─── */
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:center;justify-content:center;padding:1rem;backdrop-filter:blur(6px)}
+/* ─── Modal & Tabs ─── */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:flex;align-items:center;justify-content:center;padding:1rem;backdrop-filter:blur(6px)}
 .overlay.hide{display:none}
-.modal{background:var(--surface);border-radius:14px;padding:1.75rem;width:100%;max-width:440px;box-shadow:var(--sh-lg);border:1px solid var(--border)}
+.modal{background:var(--surface);border-radius:14px;padding:1.75rem;width:100%;max-width:440px;box-shadow:var(--sh-lg);border:1px solid var(--border);position:relative}
+.modal-close{position:absolute;top:15px;left:15px;color:var(--muted);background:var(--surface-off);border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.2s}
+.modal-close:hover{color:var(--text);background:var(--divider)}
 .modal h2{font-size:1.2rem;font-weight:700;margin-bottom:.25rem}
 .modal .sub{color:var(--muted);font-size:.875rem;margin-bottom:1.5rem}
+
+.tabs{display:flex;gap:10px;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:10px}
+.tab-btn{flex:1;padding:8px;font-size:.9rem;font-weight:600;color:var(--muted);text-align:center;border-radius:8px;transition:.2s}
+.tab-btn.active{background:var(--primary-hl);color:var(--primary)}
+.tab-content{display:none}
+.tab-content.active{display:block}
+
 .f-group{margin-bottom:.875rem}
 .f-group label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase;letter-spacing:.04em}
-.f-group input{
-  width:100%;padding:.6rem .875rem;border:1px solid var(--border);border-radius:8px;
-  background:var(--surface-2);font-size:.9rem;
+.f-group input, .f-group select{
+  width:100%;padding:.7rem .875rem;border:1px solid var(--border);border-radius:8px;
+  background:var(--surface-2);font-size:.95rem;
   transition:border-color .15s,box-shadow .15s;
 }
-.f-group input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-hl)}
-.f-group .hint{font-size:.75rem;color:var(--faint);margin-top:.25rem}
+.f-group input:focus, .f-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-hl)}
 .btn-cta{
-  width:100%;margin-top:.5rem;padding:.7rem;background:var(--primary);color:#fff;border-radius:8px;
-  font-size:.95rem;font-weight:700;transition:background .15s,transform .1s;
+  width:100%;margin-top:1rem;padding:.8rem;background:var(--primary);color:#fff;border-radius:8px;
+  font-size:1rem;font-weight:700;transition:background .15s,transform .1s;
 }
 .btn-cta:hover{background:var(--primary-h)}
 .btn-cta:active{transform:scale(.98)}
 
-/* ─── Main ─── */
+/* ─── Main & Grid ─── */
 .main{padding:1.5rem;max-width:1280px;margin:0 auto;width:100%}
 @media(max-width:600px){.main{padding:1rem .875rem}}
-
-/* ─── KPIs ─── */
 .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.875rem;margin-bottom:1.75rem}
 .kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.25rem;box-shadow:var(--sh-sm);transition:box-shadow .15s}
 .kpi:hover{box-shadow:var(--sh-md)}
@@ -97,12 +103,10 @@ input,select{font:inherit;color:var(--text)}
 .kpi-val{font-size:1.65rem;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
 .kpi-sub{font-size:.75rem;color:var(--muted);margin-top:.3rem}
 .c-pos{color:var(--success)}.c-neg{color:var(--error)}.c-pri{color:var(--primary)}.c-gold{color:var(--gold)}
-
-/* ─── Grid ─── */
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.125rem;margin-bottom:1.75rem}
 @media(max-width:860px){.grid2{grid-template-columns:1fr}}
 
-/* ─── Card ─── */
+/* ─── Cards ─── */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.25rem;box-shadow:var(--sh-sm)}
 .card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
 .card-title{font-size:.9rem;font-weight:700}
@@ -111,126 +115,71 @@ input,select{font:inherit;color:var(--text)}
 /* ─── Budget bars ─── */
 .b-list{display:flex;flex-direction:column;gap:.7rem}
 .b-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.25rem}
-.b-cat{font-size:.85rem;font-weight:500}
+.b-cat{font-size:.85rem;font-weight:600;display:flex;align-items:center;gap:6px}
+.b-edit-btn{color:var(--muted);background:var(--surface-off);border-radius:4px;padding:2px 5px;font-size:.7rem;cursor:pointer;transition:.2s}
+.b-edit-btn:hover{color:var(--text);background:var(--divider)}
 .b-amounts{font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
-.b-track{height:5px;background:var(--surface-off);border-radius:3px;overflow:hidden}
+.b-track{height:6px;background:var(--surface-off);border-radius:3px;overflow:hidden}
 .b-fill{height:100%;border-radius:3px;transition:width .7s cubic-bezier(.16,1,.3,1)}
 
 /* ─── Chart ─── */
 .chart-wrap{height:210px;position:relative;margin-top:.25rem}
 
-/* ─── Tasks ─── */
-.t-list{display:flex;flex-direction:column;gap:.4rem;max-height:320px;overflow-y:auto;padding-right:2px}
-.t-list::-webkit-scrollbar{width:3px}
-.t-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.t-item{
-  display:flex;align-items:flex-start;gap:.5rem;padding:.55rem .7rem;
-  border-radius:8px;border:1px solid var(--divider);background:var(--surface-2);
-  transition:background .12s,opacity .2s;
-}
-.t-item:hover{background:var(--surface-off)}
-.t-cb{
-  width:17px;height:17px;border:1.5px solid var(--border);border-radius:4px;
-  flex-shrink:0;margin-top:3px;cursor:pointer;display:flex;align-items:center;justify-content:center;
-  transition:background .12s,border-color .12s;
-}
-.t-cb:hover{border-color:var(--primary);background:var(--primary-hl)}
-.t-txt{flex:1;font-size:.85rem;line-height:1.45}
-.t-q{font-size:.68rem;padding:.12rem .4rem;border-radius:999px;font-weight:600;white-space:nowrap;flex-shrink:0;margin-top:3px}
-.q1{background:rgba(192,57,43,.15);color:#e74c3c}.q2{background:rgba(215,189,0,.15);color:var(--gold)}
-.q3{background:rgba(230,126,34,.15);color:#e67e22}.q4{background:rgba(67,122,34,.15);color:var(--success)}
-[data-theme="light"] .q1{background:#fdecea;color:#c0392b}
-[data-theme="light"] .q2{background:#fef9e4;color:#b7770d}
-[data-theme="light"] .q3{background:#fdf0de;color:#d35400}
-[data-theme="light"] .q4{background:#eafaf1;color:#1e8449}
-.t-del{opacity:0;flex-shrink:0;margin-top:2px;color:var(--faint);transition:opacity .12s,color .12s;padding:1px}
-.t-item:hover .t-del{opacity:1}
-.t-del:hover{color:var(--error)}
-
-/* ─── Add forms ─── */
-.add-row{display:flex;gap:.5rem;margin-top:.875rem;flex-wrap:wrap}
-.add-row input,.add-row select{
-  padding:.5rem .7rem;border:1px solid var(--border);border-radius:7px;
-  background:var(--surface-2);font-size:.85rem;transition:border-color .12s;
-}
-.add-row input{flex:1;min-width:120px}
-.add-row select{flex-shrink:0}
-.add-row input:focus,.add-row select:focus{outline:none;border-color:var(--primary)}
-.btn-add{
-  padding:.5rem .875rem;background:var(--primary);color:#fff;border-radius:7px;
-  font-size:.85rem;font-weight:700;white-space:nowrap;transition:background .12s;flex-shrink:0;
-}
-.btn-add:hover{background:var(--primary-h)}
-
-/* ─── Transactions ─── */
-.tx-list{display:flex;flex-direction:column;gap:.35rem;max-height:300px;overflow-y:auto;padding-right:2px}
-.tx-list::-webkit-scrollbar{width:3px}
-.tx-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.tx-item{
+/* ─── Tasks & Lists ─── */
+.list-cont{display:flex;flex-direction:column;gap:.4rem;max-height:320px;overflow-y:auto;padding-right:2px}
+.list-cont::-webkit-scrollbar{width:3px}
+.list-cont::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.l-item{
   display:flex;align-items:center;gap:.625rem;padding:.55rem .7rem;
   border-radius:8px;border:1px solid var(--divider);background:var(--surface-2);
   transition:background .12s;
 }
-.tx-item:hover{background:var(--surface-off)}
+.l-item:hover{background:var(--surface-off)}
+.t-cb{width:17px;height:17px;border:1.5px solid var(--border);border-radius:4px;cursor:pointer;transition:.12s}
+.t-cb:hover{border-color:var(--primary);background:var(--primary-hl)}
+.t-txt{flex:1;font-size:.85rem;line-height:1.45}
+.t-q{font-size:.68rem;padding:.12rem .4rem;border-radius:999px;font-weight:600;white-space:nowrap}
 .tx-em{font-size:1rem;flex-shrink:0;width:24px;text-align:center}
 .tx-info{flex:1;min-width:0}
-.tx-desc{font-size:.83rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tx-desc{font-size:.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tx-meta{font-size:.72rem;color:var(--muted)}
-.tx-amt{font-size:.875rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tx-amt{font-size:.875rem;font-weight:700;font-variant-numeric:tabular-nums}
 .tx-amt.p{color:var(--success)}.tx-amt.n{color:var(--error)}
-.tx-del{opacity:0;color:var(--faint);transition:opacity .12s,color .12s;flex-shrink:0}
-.tx-item:hover .tx-del{opacity:1}
-.tx-del:hover{color:var(--error)}
+.del-btn{opacity:0;color:var(--faint);transition:.12s;padding:2px}
+.l-item:hover .del-btn{opacity:1}
+.del-btn:hover{color:var(--error)}
 
-/* ─── Expense add ─── */
-.exp-form{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.875rem}
-.exp-form select,.exp-form input{
-  padding:.5rem .7rem;border:1px solid var(--border);border-radius:7px;
-  background:var(--surface-2);font-size:.85rem;width:100%;transition:border-color .12s;
+/* ─── FAB (Floating Action Button) ─── */
+.fab{
+  position:fixed;bottom:2rem;left:2rem;width:56px;height:56px;border-radius:50%;
+  background:var(--primary);color:#fff;font-size:1.8rem;display:flex;align-items:center;justify-content:center;
+  box-shadow:var(--sh-lg);cursor:pointer;transition:transform .2s,background .2s;z-index:90;
 }
-.exp-form select:focus,.exp-form input:focus{outline:none;border-color:var(--primary)}
-.exp-form .span2{grid-column:1/-1;display:flex;gap:.5rem}
-.exp-form .span2 input{flex:1}
+.fab:hover{transform:scale(1.05);background:var(--primary-h)}
 
-/* ─── Empty ─── */
+/* ─── Utils ─── */
 .empty{display:flex;flex-direction:column;align-items:center;padding:1.75rem 1rem;color:var(--muted);gap:.5rem;text-align:center}
 .empty svg{opacity:.3}
 .empty p{font-size:.83rem}
-
-/* ─── Skeleton ─── */
 @keyframes sh{0%{background-position:-200% 0}100%{background-position:200% 0}}
 .sk{background:linear-gradient(90deg,var(--surface-off) 25%,var(--surface-dyn) 50%,var(--surface-off) 75%);background-size:200% 100%;animation:sh 1.4s ease-in-out infinite;border-radius:6px}
-
-/* ─── Toast ─── */
 .toasts{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:.5rem;pointer-events:none;align-items:center}
-.toast{background:var(--text);color:var(--bg);padding:.55rem 1.1rem;border-radius:999px;font-size:.83rem;font-weight:600;box-shadow:var(--sh-md);white-space:nowrap;pointer-events:auto;animation:tin .25s ease}
+.toast{background:var(--text);color:var(--bg);padding:.55rem 1.1rem;border-radius:999px;font-size:.83rem;font-weight:600;box-shadow:var(--sh-md);animation:tin .25s ease;pointer-events:auto}
 @keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-
-/* ─── Error banner ─── */
 .err-banner{background:var(--error-hl);border:1px solid var(--error);border-radius:10px;padding:.875rem 1rem;margin-bottom:1.25rem;font-size:.875rem;display:none;align-items:flex-start;gap:.625rem}
 .err-banner.show{display:flex}
 .err-banner strong{color:var(--error)}
-
-/* ─── Connection test button ─── */
-.test-row{display:flex;align-items:center;gap:.5rem;margin-top:.75rem}
-.btn-test{padding:.45rem .875rem;border:1px solid var(--border);border-radius:7px;font-size:.8rem;font-weight:600;color:var(--muted);background:var(--surface-2);transition:background .12s,color .12s}
-.btn-test:hover{background:var(--surface-off);color:var(--text)}
-#testResult{font-size:.78rem;color:var(--muted)}
 </style>
 </head>
 <body>
-<!-- Header -->
 <header class="hdr">
-  <div class="logo">
-    <div class="logo-icon">🤖</div>
-    סחבק
-  </div>
+  <div class="logo"><div class="logo-icon">🤖</div>סחבק</div>
   <div class="spacer"></div>
   <div class="badge" id="badge"><span class="dot"></span><span id="badgeTxt">לא מחובר</span></div>
   <button class="icon-btn" id="btnRefresh" title="רענן" onclick="load()">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
   </button>
-  <button class="icon-btn" title="הגדרות" onclick="openModal()">
+  <button class="icon-btn" title="הגדרות" onclick="openCfgModal()">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
   </button>
   <button class="icon-btn" title="מצב צבע" onclick="toggleTheme()">
@@ -238,54 +187,87 @@ input,select{font:inherit;color:var(--text)}
   </button>
 </header>
 
-<!-- Modal -->
-<div class="overlay hide" id="modal">
+<!-- Config Modal -->
+<div class="overlay hide" id="cfgModal">
   <div class="modal">
+    <button class="modal-close" onclick="closeCfgModal()">✕</button>
     <h2>🔌 הגדרות חיבור</h2>
     <p class="sub">עדכן את פרטי החיבור לבוט</p>
-    <div class="f-group">
-      <label>Railway URL</label>
-      <input id="cfgUrl" type="text" dir="ltr" placeholder="https://your-app.up.railway.app">
-    </div>
-    <div class="f-group">
-      <label>מפתח API</label>
-      <input id="cfgKey" type="password" placeholder="DASHBOARD_API_KEY">
-      <div class="hint">הערך שהגדרת ב-Railway Variables</div>
-    </div>
-    <div class="f-group">
-      <label>מספר טלפון (user_id)</label>
-      <input id="cfgUser" type="text" dir="ltr" placeholder="972501234567">
-      <div class="hint">מספר ה-WhatsApp ללא + (972...)</div>
-    </div>
-    <div class="test-row">
-      <button class="btn-test" onclick="testConn()">🧪 בדוק חיבור</button>
-      <span id="testResult"></span>
-    </div>
-    <button class="btn-cta" onclick="saveConf()" style="margin-top:1rem">שמור והתחבר 🚀</button>
+    <div class="f-group"><label>Railway URL</label><input id="cfgUrl" type="text" dir="ltr"></div>
+    <div class="f-group"><label>מפתח API</label><input id="cfgKey" type="password"></div>
+    <div class="f-group"><label>מספר טלפון (user_id)</label><input id="cfgUser" type="text" dir="ltr"></div>
+    <button class="btn-cta" onclick="saveConf()">שמור והתחבר 🚀</button>
   </div>
 </div>
 
-<!-- Content -->
-<main class="main" id="main" style="display:none">
-  <!-- Error banner -->
-  <div class="err-banner" id="errBanner">
-    <span>⚠️</span>
-    <div><strong>שגיאת חיבור</strong><br><span id="errMsg"></span></div>
-  </div>
+<!-- Add/Action Modal -->
+<div class="overlay hide" id="addModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeAddModal()">✕</button>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">💸 הוצאה</button>
+      <button class="tab-btn" onclick="switchTab('rec')" id="tab-btn-rec">🗓️ מינוי</button>
+      <button class="tab-btn" onclick="switchTab('tsk')" id="tab-btn-tsk">✅ משימה</button>
+    </div>
+    
+    <!-- Expense Tab -->
+    <div class="tab-content active" id="tab-exp">
+      <div class="f-group">
+        <label>קטגוריה</label>
+        <select id="eCat">
+          <option value="מזון">🍔 מזון</option><option value="רכב">🚗 רכב</option><option value="דיור">🏠 דיור</option>
+          <option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="בילויים">🎉 בילויים</option>
+          <option value="קניות">🛒 קניות</option><option value="נופש">✈️ נופש</option><option value="הכנסה">💰 הכנסה</option>
+        </select>
+      </div>
+      <div class="f-group"><label>סכום (₪)</label><input type="number" id="eAmt" placeholder="0"></div>
+      <div class="f-group"><label>תיאור</label><input type="text" id="eDesc" placeholder="למשל: סופר"></div>
+      <button class="btn-cta" onclick="addExp()">הוסף תנועה</button>
+    </div>
 
-  <!-- KPIs -->
+    <!-- Recurring Tab -->
+    <div class="tab-content" id="tab-rec">
+      <div class="f-group">
+        <label>קטגוריה</label>
+        <select id="rCat">
+          <option value="בילויים">🎉 בילויים</option><option value="דיור">🏠 דיור</option><option value="רכב">🚗 רכב</option>
+          <option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="הכנסה">💰 הכנסה קבועה</option>
+        </select>
+      </div>
+      <div class="f-group"><label>סכום (₪)</label><input type="number" id="rAmt" placeholder="0"></div>
+      <div class="f-group"><label>יום חיוב בחודש (1-31)</label><input type="number" id="rDay" placeholder="למשל: 10" min="1" max="31"></div>
+      <div class="f-group"><label>תיאור העסק</label><input type="text" id="rDesc" placeholder="למשל: נטפליקס"></div>
+      <button class="btn-cta" onclick="addRecurring()">שמור הוראת קבע</button>
+    </div>
+
+    <!-- Task Tab -->
+    <div class="tab-content" id="tab-tsk">
+      <div class="f-group"><label>תיאור המשימה</label><input type="text" id="newTDesc"></div>
+      <div class="f-group">
+        <label>דחיפות</label>
+        <select id="newTQ">
+          <option value="חשוב דחוף">🔴 חשוב דחוף</option><option value="חשוב לא דחוף" selected>🟡 חשוב לא דחוף</option>
+          <option value="דחוף לא חשוב">🟠 דחוף לא חשוב</option><option value="לא דחוף לא חשוב">🟢 לא חשוב</option>
+        </select>
+      </div>
+      <button class="btn-cta" onclick="addTask()">הוסף משימה</button>
+    </div>
+  </div>
+</div>
+
+<main class="main" id="main" style="display:none">
+  <div class="err-banner" id="errBanner"><span>⚠️</span><div><strong>שגיאת חיבור</strong><br><span id="errMsg"></span></div></div>
   <div class="kpis">
-    <div class="kpi"><div class="kpi-lbl">מאזן חודשי</div><div class="kpi-val c-pri" id="kBalance">—</div><div class="kpi-sub" id="kMonth"></div></div>
+    <div class="kpi"><div class="kpi-lbl">מאזן פנוי</div><div class="kpi-val c-pri" id="kBalance">—</div><div class="kpi-sub" id="kMonth"></div></div>
     <div class="kpi"><div class="kpi-lbl">הוצאות</div><div class="kpi-val c-neg" id="kExp">—</div><div class="kpi-sub">החודש</div></div>
     <div class="kpi"><div class="kpi-lbl">הכנסות</div><div class="kpi-val c-pos" id="kInc">—</div><div class="kpi-sub">החודש</div></div>
     <div class="kpi"><div class="kpi-lbl">משימות פתוחות</div><div class="kpi-val c-gold" id="kTasks">—</div><div class="kpi-sub" id="kTaskSub"></div></div>
   </div>
 
-  <!-- Budget + Pie -->
   <div class="grid2">
     <div class="card">
       <div class="card-hdr"><div class="card-title">📊 תקציב לפי קטגוריה</div><div class="card-meta" id="bMonth"></div></div>
-      <div class="b-list" id="bList"><div class="sk" style="height:36px;margin-bottom:.5rem"></div><div class="sk" style="height:36px;margin-bottom:.5rem"></div><div class="sk" style="height:36px"></div></div>
+      <div class="b-list" id="bList"><div class="sk" style="height:36px;margin-bottom:.5rem"></div></div>
     </div>
     <div class="card">
       <div class="card-hdr"><div class="card-title">🥧 חלוקת הוצאות</div></div>
@@ -293,123 +275,65 @@ input,select{font:inherit;color:var(--text)}
     </div>
   </div>
 
-  <!-- Tasks + Transactions -->
   <div class="grid2">
     <div class="card">
-      <div class="card-hdr"><div class="card-title">✅ משימות</div><div class="card-meta" id="tCount"></div></div>
-      <div class="t-list" id="tList"><div class="sk" style="height:42px;margin-bottom:.4rem"></div><div class="sk" style="height:42px"></div></div>
-      <div class="add-row">
-        <input type="text" id="newTDesc" placeholder="משימה חדשה..." onkeydown="if(event.key==='Enter')addTask()">
-        <select id="newTQ">
-          <option value="חשוב דחוף">🔴 חשוב דחוף</option>
-          <option value="חשוב לא דחוף" selected>🟡 חשוב לא דחוף</option>
-          <option value="דחוף לא חשוב">🟠 דחוף לא חשוב</option>
-          <option value="לא דחוף לא חשוב">🟢 לא חשוב</option>
-        </select>
-        <button class="btn-add" onclick="addTask()">+ הוסף</button>
-      </div>
+      <div class="card-hdr"><div class="card-title">💸 תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
+      <div class="list-cont" id="txList"><div class="sk" style="height:46px;margin-bottom:.35rem"></div></div>
     </div>
     <div class="card">
-      <div class="card-hdr"><div class="card-title">💸 תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
-      <div class="tx-list" id="txList"><div class="sk" style="height:46px;margin-bottom:.35rem"></div><div class="sk" style="height:46px;margin-bottom:.35rem"></div><div class="sk" style="height:46px"></div></div>
-      <div class="exp-form">
-        <select id="eCat">
-          <option value="מזון">🍔 מזון</option>
-          <option value="רכב">🚗 רכב</option>
-          <option value="דיור">🏠 דיור</option>
-          <option value="בריאות">💊 בריאות</option>
-          <option value="חינוך">📚 חינוך</option>
-          <option value="בילויים">🎉 בילויים</option>
-          <option value="קניות">🛒 קניות</option>
-          <option value="נופש">✈️ נופש</option>
-          <option value="הכנסה">💰 הכנסה</option>
-        </select>
-        <input type="number" id="eAmt" placeholder="סכום ₪" min="0">
-        <div class="span2">
-          <input type="text" id="eDesc" placeholder="תיאור (אופציונלי)" onkeydown="if(event.key==='Enter')addExp()">
-          <button class="btn-add" onclick="addExp()">+ הוסף</button>
-        </div>
+      <div class="card-hdr"><div class="card-title">🗓️ מינויים והוראות קבע</div></div>
+      <div class="list-cont" id="recList">
+        <div class="empty"><p>בקרוב: מינויים יוצגו כאן!</p></div>
       </div>
+    </div>
+  </div>
+  
+  <div class="grid2" style="grid-template-columns: 1fr;">
+    <div class="card">
+      <div class="card-hdr"><div class="card-title">✅ משימות</div><div class="card-meta" id="tCount"></div></div>
+      <div class="list-cont" id="tList"><div class="sk" style="height:42px;margin-bottom:.4rem"></div></div>
     </div>
   </div>
 </main>
 
+<button class="fab" onclick="openAddModal()">+</button>
 <div class="toasts" id="toasts"></div>
 
 <script>
-// ── Config ──
-// When served from /dashboard the server injects window.__SAHBAK_CFG__
-// (url='' = same-origin → no CORS; token = per-user scope). A URL query
-// (?user_id & token) always wins, so a personal link works even if an old
-// config is cached in localStorage. The master key is never injected.
 const _inj = window.__SAHBAK_CFG__ || {};
 const _injClean = {};
 for (const k in _inj) if (_inj[k] !== '' && _inj[k] != null) _injClean[k] = _inj[k];
-let C = Object.assign(
-  { url:'', key:'', userId:'', token:'' },
-  JSON.parse(localStorage.getItem('sahbak_cfg') || '{}'),
-  _injClean
-);
-(function(){
-  const q = new URLSearchParams(location.search);
-  const uid = q.get('user_id') || q.get('u');
-  const tok = q.get('token')   || q.get('t');
-  if (uid) C.userId = uid;
-  if (tok) C.token  = tok;
-})();
+let C = Object.assign({ url:'', key:'', userId:'', token:'' }, JSON.parse(localStorage.getItem('sahbak_cfg') || '{}'), _injClean);
+(function(){const q = new URLSearchParams(location.search);const uid = q.get('user_id') || q.get('u');const tok = q.get('token') || q.get('t');if(uid) C.userId = uid;if(tok) C.token = tok;})();
 
 const EMO = {דיור:'🏠',רכב:'🚗',נופש:'✈️',מזון:'🍔',בריאות:'💊',חינוך:'📚',בילויים:'🎉',קניות:'🛒',הכנסה:'💰'};
-const QC  = {'חשוב דחוף':'q1','חשוב לא דחוף':'q2','דחוף לא חשוב':'q3','לא דחוף לא חשוב':'q4'};
+const QC = {'חשוב דחוף':'q1','חשוב לא דחוף':'q2','דחוף לא חשוב':'q3','לא דחוף לא חשוב':'q4'};
 let pieChart = null;
 
-// ── Theme ──
-function toggleTheme(){
-  const h=document.documentElement,d=h.getAttribute('data-theme')==='dark';
-  h.setAttribute('data-theme',d?'light':'dark');
-}
+function toggleTheme(){const h=document.documentElement;h.setAttribute('data-theme',h.getAttribute('data-theme')==='dark'?'light':'dark');}
 
-// ── Modal ──
-function openModal(){
-  document.getElementById('cfgUrl').value=C.url;
-  document.getElementById('cfgKey').value=C.key;
-  document.getElementById('cfgUser').value=C.userId;
-  document.getElementById('testResult').textContent='';
-  document.getElementById('modal').classList.remove('hide');
+// ── Modals & Tabs ──
+function openCfgModal(){document.getElementById('cfgUrl').value=C.url;document.getElementById('cfgKey').value=C.key;document.getElementById('cfgUser').value=C.userId;document.getElementById('cfgModal').classList.remove('hide');}
+function closeCfgModal(){document.getElementById('cfgModal').classList.add('hide')}
+function openAddModal(){document.getElementById('addModal').classList.remove('hide');}
+function closeAddModal(){document.getElementById('addModal').classList.add('hide');}
+document.querySelectorAll('.overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.add('hide')}));
+
+function switchTab(tab){
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+  document.getElementById('tab-btn-'+tab).classList.add('active');
+  document.getElementById('tab-'+tab).classList.add('active');
 }
-function closeModal(){document.getElementById('modal').classList.add('hide')}
-document.getElementById('modal').addEventListener('click',e=>{if(e.target===document.getElementById('modal'))closeModal()});
 
 function saveConf(){
-  const u=document.getElementById('cfgUrl').value.trim().replace(/\/+$/,'');
-  const k=document.getElementById('cfgKey').value.trim();
-  const uid=document.getElementById('cfgUser').value.trim();
+  const u=document.getElementById('cfgUrl').value.trim().replace(/\/+$/,''),k=document.getElementById('cfgKey').value.trim(),uid=document.getElementById('cfgUser').value.trim();
   if(!u||!uid){toast('⚠️ מלא לפחות כתובת ומספר');return;}
   C={url:u,key:k,userId:uid,token:C.token||''};
-  try{localStorage.setItem('sahbak_cfg',JSON.stringify(C));}catch(e){}
-  closeModal();
-  document.getElementById('main').style.display='';
-  load();
+  localStorage.setItem('sahbak_cfg',JSON.stringify(C));
+  closeCfgModal();document.getElementById('main').style.display='';load();
 }
 
-async function testConn(){
-  const u=document.getElementById('cfgUrl').value.trim().replace(/\/+$/,'');
-  const k=document.getElementById('cfgKey').value.trim();
-  const uid=document.getElementById('cfgUser').value.trim();
-  const el=document.getElementById('testResult');
-  el.textContent='בודק...';
-  try{
-    const r=await fetch(`${u}/api/dashboard?user_id=${encodeURIComponent(uid)}`,{
-      headers:{'X-Dashboard-Key':k,'X-Dash-Token':C.token||''}
-    });
-    if(r.ok){el.textContent='✅ חיבור תקין!';el.style.color='var(--success)'}
-    else{const j=await r.json().catch(()=>({}));el.textContent='❌ '+( j.error||r.status);el.style.color='var(--error)'}
-  }catch(e){
-    el.textContent='❌ CORS / Network — ראה הערה למטה';
-    el.style.color='var(--error)';
-  }
-}
-
-// ── API ──
 async function api(path,method='GET',body=null){
   const sep=path.includes('?')?'&':'?';
   const url=C.url+path+(method==='GET'?`${sep}user_id=${encodeURIComponent(C.userId)}`:'');
@@ -420,56 +344,33 @@ async function api(path,method='GET',body=null){
   return r.json();
 }
 
-// ── Load ──
 async function load(){
   setBadge('loading','מתחבר...');
-  const btn=document.getElementById('btnRefresh');
-  btn.classList.add('spin');
-  hideErr();
+  const btn=document.getElementById('btnRefresh');btn.classList.add('spin');
+  document.getElementById('errBanner').classList.remove('show');
   try{
     const d=await api('/api/dashboard');
-    render(d);
-    setBadge('ok','מחובר ✓');
-    document.getElementById('main').style.display='';
+    renderKPIs(d); renderBudget(d); renderPie(d); renderTasks(d); renderTx(d);
+    // TODO: renderRecurring(d) will be added here once backend is ready
+    setBadge('ok','מחובר ✓'); document.getElementById('main').style.display='';
   }catch(e){
-    setBadge('err','שגיאה');
-    showErr(e.message);
-    toast('❌ '+e.message);
-  }finally{
-    setTimeout(()=>btn.classList.remove('spin'),500);
-  }
+    setBadge('err','שגיאה');document.getElementById('errBanner').classList.add('show');document.getElementById('errMsg').textContent=e.message;toast('❌ '+e.message);
+  }finally{setTimeout(()=>btn.classList.remove('spin'),500);}
 }
 
-function setBadge(s,t){
-  const b=document.getElementById('badge');
-  b.className='badge'+(s==='ok'?' ok':s==='err'?' err':s==='loading'?' loading':'');
-  document.getElementById('badgeTxt').textContent=t;
-}
-function showErr(m){const b=document.getElementById('errBanner');b.classList.add('show');document.getElementById('errMsg').textContent=m;}
-function hideErr(){document.getElementById('errBanner').classList.remove('show')}
+function setBadge(s,t){document.getElementById('badge').className='badge'+(s==='ok'?' ok':s==='err'?' err':s==='loading'?' loading':'');document.getElementById('badgeTxt').textContent=t;}
 
 // ── Render ──
-function render(d){
-  renderKPIs(d);
-  renderBudget(d);
-  renderPie(d);
-  renderTasks(d);
-  renderTx(d);
-}
-
 function renderKPIs(d){
-  const txs=d.transactions||[];
-  let inc=0,exp=0;
+  const txs=d.transactions||[]; let inc=0,exp=0;
   txs.forEach(t=>{t.amount>0?inc+=t.amount:exp+=Math.abs(t.amount)});
   const bal=inc-exp;
-  set('kBalance',fmt(bal));
+  document.getElementById('kBalance').textContent=fmt(bal);
   document.getElementById('kBalance').className='kpi-val '+(bal>=0?'c-pos':'c-neg');
-  set('kExp',fmt(exp));set('kInc',fmt(inc));
-  set('kMonth',d.month||'');set('bMonth',d.month||'');
-  set('kTasks',(d.tasks||[]).length);
-  set('kTaskSub',`הושלמו ${d.tasks_completed||0}/${d.tasks_total||0}`);
-  set('tCount',(d.tasks||[]).length+' משימות');
-  set('txCount',(d.transactions||[]).length+' תנועות');
+  document.getElementById('kExp').textContent=fmt(exp); document.getElementById('kInc').textContent=fmt(inc);
+  document.getElementById('kMonth').textContent=d.month||''; document.getElementById('bMonth').textContent=d.month||'';
+  document.getElementById('kTasks').textContent=(d.tasks||[]).length; document.getElementById('kTaskSub').textContent=`הושלמו ${d.tasks_completed||0}/${d.tasks_total||0}`;
+  document.getElementById('tCount').textContent=(d.tasks||[]).length+' משימות'; document.getElementById('txCount').textContent=(d.transactions||[]).length+' תנועות';
 }
 
 function renderBudget(d){
@@ -478,13 +379,14 @@ function renderBudget(d){
   if(!exps.length){el.innerHTML='<div class="empty"><p>אין הוצאות החודש</p></div>';return;}
   el.innerHTML=exps.map(b=>{
     const sp=Math.abs(b.total),lim=b.limit||(d.budget_limits||{})[b.category]||0;
-    const pct=lim>0?Math.min(100,sp/lim*100):0;
-    const over=lim>0&&sp>lim;
-    const col=over?'var(--error)':pct>75?'var(--warn)':'var(--primary)';
+    const isUnconfigured = (lim === 0);
+    const pct=isUnconfigured ? 0 : Math.min(100,sp/lim*100);
+    const col=isUnconfigured ? 'var(--surface-off)' : (sp>lim ? 'var(--error)' : (pct>75 ? 'var(--warn)' : 'var(--primary)'));
+    const amountStr = isUnconfigured ? `${fmt(sp)} (לא הוגדר יעד)` : `${fmt(sp)} / ${fmt(lim)}`;
     return `<div class="b-row">
       <div class="b-row-top">
-        <span class="b-cat">${EMO[b.category]||'💵'} ${b.category}</span>
-        <span class="b-amounts">${fmt(sp)}${lim?' / '+fmt(lim):''}</span>
+        <span class="b-cat">${EMO[b.category]||'💵'} ${b.category} <button class="b-edit-btn" onclick="editBudget('${b.category}')">✏️ ערוך</button></span>
+        <span class="b-amounts">${amountStr}</span>
       </div>
       <div class="b-track"><div class="b-fill" style="width:${pct}%;background:${col}"></div></div>
     </div>`;
@@ -493,128 +395,81 @@ function renderBudget(d){
 
 function renderPie(d){
   const exps=(d.budget_summary||[]).filter(b=>b.category!=='הכנסה'&&b.total<0);
-  const labels=exps.map(b=>`${EMO[b.category]||''} ${b.category}`);
-  const vals=exps.map(b=>Math.abs(b.total));
-  const colors=['#4f98a3','#01696f','#6daa45','#e8af34','#bb653b','#d163a7','#5591c7','#a86fdf','#da7101'];
   const ctx=document.getElementById('pie').getContext('2d');
   if(pieChart)pieChart.destroy();
   const dk=document.documentElement.getAttribute('data-theme')==='dark';
   pieChart=new Chart(ctx,{
     type:'doughnut',
-    data:{labels,datasets:[{data:vals,backgroundColor:colors,borderWidth:2,borderColor:dk?'#1a1917':'#fff'}]},
-    options:{
-      responsive:true,maintainAspectRatio:false,cutout:'58%',
-      plugins:{
-        legend:{position:'right',labels:{color:dk?'#d4d3d0':'#28251d',font:{family:'Heebo',size:10},boxWidth:9,padding:6,usePointStyle:true}},
-        tooltip:{callbacks:{label:c=>`₪${Math.round(c.raw).toLocaleString('he-IL')}`}}
-      }
-    }
+    data:{labels:exps.map(b=>`${EMO[b.category]||''} ${b.category}`),datasets:[{data:exps.map(b=>Math.abs(b.total)),backgroundColor:['#4f98a3','#01696f','#6daa45','#e8af34','#bb653b','#d163a7','#5591c7','#a86fdf','#da7101'],borderWidth:2,borderColor:dk?'#1a1917':'#fff'}]},
+    options:{responsive:true,maintainAspectRatio:false,cutout:'58%',plugins:{legend:{position:'right',labels:{color:dk?'#d4d3d0':'#28251d',font:{family:'Heebo',size:10},boxWidth:9,usePointStyle:true}},tooltip:{callbacks:{label:c=>`₪${Math.round(c.raw).toLocaleString('he-IL')}`}}}}
   });
 }
 
 function renderTasks(d){
-  const el=document.getElementById('tList');
-  const tasks=d.tasks||[];
-  if(!tasks.length){
-    el.innerHTML='<div class="empty"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg><p>אין משימות פתוחות 🎉</p></div>';
-    return;
-  }
-  el.innerHTML=tasks.map(t=>`
-    <div class="t-item" id="ti${t.id}">
-      <div class="t-cb" onclick="doneTask(${t.id})" title="סמן כהושלם"></div>
-      <span class="t-txt">${esc(t.description)}</span>
-      <span class="t-q ${QC[t.quadrant]||'q2'}">${t.quadrant}</span>
-      <button class="t-del" onclick="delTask(${t.id})" title="מחק">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/></svg>
-      </button>
-    </div>`).join('');
+  const el=document.getElementById('tList'); const tasks=d.tasks||[];
+  if(!tasks.length){el.innerHTML='<div class="empty"><p>אין משימות פתוחות 🎉</p></div>';return;}
+  el.innerHTML=tasks.map(t=>`<div class="l-item" id="ti${t.id}">
+    <div class="t-cb" onclick="doneTask(${t.id})" title="סמן כהושלם"></div>
+    <span class="t-txt">${esc(t.description)}</span><span class="t-q ${QC[t.quadrant]||'q2'}">${t.quadrant}</span>
+    <button class="del-btn" onclick="delTask(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/></svg></button>
+  </div>`).join('');
 }
 
 function renderTx(d){
-  const el=document.getElementById('txList');
-  const txs=d.transactions||[];
+  const el=document.getElementById('txList'); const txs=d.transactions||[];
   if(!txs.length){el.innerHTML='<div class="empty"><p>אין תנועות החודש</p></div>';return;}
-  el.innerHTML=txs.map(t=>`
-    <div class="tx-item" id="tx${t.id}">
-      <span class="tx-em">${EMO[t.category]||'💵'}</span>
-      <div class="tx-info">
-        <div class="tx-desc">${esc(t.description||t.category)}</div>
-        <div class="tx-meta">${t.category} · ${t.date}</div>
-      </div>
-      <span class="tx-amt ${t.amount>0?'p':'n'}">${t.amount>0?'+':''}${fmt(t.amount)}</span>
-      <button class="tx-del" onclick="delExp(${t.id})" title="מחק">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </div>`).join('');
+  el.innerHTML=txs.map(t=>`<div class="l-item" id="tx${t.id}">
+    <span class="tx-em">${EMO[t.category]||'💵'}</span>
+    <div class="tx-info"><div class="tx-desc">${esc(t.description||t.category)}</div><div class="tx-meta">${t.category} · ${t.date}</div></div>
+    <span class="tx-amt ${t.amount>0?'p':'n'}">${t.amount>0?'+':''}${fmt(t.amount)}</span>
+    <button class="del-btn" onclick="delExp(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+  </div>`).join('');
 }
 
 // ── Actions ──
 async function addTask(){
-  const desc=document.getElementById('newTDesc').value.trim();
-  const quad=document.getElementById('newTQ').value;
+  const desc=document.getElementById('newTDesc').value.trim(), quad=document.getElementById('newTQ').value;
   if(!desc){toast('⚠️ הכנס תיאור');return;}
-  try{
-    await api('/api/tasks','POST',{user_id:C.userId,description:desc,quadrant:quad});
-    document.getElementById('newTDesc').value='';
-    toast('✅ משימה נוספה');await load();
+  try{await api('/api/tasks','POST',{user_id:C.userId,description:desc,quadrant:quad});
+    document.getElementById('newTDesc').value=''; closeAddModal(); toast('✅ משימה נוספה'); await load();
   }catch(e){toast('❌ '+e.message);}
 }
 
-async function doneTask(id){
-  fade('ti'+id);
-  try{
-    await api(`/api/tasks/${id}/complete?user_id=${enc(C.userId)}`,'PATCH');
-    toast('🎉 הושלם!');await load();
-  }catch(e){unfade('ti'+id);toast('❌ '+e.message);}
-}
-
-async function delTask(id){
-  fade('ti'+id);
-  try{
-    await api(`/api/tasks/${id}?user_id=${enc(C.userId)}`,'DELETE');
-    toast('🗑️ נמחק');await load();
-  }catch(e){unfade('ti'+id);toast('❌ '+e.message);}
-}
+async function doneTask(id){try{document.getElementById('ti'+id).style.opacity='.35';await api(`/api/tasks/${id}/complete?user_id=${encodeURIComponent(C.userId)}`,'PATCH');toast('🎉 הושלם!');await load();}catch(e){toast('❌ '+e.message);}}
+async function delTask(id){try{document.getElementById('ti'+id).style.opacity='.35';await api(`/api/tasks/${id}?user_id=${encodeURIComponent(C.userId)}`,'DELETE');toast('🗑️ נמחק');await load();}catch(e){toast('❌ '+e.message);}}
+async function delExp(id){try{document.getElementById('tx'+id).style.opacity='.35';await api(`/api/expense/${id}?user_id=${encodeURIComponent(C.userId)}`,'DELETE');toast('🗑️ נמחק');await load();}catch(e){toast('❌ '+e.message);}}
 
 async function addExp(){
-  const cat=document.getElementById('eCat').value;
-  const amt=parseFloat(document.getElementById('eAmt').value);
-  const desc=document.getElementById('eDesc').value.trim()||cat;
+  const cat=document.getElementById('eCat').value, amt=parseFloat(document.getElementById('eAmt').value), desc=document.getElementById('eDesc').value.trim()||cat;
   if(!amt||amt<=0){toast('⚠️ הכנס סכום');return;}
   try{
     await api('/api/expense','POST',{user_id:C.userId,category:cat,amount:amt,description:desc});
-    document.getElementById('eAmt').value='';document.getElementById('eDesc').value='';
-    toast('✅ נרשם');await load();
+    document.getElementById('eAmt').value='';document.getElementById('eDesc').value=''; closeAddModal(); toast('✅ נרשם'); await load();
   }catch(e){toast('❌ '+e.message);}
 }
 
-async function delExp(id){
-  fade('tx'+id);
-  try{
-    await api(`/api/expense/${id}?user_id=${enc(C.userId)}`,'DELETE');
-    toast('🗑️ נמחק');await load();
-  }catch(e){unfade('tx'+id);toast('❌ '+e.message);}
+// Stub for recurring
+async function addRecurring(){
+  toast('🔄 שומר הוראת קבע (השרת יעודכן בקרוב)...');
+  closeAddModal();
+}
+
+async function editBudget(cat){
+  const val = prompt(`הגדר יעד תקציב חדש עבור ${cat}:\n(הקלד 0 כדי לבטל את היעד)`);
+  if(val === null) return;
+  const num = parseFloat(val);
+  if(isNaN(num) || num < 0){ toast('⚠️ סכום לא חוקי'); return; }
+  toast('⏳ מעדכן תקציב (דורש עדכון שרת)...');
+  // TODO: Add API call to update budget limit
 }
 
 // ── Helpers ──
-function fmt(n){const a=Math.abs(n);return(n<0?'-':'')+'₪'+Math.round(a).toLocaleString('he-IL')}
+function fmt(n){return(n<0?'-':'')+'₪'+Math.round(Math.abs(n)).toLocaleString('he-IL')}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function enc(s){return encodeURIComponent(s)}
-function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v}
-function fade(id){const e=document.getElementById(id);if(e)e.style.opacity='.35'}
-function unfade(id){const e=document.getElementById(id);if(e)e.style.opacity='1'}
-function toast(msg,dur=3200){
-  const c=document.getElementById('toasts'),t=document.createElement('div');
-  t.className='toast';t.textContent=msg;c.appendChild(t);
-  setTimeout(()=>{t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(()=>t.remove(),300)},dur);
-}
-
-// ── Auto-refresh every 30s ──
+function toast(msg){const c=document.getElementById('toasts'),t=document.createElement('div');t.className='toast';t.textContent=msg;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},3000);}
 setInterval(()=>load(),30000);
-
-// ── Boot ──
 document.getElementById('main').style.display='';
-if(!C.userId){ openModal(); } else { load(); }
+if(!C.userId){openCfgModal();}else{load();}
 </script>
 </body>
 </html>
