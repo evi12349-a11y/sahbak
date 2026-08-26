@@ -271,11 +271,7 @@ CALENDAR_COLORS_HE = {
 # Sensible defaults used as a FALLBACK whenever a user hasn't set their own
 # limit. They are no longer written to the DB — each user simply inherits
 # these until they override a category.
-DEFAULT_BUDGET_LIMITS = {
-    'דיור': 5000, 'רכב': 2000, 'נופש': 1500,
-    'מזון': 3000, 'בריאות': 1000, 'חינוך': 1500,
-    'בילויים': 800, 'קניות': 1000, 'חיסכון': 1000,  # חיסכון = יעד חודשי
-}
+DEFAULT_BUDGET_LIMITS = {}
 
 TASK_QUADRANTS_EMOJI = {
     'חשוב דחוף':        '🔴',
@@ -2812,54 +2808,92 @@ def get_task_status(user_id: str) -> str:
 
 
 def get_detailed_budget(user_id: str) -> str:
-    summary = get_all_budget_summary(user_id)
-    if not summary:
-        return 'אין רשומות לחודש הנוכחי.'
-    month   = now_local().strftime('%m/%Y')
-    report  = f'*סטטוס כלכלי — {month}*\n\n'
+    summary_dict = {cat: total for cat, total in get_all_budget_summary(user_id)}
+    limits = get_all_budget_limits(user_id)
+    month = now_local().strftime('%m/%Y')
+    
     total_inc, total_exp, total_sav = 0.0, 0.0, 0.0
-
-    for cat, total in summary:
-        emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
+    
+    configured = []
+    unconfigured_active = []
+    unconfigured_empty = []
+    
+    # 1. עיבוד מדויק ומתמטי של כל הקטגוריות
+    for cat in VALID_CATEGORIES:
         if cat == 'הכנסה':
-            total_inc += total
-            report += f'{emoji} *{cat}*: +{total:,.0f} ש"ח\n\n'
-        elif cat == 'חיסכון':
-            saved = max(total, 0.0)           # savings stored positive
+            total_inc += summary_dict.get(cat, 0.0)
+            continue
+            
+        limit = limits.get(cat, 0.0)
+        raw_sum = summary_dict.get(cat, 0.0)
+        emoji = BUDGET_CATEGORIES_HE.get(cat, '💵')
+        
+        if cat == 'חיסכון':
+            saved = raw_sum
             total_sav += saved
-            goal = get_budget_limit(cat, user_id)
-            if goal > 0:
-                perc   = min((saved / goal) * 100, 100)
-                filled = min(int(perc / 10), 10)
-                bar    = '█' * filled + '░' * (10 - filled)
-                done   = ' 🎉' if saved >= goal else ''
-                report += f'{emoji} *{cat}*: {saved:,.0f}/{goal:,.0f} ש"ח 🎯{done}\n{bar} {int(perc)}%\n\n'
-            else:
-                report += f'{emoji} *{cat}*: {saved:,.0f} ש"ח\n\n'
-        else:
-            spent = abs(total)
-            total_exp += spent
-            limit = get_budget_limit(cat, user_id)   # [MULTI] per-user
             if limit > 0:
-                perc   = min((spent / limit) * 100, 100)
-                filled = min(int(perc / 10), 10)
-                bar    = '█' * filled + '░' * (10 - filled)
-                over   = ' ⚠️' if spent > limit else ''
-                report += f'{emoji} *{cat}*: {spent:,.0f}/{limit:,.0f} ש"ח{over}\n{bar} {int(perc)}%\n\n'
+                configured.append((limit, cat, emoji, saved))
+            elif saved != 0:
+                unconfigured_active.append((cat, emoji, saved))
             else:
-                report += f'{emoji} *{cat}*: {spent:,.0f} ש"ח\n\n'
+                unconfigured_empty.append(cat)
+        else:
+            # הוצאות נשמרות כמספר שלילי ב-DB. זיכוי מקטין את ההוצאה!
+            spent = -raw_sum 
+            total_exp += spent
+            if limit > 0:
+                configured.append((limit, cat, emoji, spent))
+            elif spent != 0:
+                unconfigured_active.append((cat, emoji, spent))
+            else:
+                unconfigured_empty.append(cat)
 
-    bal = total_inc - total_exp
+    # 2. מיון הקטגוריות המוגדרות
+    configured.sort(key=lambda x: x[0], reverse=True)
+    
+    report = f'*סטטוס כלכלי — {month}*\n\n'
+    
+    # 3. בניית מד החרוזים לקטגוריות עם תקציב
+    for limit, cat, emoji, amount in configured:
+        perc = min((max(amount, 0) / limit) * 100, 100) if limit > 0 else 0
+        filled = min(int(perc / 10), 10)
+        bar = '█' * filled + '░' * (10 - filled)
+        
+        if cat == 'חיסכון':
+            done = ' 🎉' if amount >= limit else ''
+            report += f'{emoji} *{cat}*: {amount:,.0f}/{limit:,.0f} ש"ח 🎯{done}\n{bar} {int(perc)}%\n\n'
+        else:
+            over = ' ⚠️' if amount > limit else ''
+            report += f'{emoji} *{cat}*: {amount:,.0f}/{limit:,.0f} ש"ח{over}\n{bar} {int(perc)}%\n\n'
+            
+    # 4. הצגת חריגות (קטגוריות עם הוצאה אך ללא יעד)
+    if unconfigured_active:
+        report += '*חריגות (ללא תקציב מוגדר):*\n'
+        for cat, emoji, amount in unconfigured_active:
+            if cat == 'חיסכון':
+                report += f'{emoji} *{cat}*: נחסכו {amount:,.0f} ש"ח\n'
+            else:
+                report += f'{emoji} *{cat}*: הוצאו {amount:,.0f} ש"ח\n'
+        report += '\n'
+
+    # 5. חישוב המאזן - משקף את העו"ש הפנוי! (הכנסות פחות הוצאות וחסכונות)
+    bal = total_inc - total_exp - total_sav
     report += '━━━━━━━━━━━━━━━\n'
     report += f'💰 הכנסות: {total_inc:,.0f} ש"ח\n'
     report += f'💸 הוצאות: {total_exp:,.0f} ש"ח\n'
-    if total_sav > 0:
+    if total_sav != 0:
         report += f'🐷 חיסכון: {total_sav:,.0f} ש"ח\n'
     report += '━━━━━━━━━━━━━━━\n'
     if bal >= 0:
-        report += f'✅ *מאזן חיובי*: +{bal:,.0f} ש"ח'
+        report += f'✅ *מאזן פנוי לעו"ש*: +{bal:,.0f} ש"ח'
     else:
-        report += f'⚠️ *גרעון*: {abs(bal):,.0f} ש"ח'
+        report += f'⚠️ *גרעון בעו"ש*: {bal:,.0f} ש"ח'
+
+    # 6. טיפ שקוף בתחתית
+    if unconfigured_empty:
+        empty_str = ", ".join(unconfigured_empty)
+        report += f'\n\n_(💡 טיפ: ניתן להגדיר יעדים גם עבור: {empty_str})_'
+        
     return report
 
 
