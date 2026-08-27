@@ -299,7 +299,8 @@ function saveConf(){
 
 async function api(path,method='GET',body=null){
   const sep=path.includes('?')?'&':'?';
-  const url=C.url+path+(method==='GET'?`${sep}user_id=${encodeURIComponent(C.userId)}`:'');
+  // התיקון: תמיד מצרפים את מספר הטלפון כדי לעבור את חומת האבטחה של השרת
+  const url=C.url+path+`${sep}user_id=${encodeURIComponent(C.userId)}`;
   const opts={method,headers:{'X-Dashboard-Key':C.key||'','X-Dash-Token':C.token||'','Content-Type':'application/json'}};
   if(body)opts.body=JSON.stringify(body);
   const r=await fetch(url,opts);
