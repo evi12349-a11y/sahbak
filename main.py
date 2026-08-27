@@ -3363,7 +3363,13 @@ def api_apple_pay():
     except ValueError:
         return jsonify({'error': 'invalid amount format'}), 400
 
-    if amount <= 0:
+    # זיהוי עסקאות אימות (Pre-auth) של 0 ש"ח, הנפוצות בתחבורה ציבורית.
+    # אנחנו מחזירים 200 לאייפון כדי שהאוטומציה תרוץ חלק, אבל עוצרים פה כדי לא לרשום הוצאת סרק.
+    if amount == 0:
+        logger.info('Apple Pay received a 0 NIS transaction (likely transit pre-auth) for %s - ignoring quietly.', merchant)
+        return jsonify({'status': 'ignored_zero_amount'}), 200
+
+    if amount < 0:
         return jsonify({'error': 'amount must be positive'}), 400
 
     original_amount = amount
