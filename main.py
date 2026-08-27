@@ -3422,7 +3422,7 @@ def api_add_expense():
     if amount <= 0:
         return jsonify({'error': 'amount must be positive'}), 400
 
-    signed = amount if category == 'הכנסה' else -amount
+    signed = amount if category in POSITIVE_CATEGORIES else -amount
     add_expense(category, signed, now_local().isoformat(), description, user_id)
     return jsonify({'status': 'ok', 'category': category, 'amount': signed}), 201
 
