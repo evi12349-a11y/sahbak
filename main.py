@@ -3285,7 +3285,13 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
         client = get_genai_client()
         category = 'קניות'  
         
-        if client and merchant:
+        # --- תוספת הזיכויים ---
+        if amount < 0:
+            category = 'הכנסה'
+            merchant = f'זיכוי: {merchant}'
+            amount = abs(amount) # הופכים לחיובי כדי שהפונקציה הרושמת תדע לטפל בזה
+        # ---------------------
+        elif client and merchant:
             allowed_cats = [c for c in VALID_CATEGORIES if c not in POSITIVE_CATEGORIES]
             prompt = (
                 f'לאיזו קטגוריה הכי מתאים לשייך הוצאה בבית העסק "{merchant}"?\n'
@@ -3310,7 +3316,6 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
                 _, txt = _extract_calls_and_text(resp)
                 raw_reply = (txt or '').strip()
                 
-                # מוודא שחולצה אך ורק קטגוריה קיימת
                 matched_cat = next((c for c in allowed_cats if c in raw_reply), None)
                 if matched_cat:
                     category = matched_cat
@@ -3330,8 +3335,7 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
         
     except Exception:
         logger.exception('Critical error in background Apple Pay processing for %s', user_id_raw)
-
-
+      
 # ─── POST /api/apple-pay ─────────────────────────────────────────────────────
 @app.route('/api/apple-pay', methods=['POST'])
 def api_apple_pay():
@@ -3368,9 +3372,6 @@ def api_apple_pay():
     if amount == 0:
         logger.info('Apple Pay received a 0 NIS transaction (likely transit pre-auth) for %s - ignoring quietly.', merchant)
         return jsonify({'status': 'ignored_zero_amount'}), 200
-
-    if amount < 0:
-        return jsonify({'error': 'amount must be positive'}), 400
 
     original_amount = amount
     currency = 'USD' if is_usd else 'ILS'
