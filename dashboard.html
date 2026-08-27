@@ -337,22 +337,52 @@ function renderKPIs(d){
 
 function renderBudget(d){
   const el=document.getElementById('bList');
-  const exps=(d.budget_summary||[]).filter(b=>b.category!=='הכנסה'&&b.total<0);
-  if(!exps.length){el.innerHTML='<div class="empty"><p>אין הוצאות החודש</p></div>';return;}
-  el.innerHTML=exps.map(b=>{
-    const sp=Math.abs(b.total),lim=b.limit||(d.budget_limits||{})[b.category]||0;
-    const isUnconfigured = (lim === 0);
-    const pct=isUnconfigured ? 0 : Math.min(100,sp/lim*100);
-    const col=isUnconfigured ? 'var(--surface-off)' : (sp>lim ? 'var(--error)' : (pct>75 ? 'var(--warn)' : 'var(--primary)'));
-    const amountStr = isUnconfigured ? `${fmt(sp)} (לא הוגדר יעד)` : `${fmt(sp)} / ${fmt(lim)}`;
-    return `<div class="b-row">
-      <div class="b-row-top">
-        <span class="b-cat">${EMO[b.category]||'💵'} ${b.category} <button class="b-edit-btn" onclick="editBudget('${b.category}')">✏️ ערוך</button></span>
-        <span class="b-amounts">${amountStr}</span>
-      </div>
-      <div class="b-track"><div class="b-fill" style="width:${pct}%;background:${col}"></div></div>
-    </div>`;
-  }).join('');
+  const limits = d.budget_limits || {};
+  const summary = d.budget_summary || [];
+  const map = {};
+
+  // 1. הוספת כל הקטגוריות שיש להן תקציב מוגדר (גם אם לא הוציאו בהן שקל)
+  for(let cat in limits) {
+    if(cat !== 'הכנסה' && limits[cat] > 0) {
+      map[cat] = { spent: 0, limit: limits[cat] };
+    }
+  }
+
+  // 2. הוספת כל הקטגוריות שיש בהן הוצאות בפועל
+  summary.forEach(b => {
+    if(b.category !== 'הכנסה' && b.total < 0) {
+      if(!map[b.category]) map[b.category] = { spent: 0, limit: limits[b.category] || 0 };
+      map[b.category].spent = Math.abs(b.total);
+    }
+  });
+
+  const cats = Object.keys(map);
+  let html = '';
+
+  if(!cats.length){
+    html = '<div class="empty"><p>לא הוגדרו יעדים ואין הוצאות</p></div>';
+  } else {
+    cats.sort((a,b) => map[b].spent - map[a].spent); // מיון מהגבוה לנמוך
+    html = cats.map(cat => {
+      const sp = map[cat].spent, lim = map[cat].limit;
+      const isUnconfigured = (lim === 0);
+      const pct = isUnconfigured ? 0 : Math.min(100, sp/lim*100);
+      const col = isUnconfigured ? 'var(--surface-off)' : (sp>lim ? 'var(--error)' : (pct>75 ? 'var(--warn)' : 'var(--primary)'));
+      const amountStr = isUnconfigured ? `${fmt(sp)} (ללא יעד)` : `${fmt(sp)} / ${fmt(lim)}`;
+      return `<div class="b-row">
+        <div class="b-row-top" style="align-items:center; flex-wrap:wrap;">
+          <span class="b-cat">${EMO[cat]||'💵'} ${cat} <button class="b-edit-btn" onclick="editBudget('${cat}')">✏️ ערוך</button></span>
+          <span class="b-amounts">${amountStr}</span>
+        </div>
+        <div class="b-track"><div class="b-fill" style="width:${pct}%;background:${col}"></div></div>
+      </div>`;
+    }).join('');
+  }
+
+  // 3. כפתור נוח וברור בתחתית הרשימה להוספת תקציב חדש
+  html += `<button class="btn-test" style="width:100%; margin-top:1rem; border-style:dashed; cursor:pointer;" onclick="switchTab('bud');openAddModal();">➕ הגדר יעד לקטגוריה נוספת</button>`;
+  
+  el.innerHTML = html;
 }
 
 function renderPie(d){
