@@ -1076,9 +1076,10 @@ def process_calendar_ai(title: str, start_time_iso: str,
                         location: str | None, user_id: str,
                         duration_minutes: int = 60,
                         recurrence: str | None = None,
-                        color: str | None = None) -> str:
-    # [MULTI] Resolve THIS user's own calendar. If they have none connected,
-    # refuse — never silently write a friend's event onto the owner's calendar.
+                        color: str | None = None,
+                        end_time_iso: str | None = None,
+                        is_all_day: bool = False) -> str:
+    
     cal_id = calendar_id_for(user_id)
     sa     = _service_account_email()
     if not cal_id:
@@ -1099,48 +1100,78 @@ def process_calendar_ai(title: str, start_time_iso: str,
     if start_time is None:
         return f'תאריך לא תקין: {start_time_iso}'
 
+    # עיבוד תאריך סיום לטווחים
+    end_time = None
+    if end_time_iso:
+        end_time = _parse_event_datetime(end_time_iso)
+    if not end_time or end_time < start_time:
+        end_time = start_time + timedelta(minutes=duration_minutes)
+
     past_note = ''
     if start_time < now_local() - timedelta(minutes=1):
         past_note = '\n⚠️ שים לב: הזמן שביקשת כבר עבר — קבעתי בכל זאת. לשינוי כתוב לי תאריך חדש.'
 
-    end_time = start_time + timedelta(minutes=duration_minutes)
     event: dict = {
         'summary': title,
-        'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE_NAME},
-        'end':   {'dateTime': end_time.isoformat(),   'timeZone': TIMEZONE_NAME},
-        # [r6] inherit the calendar's default notifications, so the user's
-        # phone actually pops a reminder ("תשלח לי תזכורת ביומן").
         'reminders': {'useDefault': True},
     }
+    
+    # התיקון הקריטי לאירועי יום שלם וטווחי תאריכים
+    if is_all_day:
+        start_date_str = start_time.strftime('%Y-%m-%d')
+        # גוגל דורש שתאריך הסיום של אירוע יום שלם יהיה "היום שאחרי" (Exclusive)
+        if end_time.date() == start_time.date():
+            real_end_date = start_time + timedelta(days=1)
+        else:
+            real_end_date = end_time + timedelta(days=1)
+            
+        end_date_str = real_end_date.strftime('%Y-%m-%d')
+        
+        event['start'] = {'date': start_date_str}
+        event['end']   = {'date': end_date_str}
+        time_str = "יום שלם"
+    else:
+        event['start'] = {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE_NAME}
+        event['end']   = {'dateTime': end_time.isoformat(),   'timeZone': TIMEZONE_NAME}
+        time_str = f'{start_time.strftime("%H:%M")}–{end_time.strftime("%H:%M")}'
+
     if location:
         event['location'] = location
 
-    # [r6] Recurring events — ONE event with an RRULE instead of the model
-    # firing several separate create calls.
     rrule = _normalize_rrule(recurrence)
     if rrule:
         event['recurrence'] = [rrule]
 
-    # [NEW] optional event colour (user-chosen; otherwise Google's default).
     color_name = (color or '').strip()
     color_id = CALENDAR_COLORS_HE.get(color_name)
     if color_id:
         event['colorId'] = color_id
 
     try:
+        logger.info("Sending payload to Google Calendar: %s", event)
         created = call_with_retry(
             lambda: service.events().insert(calendarId=cal_id, body=event).execute(),
             what='Calendar insert', max_attempts=3, base_delay=0.6, max_total=6.0,
         )
-        link    = created.get('htmlLink', 'לא זמין')
+        logger.info("Google Calendar response ID: %s", created.get('id'))
+        
+        # שכבת הגנה לקישור שחוזר מגוגל
+        raw_link = created.get('htmlLink', '')
+        if not raw_link or 'google.com' not in raw_link or len(raw_link) > 250 or _looks_degenerate(raw_link):
+            logger.error("Suspicious or missing htmlLink from Google: %s", raw_link)
+            link = "נוצר בהצלחה (קישור לא זמין עקב שגיאת תצוגה)"
+        else:
+            link = raw_link
+
         weekday = HEB_WEEKDAYS[start_time.weekday()]
         recur_line = f'\n🔁 {_recurrence_summary_he(rrule)}' if rrule else ''
         color_line = f'\n🎨 צבע: {color_name}' if color_id else ''
+        
         return (
             f'האירוע נוצר בהצלחה! 📅\n'
             f'כותרת: {title}\n'
             f'יום {weekday}, {start_time.strftime("%d/%m/%Y")} '
-            f'{start_time.strftime("%H:%M")}–{end_time.strftime("%H:%M")}'
+            f'({time_str})'
             f'{recur_line}'
             + (f'\nמיקום: {location}' if location else '') +
             f'{color_line}'
@@ -1148,8 +1179,6 @@ def process_calendar_ai(title: str, start_time_iso: str,
             f'{past_note}'
         )
     except HttpError as e:
-        # [r6] Tell the user (and the admin reading the chat) EXACTLY what's
-        # wrong, instead of a generic "calendar error".
         status = _http_status(e)
         logger.exception('Calendar insert failed (user=%s, cal=%s, status=%s)',
                          user_id, cal_id, status)
@@ -1430,45 +1459,33 @@ def _build_tools() -> list:
         ),
         _make_function_declaration(
             'create_calendar_event',
-            'יצירת אירוע ביומן גוגל (כולל אירועים חוזרים). השתמש בזה כשהמשתמש '
-            'מבקש לקבוע פגישה, תור, אירוע, בוחן או תזכורת עם זמן מסוים. '
-            'עבור בקשה חוזרת ("כל שבוע", "באופן קבוע", "כל יום שלישי לחודש '
-            'הקרוב") — קרא לכלי *פעם אחת בלבד* עם הפרמטר recurrence, ולא '
-            'בכמה קריאות נפרדות.',
+            'יצירת אירוע ביומן גוגל (כולל אירועים חוזרים, וטווחי תאריכים מרובי ימים). השתמש בזה לקביעת פגישות, חופשות, אירועים חוזרים וכדומה.',
             {
                 'type': 'object',
                 'properties': {
                     'title': {
                         'type': 'string',
-                        'description': 'כותרת האירוע (למשל "פגישה עם דני", "בוחן באינפי").',
+                        'description': 'כותרת האירוע (למשל "פגישה עם דני", "בוחן באינפי", "חופשה באילת").',
                     },
                     'start_time': {
                         'type': 'string',
-                        'description': (
-                            'זמן ההתחלה בפורמט ISO 8601 מלא עם שניות וללא אזור זמן, '
-                            'למשל "2026-06-15T10:00:00". "10" או "ב-10" = 10:00. '
-                            'טווח כמו "10-12" → התחלה ב-10:00. תאריך בפורמט יום/חודש '
-                            '("15/06") או יחסי ("מחר", "יום שלישי") — חשב לפי הזמן '
-                            'הנוכחי שניתן לך. באירוע חוזר — זה זמן המופע הראשון.'
-                        ),
+                        'description': 'זמן ההתחלה בפורמט ISO 8601 מלא. באירוע חוזר — זה זמן המופע הראשון.',
+                    },
+                    'end_time': {
+                        'type': 'string',
+                        'description': 'זמן סיום בפורמט ISO 8601 (אופציונלי). חובה למלא עבור טווחי תאריכים מרובי ימים (למשל חופשה מ-10.9 עד 12.9).',
+                    },
+                    'is_all_day': {
+                        'type': 'boolean',
+                        'description': 'true אם מדובר באירוע של יום שלם או מספר ימים מלאים (חופשה, מילואים, קאנטה). false אם יש שעות ספציפיות.',
                     },
                     'duration_minutes': {
                         'type': 'integer',
-                        'description': (
-                            'משך האירוע בדקות. "למשך שעתיים"=120, "חצי שעה"=30, '
-                            'טווח "10-12"=120, "16-19"=180. אם המשתמש לא ציין משך — 60.'
-                        ),
+                        'description': 'משך האירוע בדקות. התעלם מזה אם סיפקת end_time.',
                     },
                     'recurrence': {
                         'type': 'string',
-                        'description': (
-                            'כלל חזרה בפורמט RRULE עבור אירוע חוזר בלבד. '
-                            'דוגמאות: "RRULE:FREQ=WEEKLY;COUNT=4" = כל שבוע, 4 פעמים '
-                            '(מתאים ל"כל שבוע לחודש הקרוב"); '
-                            '"RRULE:FREQ=DAILY;COUNT=30" = כל יום לחודש; '
-                            '"RRULE:FREQ=WEEKLY" = כל שבוע ללא הגבלה. '
-                            'העדף תמיד COUNT על UNTIL. אם האירוע חד-פעמי — השמט לגמרי.'
-                        ),
+                        'description': 'כלל RRULE לאירוע חוזר (למשל "RRULE:FREQ=WEEKLY;COUNT=4").',
                     },
                     'location': {
                         'type': 'string',
@@ -1476,11 +1493,8 @@ def _build_tools() -> list:
                     },
                     'color': {
                         'type': 'string',
-                        'enum': ['אדום', 'כתום', 'צהוב', 'ירוק', 'טורקיז', 'כחול',
-                                 'סגול', 'ורוד', 'אפור', 'לבנדר', 'ירקרק'],
-                        'description': ('צבע האירוע ביומן — רק אם המשתמש ביקש צבע '
-                                        'מסוים (למשל "בצבע אדום", "תעשה את זה ירוק"). '
-                                        'אחרת השמט לגמרי.'),
+                        'enum': ['אדום', 'כתום', 'צהוב', 'ירוק', 'טורקיז', 'כחול', 'סגול', 'ורוד', 'אפור', 'לבנדר', 'ירקרק'],
+                        'description': 'צבע האירוע, רק אם המשתמש ביקש במפורש.',
                     },
                 },
                 'required': ['title', 'start_time'],
@@ -1678,41 +1692,23 @@ def _system_instruction() -> str:
         'ותקציב. אתה מדבר עברית, בקצרה ובחום.\n\n'
         f'הזמן הנוכחי: {now.strftime("%Y-%m-%d %H:%M")} (יום {weekday}).\n\n'
         'הנחיות לתאריכים ולשעות:\n'
-        '• תאריכים יחסיים ("מחר", "מחרתיים", "יום ראשון הבא", "עוד שעתיים") — '
-        'חשב לפי הזמן הנוכחי שלמעלה.\n'
-        '• פורמט תאריך עברי הוא יום/חודש: "15/06" או "ב-15 ביוני" = 15 ביוני.\n'
-        '• שעה: "10" או "ב-10" פירושו 10:00. "8 וחצי" = 08:30. "רבע ל-9" = 08:45.\n'
-        '• טווח שעות כמו "10-12" או "בין 10 ל-12" = התחלה ב-10:00 ומשך 120 דקות. '
-        '"16-19" = התחלה ב-16:00 ומשך 180 דקות.\n'
-        '• "למשך שעתיים" = duration_minutes=120. אם לא צוין משך — 60 דקות.\n\n'
-        'אירועים חוזרים (חשוב!):\n'
-        '• "כל שבוע", "באופן קבוע", "כל יום שלישי", "כל יום" — זה אירוע חוזר: '
-        'קרא ל-create_calendar_event *פעם אחת בלבד* עם recurrence מתאים. '
-        'לעולם אל תיצור כמה אירועים נפרדים בכמה קריאות.\n'
-        '• "לחודש הקרוב" בתדירות שבועית = RRULE:FREQ=WEEKLY;COUNT=4. '
-        'בתדירות יומית = RRULE:FREQ=DAILY;COUNT=30.\n'
-        '• start_time באירוע חוזר = המופע הראשון הקרוב (למשל יום שלישי הבא).\n\n'
+        '• תאריכים יחסיים ("מחר", "מחרתיים", "יום ראשון הבא") — חשב לפי הזמן הנוכחי.\n'
+        '• פורמט תאריך עברי הוא יום/חודש: "15/06" או "ב-15 ביוני".\n'
+        '• אירועי יום שלם (כמו חופשה 10.9 עד 11.9): קבע is_all_day=true, והזן את start_time ו-end_time בהתאמה לתאריכים שצוינו.\n'
+        '• שעה: "10" או "ב-10" פירושו 10:00. "8 וחצי" = 08:30.\n'
+        '• טווח שעות כמו "10-12" = התחלה ב-10:00 ומשך 120 דקות. "למשך שעתיים" = duration_minutes=120.\n\n'
+        '⚠️ אזהרה קריטית - יומן: לעולם, בשום מצב, אל תייצר בעצמך הודעת "האירוע נוצר בהצלחה" או קישורים ליומן. '
+        'הדרך היחידה לקבוע אירוע היא אך ורק דרך קריאה לפונקציה create_calendar_event. הבוט כבר יחזיר למשתמש את הקישור האמיתי.\n\n'
+        'אירועים חוזרים:\n'
+        '• "כל שבוע", "באופן קבוע", "כל יום שלישי" — זה אירוע חוזר: '
+        'קרא ל-create_calendar_event פעם אחת בלבד עם recurrence מתאים. '
+        'לעולם אל תיצור כמה אירועים נפרדים בכמה קריאות.\n\n'
         'משימות:\n'
-        '• אם המשתמש סיים/מחק כמה משימות — העבר את כולן ב-task_queries '
-        'בקריאה אחת. "סיימתי הכל" → all=true.\n\n'
+        '• אם המשתמש סיים/מחק כמה משימות — העבר את כולן ב-task_queries בקריאה אחת.\n\n'
         'כסף:\n'
-        '• ביטול/מחיקה/תיקון של רישום כספי — קרא ל-delete_expense '
-        '("בטל את ההוצאה האחרונה" → last=true).\n'
-        '• חיסכון: "חסכתי 500" / "שמתי 500 בצד / בחיסכון" → add_expense עם '
-        'category="חיסכון" (הפרשה לחיסכון — לא הוצאה רגילה).\n\n'
-        'צבע אירוע: רק אם המשתמש ביקש צבע מסוים ("בצבע אדום", "תעשה את זה ירוק") '
-        '— העבר את הפרמטר color ב-create_calendar_event. אחרת אל תעביר אותו כלל.\n\n'
-        'שיחה רב-תורית (חשוב מאוד!):\n'
-        '• ההודעות הקודמות בשיחה ניתנות לך. אם בהודעה הנוכחית חסר פרט (כותרת, '
-        'תאריך או שעה) אבל הוא כבר הופיע קודם בשיחה — קח אותו מההיסטוריה ובצע את '
-        'הפעולה. אל תשאל שוב על מה שכבר נאמר.\n'
-        '• ברגע שיש לך מספיק מידע — בצע מיד. אל תשאל שאלות מיותרות. אם חסר רק '
-        'פרט קטן, השתמש בברירת מחדל סבירה במקום לשאול.\n\n'
-        'כשהמשתמש מבקש פעולה (הוצאה, משימה, אירוע, שאילתה) — קרא לכלי המתאים. '
-        'מותר וכדאי לקרוא לכמה כלים בהודעה אחת אם המשתמש ביקש כמה דברים שונים '
-        '(למשל גם לקבוע פגישה וגם להוסיף משימה).\n'
-        'אם המשתמש רק משוחח, שואל שאלה כללית או אומר שלום — ענה בטקסט קצר '
-        'וחביב בלי לקרוא לכלי. תמיד תן תשובה כלשהי — לעולם אל תשתוק.'
+        '• חיסכון: "חסכתי 500" → add_expense עם category="חיסכון".\n\n'
+        'כשהמשתמש מבקש פעולה, קרא לכלי המתאים. מותר לקרוא לכמה כלים יחד. '
+        'אם המשתמש רק משוחח, ענה בטקסט חביב.'
     )
 
 
@@ -1906,21 +1902,31 @@ def _tool_add_task(args: dict, user_id: str) -> str:
 
 
 def _tool_create_event(args: dict, user_id: str) -> str:
+    # כאן אנחנו מתעדים את מה שהמודל החליט לשלוח, כדי שנוכל לחקור תקלות בעתיד
+    logger.info("create_calendar_event called with args: %s", args)
+    
     title          = (args.get('title') or 'אירוע').strip()
     start_time_iso = args.get('start_time')
     if not start_time_iso:
         return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
-    location = (args.get('location') or '').strip() or None
+    
+    end_time_iso = args.get('end_time')
+    is_all_day   = bool(args.get('is_all_day', False))
+    location     = (args.get('location') or '').strip() or None
+    
     try:
         duration = int(args.get('duration_minutes') or 60)
     except (TypeError, ValueError):
         duration = 60
     if duration <= 0:
         duration = 60
-    recurrence = args.get('recurrence')   # [r6] recurring events
-    color = args.get('color')             # [NEW] optional event colour
+        
+    recurrence = args.get('recurrence')
+    color = args.get('color')
+    
+    # מעבירים את הנתונים החדשים לפונקציה המרכזית שבונה את האירוע בגוגל
     return process_calendar_ai(title, start_time_iso, location, user_id,
-                               duration, recurrence, color)
+                               duration, recurrence, color, end_time_iso, is_all_day)
 
 
 def _collect_task_queries(args: dict) -> list[str]:
