@@ -37,33 +37,21 @@ body{font-family:'Heebo',sans-serif;background:var(--bg);color:var(--text);min-h
 button{cursor:pointer;border:none;background:none;font:inherit;color:inherit}
 input,select{font:inherit;color:var(--text)}
 
-/* ─── Header ─── */
-.hdr{
-  background:var(--surface);border-bottom:1px solid var(--border);
-  padding:.75rem 1.5rem;display:flex;align-items:center;gap:.875rem;
-  position:sticky;top:0;z-index:100;box-shadow:var(--sh-sm);
-}
+.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:.75rem 1.5rem;display:flex;align-items:center;gap:.875rem;position:sticky;top:0;z-index:100;box-shadow:var(--sh-sm);}
 .logo{display:flex;align-items:center;gap:.5rem;font-size:1.1rem;font-weight:800;letter-spacing:-.02em}
 .logo-icon{width:32px;height:32px;background:var(--primary);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1rem}
 .spacer{flex:1}
-.badge{
-  display:flex;align-items:center;gap:.375rem;font-size:.78rem;color:var(--muted);
-  background:var(--surface-off);padding:.3rem .7rem;border-radius:999px;border:1px solid var(--border);
-}
+.badge{display:flex;align-items:center;gap:.375rem;font-size:.78rem;color:var(--muted);background:var(--surface-off);padding:.3rem .7rem;border-radius:999px;border:1px solid var(--border);}
 .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex-shrink:0;transition:background .3s}
 .badge.ok .dot{background:var(--success);box-shadow:0 0 0 2px var(--success-hl)}
 .badge.err .dot{background:var(--error)}
 .badge.loading .dot{background:var(--gold);animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.icon-btn{
-  width:34px;height:34px;border-radius:7px;display:flex;align-items:center;justify-content:center;
-  color:var(--muted);transition:background .15s,color .15s;flex-shrink:0;
-}
+.icon-btn{width:34px;height:34px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:background .15s,color .15s;flex-shrink:0;}
 .icon-btn:hover{background:var(--surface-off);color:var(--text)}
-#btnRefresh svg{transition:transform .6s ease}
-#btnRefresh.spin svg{transform:rotate(360deg)}
+#btnRefresh.spin svg{transform:rotate(360deg);transition:transform .6s ease}
 
-/* ─── Modal & Tabs ─── */
+/* Modals */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:flex;align-items:center;justify-content:center;padding:1rem;backdrop-filter:blur(6px)}
 .overlay.hide{display:none}
 .modal{background:var(--surface);border-radius:14px;padding:1.75rem;width:100%;max-width:440px;box-shadow:var(--sh-lg);border:1px solid var(--border);position:relative}
@@ -72,33 +60,24 @@ input,select{font:inherit;color:var(--text)}
 .modal h2{font-size:1.2rem;font-weight:700;margin-bottom:.25rem}
 .modal .sub{color:var(--muted);font-size:.875rem;margin-bottom:1.5rem}
 
-.tabs{display:flex;gap:10px;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:10px}
-.tab-btn{flex:1;padding:8px;font-size:.9rem;font-weight:600;color:var(--muted);text-align:center;border-radius:8px;transition:.2s}
+.tabs{display:flex;gap:6px;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:10px;overflow-x:auto}
+.tab-btn{flex:1;padding:8px 4px;font-size:.85rem;font-weight:600;color:var(--muted);text-align:center;border-radius:8px;transition:.2s;white-space:nowrap}
 .tab-btn.active{background:var(--primary-hl);color:var(--primary)}
 .tab-content{display:none}
 .tab-content.active{display:block}
 
 .f-group{margin-bottom:.875rem}
 .f-group label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase;letter-spacing:.04em}
-.f-group input, .f-group select{
-  width:100%;padding:.7rem .875rem;border:1px solid var(--border);border-radius:8px;
-  background:var(--surface-2);font-size:.95rem;
-  transition:border-color .15s,box-shadow .15s;
-}
+.f-group input, .f-group select{width:100%;padding:.7rem .875rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);font-size:.95rem;transition:border-color .15s,box-shadow .15s;}
 .f-group input:focus, .f-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-hl)}
-.btn-cta{
-  width:100%;margin-top:1rem;padding:.8rem;background:var(--primary);color:#fff;border-radius:8px;
-  font-size:1rem;font-weight:700;transition:background .15s,transform .1s;
-}
+.btn-cta{width:100%;margin-top:1rem;padding:.8rem;background:var(--primary);color:#fff;border-radius:8px;font-size:1rem;font-weight:700;transition:background .15s,transform .1s;}
 .btn-cta:hover{background:var(--primary-h)}
 .btn-cta:active{transform:scale(.98)}
 
-/* ─── Main & Grid ─── */
 .main{padding:1.5rem;max-width:1280px;margin:0 auto;width:100%}
 @media(max-width:600px){.main{padding:1rem .875rem}}
 .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.875rem;margin-bottom:1.75rem}
 .kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.25rem;box-shadow:var(--sh-sm);transition:box-shadow .15s}
-.kpi:hover{box-shadow:var(--sh-md)}
 .kpi-lbl{font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.375rem}
 .kpi-val{font-size:1.65rem;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
 .kpi-sub{font-size:.75rem;color:var(--muted);margin-top:.3rem}
@@ -106,13 +85,11 @@ input,select{font:inherit;color:var(--text)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.125rem;margin-bottom:1.75rem}
 @media(max-width:860px){.grid2{grid-template-columns:1fr}}
 
-/* ─── Cards ─── */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.25rem;box-shadow:var(--sh-sm)}
 .card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
 .card-title{font-size:.9rem;font-weight:700}
 .card-meta{font-size:.75rem;color:var(--muted)}
 
-/* ─── Budget bars ─── */
 .b-list{display:flex;flex-direction:column;gap:.7rem}
 .b-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.25rem}
 .b-cat{font-size:.85rem;font-weight:600;display:flex;align-items:center;gap:6px}
@@ -122,18 +99,12 @@ input,select{font:inherit;color:var(--text)}
 .b-track{height:6px;background:var(--surface-off);border-radius:3px;overflow:hidden}
 .b-fill{height:100%;border-radius:3px;transition:width .7s cubic-bezier(.16,1,.3,1)}
 
-/* ─── Chart ─── */
 .chart-wrap{height:210px;position:relative;margin-top:.25rem}
 
-/* ─── Tasks & Lists ─── */
 .list-cont{display:flex;flex-direction:column;gap:.4rem;max-height:320px;overflow-y:auto;padding-right:2px}
 .list-cont::-webkit-scrollbar{width:3px}
 .list-cont::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.l-item{
-  display:flex;align-items:center;gap:.625rem;padding:.55rem .7rem;
-  border-radius:8px;border:1px solid var(--divider);background:var(--surface-2);
-  transition:background .12s;
-}
+.l-item{display:flex;align-items:center;gap:.625rem;padding:.55rem .7rem;border-radius:8px;border:1px solid var(--divider);background:var(--surface-2);transition:background .12s;}
 .l-item:hover{background:var(--surface-off)}
 .t-cb{width:17px;height:17px;border:1.5px solid var(--border);border-radius:4px;cursor:pointer;transition:.12s}
 .t-cb:hover{border-color:var(--primary);background:var(--primary-hl)}
@@ -149,18 +120,11 @@ input,select{font:inherit;color:var(--text)}
 .l-item:hover .del-btn{opacity:1}
 .del-btn:hover{color:var(--error)}
 
-/* ─── FAB (Floating Action Button) ─── */
-.fab{
-  position:fixed;bottom:2rem;left:2rem;width:56px;height:56px;border-radius:50%;
-  background:var(--primary);color:#fff;font-size:1.8rem;display:flex;align-items:center;justify-content:center;
-  box-shadow:var(--sh-lg);cursor:pointer;transition:transform .2s,background .2s;z-index:90;
-}
+.fab{position:fixed;bottom:2rem;left:2rem;width:56px;height:56px;border-radius:50%;background:var(--primary);color:#fff;font-size:1.8rem;display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-lg);cursor:pointer;transition:transform .2s,background .2s;z-index:90;}
 .fab:hover{transform:scale(1.05);background:var(--primary-h)}
 
-/* ─── Utils ─── */
 .empty{display:flex;flex-direction:column;align-items:center;padding:1.75rem 1rem;color:var(--muted);gap:.5rem;text-align:center}
 .empty svg{opacity:.3}
-.empty p{font-size:.83rem}
 @keyframes sh{0%{background-position:-200% 0}100%{background-position:200% 0}}
 .sk{background:linear-gradient(90deg,var(--surface-off) 25%,var(--surface-dyn) 50%,var(--surface-off) 75%);background-size:200% 100%;animation:sh 1.4s ease-in-out infinite;border-radius:6px}
 .toasts{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:.5rem;pointer-events:none;align-items:center}
@@ -187,7 +151,6 @@ input,select{font:inherit;color:var(--text)}
   </button>
 </header>
 
-<!-- Config Modal -->
 <div class="overlay hide" id="cfgModal">
   <div class="modal">
     <button class="modal-close" onclick="closeCfgModal()">✕</button>
@@ -200,56 +163,59 @@ input,select{font:inherit;color:var(--text)}
   </div>
 </div>
 
-<!-- Add/Action Modal -->
+<!-- Modal הפלוס המרכזי עם טאב התקציב החדש -->
 <div class="overlay hide" id="addModal">
   <div class="modal">
     <button class="modal-close" onclick="closeAddModal()">✕</button>
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">💸 הוצאה</button>
-      <button class="tab-btn" onclick="switchTab('rec')" id="tab-btn-rec">🗓️ מינוי</button>
+      <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">💸 תנועה</button>
+      <button class="tab-btn" onclick="switchTab('bud')" id="tab-btn-bud">📊 תקציב</button>
+      <button class="tab-btn" onclick="switchTab('rec')" id="tab-btn-rec">🗓️ קבוע</button>
       <button class="tab-btn" onclick="switchTab('tsk')" id="tab-btn-tsk">✅ משימה</button>
     </div>
     
-    <!-- Expense Tab -->
     <div class="tab-content active" id="tab-exp">
-      <div class="f-group">
-        <label>קטגוריה</label>
-        <select id="eCat">
-          <option value="מזון">🍔 מזון</option><option value="רכב">🚗 רכב</option><option value="דיור">🏠 דיור</option>
-          <option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="בילויים">🎉 בילויים</option>
-          <option value="קניות">🛒 קניות</option><option value="נופש">✈️ נופש</option><option value="הכנסה">💰 הכנסה</option>
-        </select>
-      </div>
+      <div class="f-group"><label>קטגוריה</label><select id="eCat"><option value="מזון">🍔 מזון</option><option value="רכב">🚗 רכב</option><option value="דיור">🏠 דיור</option><option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="בילויים">🎉 בילויים</option><option value="קניות">🛒 קניות</option><option value="נופש">✈️ נופש</option><option value="הכנסה">💰 הכנסה</option></select></div>
       <div class="f-group"><label>סכום (₪)</label><input type="number" id="eAmt" placeholder="0"></div>
       <div class="f-group"><label>תיאור</label><input type="text" id="eDesc" placeholder="למשל: סופר"></div>
       <button class="btn-cta" onclick="addExp()">הוסף תנועה</button>
     </div>
 
-    <!-- Recurring Tab -->
-    <div class="tab-content" id="tab-rec">
+    <!-- Budget Tab (החדש והמעוצב) -->
+    <div class="tab-content" id="tab-bud">
+      <p class="sub" style="margin-bottom: 1rem;">הגדר את יעד ההוצאות או החיסכון החודשי שלך.</p>
       <div class="f-group">
-        <label>קטגוריה</label>
-        <select id="rCat">
-          <option value="בילויים">🎉 בילויים</option><option value="דיור">🏠 דיור</option><option value="רכב">🚗 רכב</option>
-          <option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="הכנסה">💰 הכנסה קבועה</option>
+        <label>בחר קטגוריה</label>
+        <select id="bCat">
+          <option value="מזון">🍔 מזון</option>
+          <option value="רכב">🚗 רכב</option>
+          <option value="דיור">🏠 דיור</option>
+          <option value="בריאות">💊 בריאות</option>
+          <option value="חינוך">📚 חינוך</option>
+          <option value="בילויים">🎉 בילויים</option>
+          <option value="קניות">🛒 קניות</option>
+          <option value="נופש">✈️ נופש</option>
+          <option value="חיסכון">🐷 חיסכון</option>
         </select>
       </div>
+      <div class="f-group">
+        <label>יעד חודשי (₪)</label>
+        <input type="number" id="bAmt" placeholder="למשל: 1500 (הקלד 0 לביטול היעד)" min="0">
+      </div>
+      <button class="btn-cta" onclick="saveBudgetLimit()">שמור יעד תקציב</button>
+    </div>
+
+    <div class="tab-content" id="tab-rec">
+      <div class="f-group"><label>קטגוריה</label><select id="rCat"><option value="בילויים">🎉 בילויים</option><option value="דיור">🏠 דיור</option><option value="רכב">🚗 רכב</option><option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="הכנסה">💰 הכנסה קבועה</option></select></div>
       <div class="f-group"><label>סכום (₪)</label><input type="number" id="rAmt" placeholder="0"></div>
       <div class="f-group"><label>יום חיוב בחודש (1-31)</label><input type="number" id="rDay" placeholder="למשל: 10" min="1" max="31"></div>
       <div class="f-group"><label>תיאור העסק</label><input type="text" id="rDesc" placeholder="למשל: נטפליקס"></div>
       <button class="btn-cta" onclick="addRecurring()">שמור הוראת קבע</button>
     </div>
 
-    <!-- Task Tab -->
     <div class="tab-content" id="tab-tsk">
       <div class="f-group"><label>תיאור המשימה</label><input type="text" id="newTDesc"></div>
-      <div class="f-group">
-        <label>דחיפות</label>
-        <select id="newTQ">
-          <option value="חשוב דחוף">🔴 חשוב דחוף</option><option value="חשוב לא דחוף" selected>🟡 חשוב לא דחוף</option>
-          <option value="דחוף לא חשוב">🟠 דחוף לא חשוב</option><option value="לא דחוף לא חשוב">🟢 לא חשוב</option>
-        </select>
-      </div>
+      <div class="f-group"><label>דחיפות</label><select id="newTQ"><option value="חשוב דחוף">🔴 חשוב דחוף</option><option value="חשוב לא דחוף" selected>🟡 חשוב לא דחוף</option><option value="דחוף לא חשוב">🟠 דחוף לא חשוב</option><option value="לא דחוף לא חשוב">🟢 לא חשוב</option></select></div>
       <button class="btn-cta" onclick="addTask()">הוסף משימה</button>
     </div>
   </div>
@@ -282,9 +248,7 @@ input,select{font:inherit;color:var(--text)}
     </div>
     <div class="card">
       <div class="card-hdr"><div class="card-title">🗓️ מינויים והוראות קבע</div></div>
-      <div class="list-cont" id="recList">
-        <div class="empty"><p>בקרוב: מינויים יוצגו כאן!</p></div>
-      </div>
+      <div class="list-cont" id="recList"><div class="empty"><p>בקרוב: מינויים יוצגו כאן!</p></div></div>
     </div>
   </div>
   
@@ -312,7 +276,6 @@ let pieChart = null;
 
 function toggleTheme(){const h=document.documentElement;h.setAttribute('data-theme',h.getAttribute('data-theme')==='dark'?'light':'dark');}
 
-// ── Modals & Tabs ──
 function openCfgModal(){document.getElementById('cfgUrl').value=C.url;document.getElementById('cfgKey').value=C.key;document.getElementById('cfgUser').value=C.userId;document.getElementById('cfgModal').classList.remove('hide');}
 function closeCfgModal(){document.getElementById('cfgModal').classList.add('hide')}
 function openAddModal(){document.getElementById('addModal').classList.remove('hide');}
@@ -351,7 +314,6 @@ async function load(){
   try{
     const d=await api('/api/dashboard');
     renderKPIs(d); renderBudget(d); renderPie(d); renderTasks(d); renderTx(d);
-    // TODO: renderRecurring(d) will be added here once backend is ready
     setBadge('ok','מחובר ✓'); document.getElementById('main').style.display='';
   }catch(e){
     setBadge('err','שגיאה');document.getElementById('errBanner').classList.add('show');document.getElementById('errMsg').textContent=e.message;toast('❌ '+e.message);
@@ -360,7 +322,6 @@ async function load(){
 
 function setBadge(s,t){document.getElementById('badge').className='badge'+(s==='ok'?' ok':s==='err'?' err':s==='loading'?' loading':'');document.getElementById('badgeTxt').textContent=t;}
 
-// ── Render ──
 function renderKPIs(d){
   const txs=d.transactions||[]; let inc=0,exp=0;
   txs.forEach(t=>{t.amount>0?inc+=t.amount:exp+=Math.abs(t.amount)});
@@ -408,31 +369,19 @@ function renderPie(d){
 function renderTasks(d){
   const el=document.getElementById('tList'); const tasks=d.tasks||[];
   if(!tasks.length){el.innerHTML='<div class="empty"><p>אין משימות פתוחות 🎉</p></div>';return;}
-  el.innerHTML=tasks.map(t=>`<div class="l-item" id="ti${t.id}">
-    <div class="t-cb" onclick="doneTask(${t.id})" title="סמן כהושלם"></div>
-    <span class="t-txt">${esc(t.description)}</span><span class="t-q ${QC[t.quadrant]||'q2'}">${t.quadrant}</span>
-    <button class="del-btn" onclick="delTask(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/></svg></button>
-  </div>`).join('');
+  el.innerHTML=tasks.map(t=>`<div class="l-item" id="ti${t.id}"><div class="t-cb" onclick="doneTask(${t.id})"></div><span class="t-txt">${esc(t.description)}</span><span class="t-q ${QC[t.quadrant]||'q2'}">${t.quadrant}</span><button class="del-btn" onclick="delTask(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/></svg></button></div>`).join('');
 }
 
 function renderTx(d){
   const el=document.getElementById('txList'); const txs=d.transactions||[];
   if(!txs.length){el.innerHTML='<div class="empty"><p>אין תנועות החודש</p></div>';return;}
-  el.innerHTML=txs.map(t=>`<div class="l-item" id="tx${t.id}">
-    <span class="tx-em">${EMO[t.category]||'💵'}</span>
-    <div class="tx-info"><div class="tx-desc">${esc(t.description||t.category)}</div><div class="tx-meta">${t.category} · ${t.date}</div></div>
-    <span class="tx-amt ${t.amount>0?'p':'n'}">${t.amount>0?'+':''}${fmt(t.amount)}</span>
-    <button class="del-btn" onclick="delExp(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-  </div>`).join('');
+  el.innerHTML=txs.map(t=>`<div class="l-item" id="tx${t.id}"><span class="tx-em">${EMO[t.category]||'💵'}</span><div class="tx-info"><div class="tx-desc">${esc(t.description||t.category)}</div><div class="tx-meta">${t.category} · ${t.date}</div></div><span class="tx-amt ${t.amount>0?'p':'n'}">${t.amount>0?'+':''}${fmt(t.amount)}</span><button class="del-btn" onclick="delExp(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>`).join('');
 }
 
-// ── Actions ──
 async function addTask(){
   const desc=document.getElementById('newTDesc').value.trim(), quad=document.getElementById('newTQ').value;
   if(!desc){toast('⚠️ הכנס תיאור');return;}
-  try{await api('/api/tasks','POST',{user_id:C.userId,description:desc,quadrant:quad});
-    document.getElementById('newTDesc').value=''; closeAddModal(); toast('✅ משימה נוספה'); await load();
-  }catch(e){toast('❌ '+e.message);}
+  try{await api('/api/tasks','POST',{user_id:C.userId,description:desc,quadrant:quad});document.getElementById('newTDesc').value=''; closeAddModal(); toast('✅ משימה נוספה'); await load();}catch(e){toast('❌ '+e.message);}
 }
 
 async function doneTask(id){try{document.getElementById('ti'+id).style.opacity='.35';await api(`/api/tasks/${id}/complete?user_id=${encodeURIComponent(C.userId)}`,'PATCH');toast('🎉 הושלם!');await load();}catch(e){toast('❌ '+e.message);}}
@@ -442,28 +391,38 @@ async function delExp(id){try{document.getElementById('tx'+id).style.opacity='.3
 async function addExp(){
   const cat=document.getElementById('eCat').value, amt=parseFloat(document.getElementById('eAmt').value), desc=document.getElementById('eDesc').value.trim()||cat;
   if(!amt||amt<=0){toast('⚠️ הכנס סכום');return;}
+  try{await api('/api/expense','POST',{user_id:C.userId,category:cat,amount:amt,description:desc});document.getElementById('eAmt').value='';document.getElementById('eDesc').value=''; closeAddModal(); toast('✅ נרשם'); await load();}catch(e){toast('❌ '+e.message);}
+}
+
+async function addRecurring(){toast('🔄 שומר הוראת קבע (השרת יעודכן בקרוב)...');closeAddModal();}
+
+// הפונקציה החדשה שמקפיצה את המודל המעוצב במקום ה-prompt המיושן
+function editBudget(cat){
+  switchTab('bud');
+  const sel = document.getElementById('bCat');
+  if([...sel.options].some(o => o.value === cat)){ sel.value = cat; }
+  document.getElementById('bAmt').value = '';
+  openAddModal();
+}
+
+// הפונקציה ששומרת בפועל למסד הנתונים את התקציב
+async function saveBudgetLimit(){
+  const cat = document.getElementById('bCat').value;
+  const amt = parseFloat(document.getElementById('bAmt').value);
+  if(isNaN(amt) || amt < 0){ toast('⚠️ הכנס סכום חוקי'); return; }
+  
+  toast('⏳ מעדכן...');
   try{
-    await api('/api/expense','POST',{user_id:C.userId,category:cat,amount:amt,description:desc});
-    document.getElementById('eAmt').value='';document.getElementById('eDesc').value=''; closeAddModal(); toast('✅ נרשם'); await load();
-  }catch(e){toast('❌ '+e.message);}
+    await api('/api/budget-limits', 'PUT', {[cat]: amt});
+    document.getElementById('bAmt').value = '';
+    closeAddModal();
+    toast(`✅ תקציב ${cat} עודכן!`);
+    await load();
+  }catch(e){
+    toast('❌ ' + e.message);
+  }
 }
 
-// Stub for recurring
-async function addRecurring(){
-  toast('🔄 שומר הוראת קבע (השרת יעודכן בקרוב)...');
-  closeAddModal();
-}
-
-async function editBudget(cat){
-  const val = prompt(`הגדר יעד תקציב חדש עבור ${cat}:\n(הקלד 0 כדי לבטל את היעד)`);
-  if(val === null) return;
-  const num = parseFloat(val);
-  if(isNaN(num) || num < 0){ toast('⚠️ סכום לא חוקי'); return; }
-  toast('⏳ מעדכן תקציב (דורש עדכון שרת)...');
-  // TODO: Add API call to update budget limit
-}
-
-// ── Helpers ──
 function fmt(n){return(n<0?'-':'')+'₪'+Math.round(Math.abs(n)).toLocaleString('he-IL')}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function toast(msg){const c=document.getElementById('toasts'),t=document.createElement('div');t.className='toast';t.textContent=msg;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},3000);}
