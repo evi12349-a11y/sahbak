@@ -2142,6 +2142,7 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
         'show_transactions':      _tool_show_transactions,
         'add_task':               _tool_add_task,
         'create_calendar_event':  _tool_create_event,
+        'delete_calendar_event':  _tool_delete_event,  # <-- השורה החדשה שהוספנו
         'complete_task':          _tool_complete_task,
         'delete_task':            _tool_delete_task,
         'set_budget_limit':       _tool_set_limit,
