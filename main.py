@@ -1203,6 +1203,62 @@ def process_calendar_ai(title: str, start_time_iso: str,
         return ('שגיאה ביצירת אירוע. ודא שהיומן שלך משותף עם חשבון השירות '
                 'עם הרשאת עריכה.')
 
+def delete_calendar_event_ai(query: str, date_iso: str | None, user_id: str) -> str:
+    cal_id = calendar_id_for(user_id)
+    if not cal_id:
+        return '❌ לא מחובר יומן אישי. אי אפשר למחוק אירועים.'
+
+    service = get_calendar_service()
+    if not service:
+        return 'שגיאת התחברות ליומן גוגל.'
+
+    time_min, time_max = None, None
+    if date_iso:
+        try:
+            # ניקח את תחילת היום וסוף היום של התאריך המבוקש
+            dt = datetime.fromisoformat(date_iso[:10])
+            if LOCAL_TZ:
+                dt = dt.replace(tzinfo=LOCAL_TZ)
+            time_min = dt.isoformat()
+            time_max = (dt + timedelta(days=1)).isoformat()
+        except Exception:
+            pass
+
+    try:
+        logger.info("Searching calendar for deletion: query='%s'", query)
+        events_result = call_with_retry(
+            lambda: service.events().list(
+                calendarId=cal_id, q=query, timeMin=time_min, timeMax=time_max,
+                singleEvents=True, orderBy='startTime', maxResults=5
+            ).execute(),
+            what='Calendar search for delete', max_attempts=3, base_delay=0.6, max_total=6.0
+        )
+        events = events_result.get('items', [])
+        
+        if not events:
+            return f'לא מצאתי ביומן אירוע שעונה לתיאור "{query}".'
+        
+        # נמחק את התוצאה הראשונה (הכי קרובה/מתאימה)
+        event_to_delete = events[0]
+        event_id = event_to_delete['id']
+        event_summary = event_to_delete.get('summary', query)
+        
+        call_with_retry(
+            lambda: service.events().delete(calendarId=cal_id, eventId=event_id).execute(),
+            what='Calendar delete event', max_attempts=3, base_delay=0.6, max_total=6.0
+        )
+        
+        return f'🗑️ האירוע "*{event_summary}*" נמחק מהיומן בהצלחה.'
+        
+    except HttpError as e:
+        status = _http_status(e)
+        logger.exception('Calendar delete failed (status=%s)', status)
+        if status == 403:
+            return '❌ יש לי גישה ליומן אבל אין לי הרשאת מחיקה. ודא שהיומן משותף בהרשאת "ביצוע שינויים".'
+        return f'שגיאה במחיקת האירוע מול גוגל (קוד {status}).'
+    except Exception:
+        logger.exception('Calendar delete completely failed')
+        return 'שגיאה כללית במחיקת האירוע.'
 
 def _admin_check_calendar(target_phone: str) -> str:
     """[r6] Live diagnostic: verify we can READ and WRITE the calendar mapped
@@ -1499,6 +1555,24 @@ def _build_tools() -> list:
                 },
                 'required': ['title', 'start_time'],
             },
+        ),
+        _make_function_declaration(
+            'delete_calendar_event',
+            'מחיקת אירוע מיומן גוגל. השתמש כשהמשתמש מבקש לבטל, למחוק או להסיר אירוע/פגישה/אימון מהיומן.',
+            {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'מילות חיפוש מתוך כותרת האירוע (למשל "אימון", "רופא").',
+                    },
+                    'date': {
+                        'type': 'string',
+                        'description': 'תאריך האירוע בפורמט ISO 8601, אם צוין (למשל "2026-08-30"). השמט אם לא צוין.',
+                    },
+                },
+                'required': ['query'],
+            }
         ),
         _make_function_declaration(
             'complete_task',
@@ -1928,7 +2002,13 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     return process_calendar_ai(title, start_time_iso, location, user_id,
                                duration, recurrence, color, end_time_iso, is_all_day)
 
-
+def _tool_delete_event(args: dict, user_id: str) -> str:
+    query = (args.get('query') or '').strip()
+    date_iso = args.get('date')
+    if not query:
+        return 'איזה אירוע תרצה שאמחק?'
+    return delete_calendar_event_ai(query, date_iso, user_id)
+  
 def _collect_task_queries(args: dict) -> list[str]:
     """[r6] Gather task search terms from either the new list parameter or
     the legacy single-string parameter."""
