@@ -884,6 +884,29 @@ def delete_expense_by_id(expense_id: int, user_id: str) -> dict | None:
     return {'id': row[0], 'category': row[1], 'amount': row[2],
             'date': row[3], 'description': row[4] or row[1]}
 
+def update_expense_category_by_id(expense_id: int, new_category: str, user_id: str) -> dict | None:
+    """[r6] Update the category of an existing transaction (scoped to the user)."""
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT id, amount, date, description FROM budget '
+            'WHERE id = ? AND user_id = ?',
+            (expense_id, user_id)
+        ).fetchone()
+        if not row:
+            return None
+            
+        old_amount = row[1]
+        # שומרים על הסימן הנכון (הוצאה = שלילי, הכנסה/חיסכון = חיובי)
+        signed_amt = abs(old_amount) if new_category in POSITIVE_CATEGORIES else -abs(old_amount)
+
+        conn.execute(
+            'UPDATE budget SET category = ?, amount = ? WHERE id = ? AND user_id = ?',
+            (new_category, signed_amt, expense_id, user_id)
+        )
+        conn.commit()
+        
+    return {'id': row[0], 'category': new_category, 'amount': signed_amt,
+            'date': row[2], 'description': row[3]}
 
 def _format_tx(t: dict) -> str:
     """One transaction as a short Hebrew line: [id] emoji desc: ±amt (dd/mm)."""
@@ -1483,6 +1506,29 @@ def _build_tools() -> list:
             },
         ),
         _make_function_declaration(
+            'update_expense_category',
+            'עדכון או שינוי קטגוריה להוצאה/הכנסה שכבר נרשמה. השתמש כשהמשתמש מתקן אותך (למשל "זה לא קניות זה מזון", "תשנה את ההוצאה האחרונה לבילויים").',
+            {
+                'type': 'object',
+                'properties': {
+                    'new_category': {
+                        'type': 'string',
+                        'enum': VALID_CATEGORIES,
+                        'description': 'הקטגוריה החדשה והנכונה.',
+                    },
+                    'last': {
+                        'type': 'boolean',
+                        'description': 'true אם המשתמש מתייחס לפעולה האחרונה.',
+                    },
+                    'query': {
+                        'type': 'string',
+                        'description': 'מילות חיפוש מתוך התיאור של ההוצאה (למשל "וולט", "זארה").',
+                    },
+                },
+                'required': ['new_category'],
+            },
+        ),
+        _make_function_declaration(
             'show_transactions',
             'הצגת התנועות הכספיות האחרונות של החודש (הוצאות והכנסות) עם '
             'המספרים שלהן. השתמש כשהמשתמש מבקש לראות תנועות, רישומים אחרונים, '
@@ -1952,7 +1998,37 @@ def _tool_delete_expense(args: dict, user_id: str) -> str:
     msg += '\n(או "ביטול")'
     return msg
 
+def _tool_update_expense_category(args: dict, user_id: str) -> str:
+    txs = get_recent_transactions(user_id, 15)
+    if not txs:
+        return 'אין תנועות החודש לעדכון.'
 
+    cat = (args.get('new_category') or '').strip()
+    if cat not in BUDGET_CATEGORIES_HE:
+        return f'קטגוריה לא מוכרת: "{cat}".\nקטגוריות: {", ".join(VALID_CATEGORIES)}'
+
+    query = (args.get('query') or '').strip()
+    last = bool(args.get('last'))
+
+    target_id = None
+    if last and not query:
+        target_id = txs[0]['id']
+    elif query:
+        ql = query.lower()
+        # מוצאים את התנועה האחרונה שמתאימה למילת החיפוש
+        matches = [t for t in txs if ql in (t['description'] or '').lower() or ql in t['category'].lower()]
+        if matches:
+            target_id = matches[0]['id']
+    else:
+        target_id = txs[0]['id']
+
+    if target_id:
+        row = update_expense_category_by_id(target_id, cat, user_id)
+        if row:
+            return f'✅ סווג מחדש בהצלחה:\n{_format_tx(row)}'
+        return 'לא הצלחתי לעדכן את התנועה.'
+
+    return 'לא מצאתי תנועה מתאימה לעדכון. נסה לפרט (למשל "תשנה את זארה לקניות").'
 def _tool_show_transactions(args: dict, user_id: str) -> str:
     txs = get_recent_transactions(user_id, 10)
     if not txs:
@@ -2139,6 +2215,7 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
     handlers = {
         'add_expense':            _tool_add_expense,
         'delete_expense':         _tool_delete_expense,
+        'update_expense_category': _tool_update_expense_category,
         'show_transactions':      _tool_show_transactions,
         'add_task':               _tool_add_task,
         'create_calendar_event':  _tool_create_event,
