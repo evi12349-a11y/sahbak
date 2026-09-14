@@ -1639,14 +1639,6 @@ ROUTER_TOOLS = [
 ]
 
 
-# Build once at import — declarations are static.
-_TOOLS = None
-def _get_tools():
-    global _TOOLS
-    if _TOOLS is None:
-        _TOOLS = _build_tools()
-    return _TOOLS
-
 
 def _gemini_version(model: str) -> tuple[int, int]:
     """(major, minor) of a Gemini model name: 'gemini-2.5-flash' → (2, 5),
@@ -1695,16 +1687,6 @@ def _build_generate_config(model: str, **kwargs):
         except Exception:
             pass
     return types.GenerateContentConfig(**kwargs)
-
-
-def _router_config(model: str):
-    return _build_generate_config(
-        model,
-        system_instruction=_system_instruction(),
-        tools=_get_tools(),
-        temperature=0.0,        # deterministic routing
-        max_output_tokens=1024, # hard cap — a runaway repetition loop can't fill
-    )                           # the bubble; router output is a tool call / short text
 
 
 def _generate_with_fallback(build_call, *, what: str,
@@ -1847,15 +1829,18 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
     contents = _build_contents(text, history)
 
     # 1. הפעלת סוכן הניתוב (Router)
-    router_config = types.GenerateContentConfig(
-        system_instruction=_get_agent_prompt('router'),
-        tools=[types.Tool(function_declarations=ROUTER_TOOLS)],
-        temperature=0.0
-    )
-    
     try:
         router_resp = _generate_with_fallback(
-            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=router_config),
+            lambda mdl: client.models.generate_content(
+                model=mdl, 
+                contents=contents, 
+                config=_build_generate_config(
+                    mdl,
+                    system_instruction=_get_agent_prompt('router'),
+                    tools=[types.Tool(function_declarations=ROUTER_TOOLS)],
+                    temperature=0.0
+                )
+            ),
             what='Gemini (Router)'
         )
     except Exception:
@@ -1873,16 +1858,23 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
 
     # 2. סמול-טוק / שיחה כללית (לא דורש הפעלת כלים)
     if agent_name == 'general':
-        gen_config = types.GenerateContentConfig(
-            system_instruction=_get_agent_prompt('router'),
-            temperature=0.4
-        )
-        gen_resp = _generate_with_fallback(
-            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=gen_config),
-            what='Gemini (General Chat)'
-        )
-        _, final_text = _extract_calls_and_text(gen_resp)
-        return [], final_text or router_text
+        try:
+            gen_resp = _generate_with_fallback(
+                lambda mdl: client.models.generate_content(
+                    model=mdl, 
+                    contents=contents, 
+                    config=_build_generate_config(
+                        mdl,
+                        system_instruction=_get_agent_prompt('router'),
+                        temperature=0.4
+                    )
+                ),
+                what='Gemini (General Chat)'
+            )
+            _, final_text = _extract_calls_and_text(gen_resp)
+            return [], final_text or router_text
+        except Exception:
+            return [], router_text or 'אני כאן! שלח פקודה ואבצע.'
 
     # 3. הפעלת הסוכן המומחה עם הכלים שלו בלבד
     expert_tools_map = {
@@ -1892,22 +1884,24 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
     }
     expert_tools = expert_tools_map.get(agent_name, [])
     
-    expert_config = types.GenerateContentConfig(
-        system_instruction=_get_agent_prompt(agent_name),
-        tools=[types.Tool(function_declarations=expert_tools)] if expert_tools else None,
-        temperature=0.0
-    )
-    
     try:
         expert_resp = _generate_with_fallback(
-            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=expert_config),
+            lambda mdl: client.models.generate_content(
+                model=mdl, 
+                contents=contents, 
+                config=_build_generate_config(
+                    mdl,
+                    system_instruction=_get_agent_prompt(agent_name),
+                    tools=[types.Tool(function_declarations=expert_tools)] if expert_tools else None,
+                    temperature=0.0
+                )
+            ),
             what=f'Gemini (Expert: {agent_name})'
         )
         return _extract_calls_and_text(expert_resp)
     except Exception:
         logger.exception(f'Expert agent {agent_name} failed')
         return [], 'אופס, משהו השתבש בעיבוד הבקשה שלך. נסה שוב 🙏'
-
 # ── Tool dispatch ────────────────────────────
 
 def _tool_add_expense(args: dict, user_id: str) -> str:
