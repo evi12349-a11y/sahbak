@@ -2030,7 +2030,39 @@ def _tool_add_task(args: dict, user_id: str) -> str:
     add_task(quad, desc, user_id)
     return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
 
+def _tool_propose_event(args: dict, user_id: str) -> str:
+    """שומר את הצעת האירוע בחדר המתנה ומבקש אישור מהמשתמש."""
+    title = args.get('title', 'אירוע')
+    start_time = args.get('start_time')
+    duration = args.get('duration_minutes', 60)
+    explanation = args.get('explanation', 'מצאתי זמן פנוי.')
 
+    if not start_time:
+        return 'חסר זמן התחלה להצעה.'
+
+    # שומרים את הנתונים ב"חדר ההמתנה" (מסד הנתונים)
+    context_data = {
+        'type': 'pending_schedule_approval',
+        'title': title,
+        'start_time': start_time,
+        'duration_minutes': duration
+    }
+    set_user_context(user_id, context_data)
+
+    # מעצבים את התאריך למראה יפה בוואטסאפ
+    try:
+        dt = datetime.fromisoformat(start_time)
+        time_str = dt.strftime("%d/%m/%Y בשעה %H:%M")
+    except Exception:
+        time_str = start_time
+
+    return (
+        f"🤖 *הצעת שיבוץ בלו״ז:*\n"
+        f"_{explanation}_\n\n"
+        f"📅 מציע לשבץ: *{title}*\n"
+        f"⏰ מתי? {time_str} (למשך {duration} דק').\n\n"
+        f"האם לאשר את השיבוץ ביומן? (ענה *כן* / *לא*)"
+    )
 def _tool_create_event(args: dict, user_id: str) -> str:
     # כאן אנחנו מתעדים את מה שהמודל החליט לשלוח, כדי שנוכל לחקור תקלות בעתיד
     logger.info("create_calendar_event called with args: %s", args)
@@ -2200,6 +2232,7 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
         'add_task':               _tool_add_task,
         'create_calendar_event':  _tool_create_event,
         'delete_calendar_event':  _tool_delete_event,  # <-- השורה החדשה שהוספנו
+        'propose_calendar_event': _tool_propose_event,
         'complete_task':          _tool_complete_task,
         'delete_task':            _tool_delete_task,
         'set_budget_limit':       _tool_set_limit,
@@ -2788,6 +2821,24 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
+        if ctype == 'pending_schedule_approval':
+            clean = re.sub(r'[\s!.,?]+', '', text).lower()
+            yes = clean.startswith(('כן', 'אשר', 'אוקי', 'סבבה', 'מעולה', 'בטח', 'יאללה', '👍', '✅'))
+            no = clean.startswith(('לא', 'בטל', 'ביטול', 'פחות', '❌'))
+            
+            if yes:
+                title = context.get('title')
+                start_time = context.get('start_time')
+                duration = context.get('duration_minutes', 60)
+                delete_user_context(user_id)
+                # המשתמש אישר! עכשיו באמת קובעים ביומן דרך הפונקציה הרגילה
+                return process_calendar_ai(title, start_time, None, user_id, duration)
+            if no:
+                delete_user_context(user_id)
+                return 'ביטלתי את השיבוץ 👍 מתי תרצה שאקבע את זה במקום?'
+            
+            # אם הוא ענה משהו שלא קשור לכן/לא, נמחק את ההצעה וניתן למערכת לעבד כרגיל
+            delete_user_context(user_id)
         if ctype in ('confirm_expense', 'confirm_expenses'):
             # Confirm expense(s) the bot extracted from a RECEIPT or STATEMENT
             # image. Strict on purpose: a reply containing a DIGIT is treated as
