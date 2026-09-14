@@ -1884,43 +1884,78 @@ def _build_contents(text: str, history) -> list:
 
 
 def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], str]:
-    """Send a free-form Hebrew message PLUS recent conversation history to
-    Gemini. Returns (tool_calls, reply_text). Falls back to a secondary model
-    automatically when the primary is overloaded (503/429)."""
+    """
+    ארכיטקטורת סוכנים (Multi-Agent):
+    שלב א: הראוטר (Router) מנתח את הבקשה ומחליט איזה סוכן נדרש.
+    שלב ב: הסוכן המומחה (Expert Agent) מקבל את הבקשה יחד עם הכלים הספציפיים שלו.
+    """
     client = get_genai_client()
     if not client:
         return [], 'מפתח Gemini חסר. הגדר GEMINI_API_KEY ב-Railway.'
 
     contents = _build_contents(text, history)
 
-    response = _generate_with_fallback(
-        lambda mdl: client.models.generate_content(
-            model=mdl, contents=contents, config=_router_config(mdl)),
-        what='Gemini (router)', max_attempts=3, base_delay=0.6, max_total=6.0,
+    # 1. הפעלת סוכן הניתוב (Router)
+    router_config = types.GenerateContentConfig(
+        system_instruction=_get_agent_prompt('router'),
+        tools=[types.Tool(function_declarations=ROUTER_TOOLS)],
+        temperature=0.0
     )
-    calls, reply_text = _extract_calls_and_text(response)
-    if calls or reply_text:
-        return calls, reply_text
-
-    logger.warning('Router returned empty content (200 but no call/text). '
-                   'Retrying once without tools for a text reply. msg=%r', text[:120])
+    
     try:
-        resp2 = _generate_with_fallback(
-            lambda mdl: client.models.generate_content(
-                model=mdl, contents=contents,
-                config=_build_generate_config(
-                    mdl, system_instruction=_system_instruction(), temperature=0.3)),
-            what='Gemini (plain fallback)', max_attempts=2, base_delay=0.5, max_total=4.0,
+        router_resp = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=router_config),
+            what='Gemini (Router)'
         )
-        _, text2 = _extract_calls_and_text(resp2)
-        if text2:
-            return [], text2
     except Exception:
-        logger.exception('Plain fallback also failed')
+        logger.exception('Router completely failed')
+        return [], 'יש כרגע עומס זמני על שרתי ה-AI 🛠️ נסה שוב עוד כמה שניות.'
 
-    return [], ('לא הצלחתי לעבד את הבקשה הזו 🤔 נסה לנסח קצת אחרת, '
-                'או כתוב "תפריט" לרשימת הפקודות.')
+    router_calls, router_text = _extract_calls_and_text(router_resp)
+    
+    # חילוץ החלטת הניתוב
+    agent_name = 'general'
+    if router_calls and router_calls[0][0] == 'route_to_agent':
+        agent_name = router_calls[0][1].get('agent_name', 'general')
 
+    logger.info("Router decided to route request to agent: %s", agent_name)
+
+    # 2. סמול-טוק / שיחה כללית (לא דורש הפעלת כלים)
+    if agent_name == 'general':
+        gen_config = types.GenerateContentConfig(
+            system_instruction=_get_agent_prompt('router'),
+            temperature=0.4
+        )
+        gen_resp = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=gen_config),
+            what='Gemini (General Chat)'
+        )
+        _, final_text = _extract_calls_and_text(gen_resp)
+        return [], final_text or router_text
+
+    # 3. הפעלת הסוכן המומחה עם הכלים שלו בלבד
+    expert_tools_map = {
+        'finance': FINANCE_TOOLS,
+        'schedule': SCHEDULE_TOOLS,
+        'tasks': TASK_TOOLS
+    }
+    expert_tools = expert_tools_map.get(agent_name, [])
+    
+    expert_config = types.GenerateContentConfig(
+        system_instruction=_get_agent_prompt(agent_name),
+        tools=[types.Tool(function_declarations=expert_tools)] if expert_tools else None,
+        temperature=0.0
+    )
+    
+    try:
+        expert_resp = _generate_with_fallback(
+            lambda mdl: client.models.generate_content(model=mdl, contents=contents, config=expert_config),
+            what=f'Gemini (Expert: {agent_name})'
+        )
+        return _extract_calls_and_text(expert_resp)
+    except Exception:
+        logger.exception(f'Expert agent {agent_name} failed')
+        return [], 'אופס, משהו השתבש בעיבוד הבקשה שלך. נסה שוב 🙏'
 
 # ── Tool dispatch ────────────────────────────
 
