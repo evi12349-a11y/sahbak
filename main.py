@@ -1455,256 +1455,188 @@ def _make_function_declaration(name: str, description: str, schema: dict):
         )
 
 
-def _build_tools() -> list:
-    cats = ', '.join(VALID_CATEGORIES)
-    quads = ', '.join(VALID_QUADRANTS)
+# ═════════════════════════════════════════════
+# הגדרת הכלים לסוכנים (Agents Toolsets)
+# ═════════════════════════════════════════════
 
-    declarations = [
-        _make_function_declaration(
-            'add_expense',
-            'רישום הוצאה או הכנסה כספית. השתמש בזה כשהמשתמש מדווח שקנה משהו, '
-            'שילם, הוציא או הרוויח כסף. עבור הכנסה (משכורת, החזר, קיבל כסף) '
-            'בחר את הקטגוריה "הכנסה".',
-            {
-                'type': 'object',
-                'properties': {
-                    'amount': {
-                        'type': 'number',
-                        'description': 'הסכום בשקלים, תמיד מספר חיובי.',
-                    },
-                    'category': {
-                        'type': 'string',
-                        'enum': VALID_CATEGORIES,
-                        'description': f'הקטגוריה. אחת מתוך: {cats}.',
-                    },
-                    'description': {
-                        'type': 'string',
-                        'description': 'תיאור קצר של ההוצאה/ההכנסה (למשל "המבורגר", "משכורת").',
-                    },
-                },
-                'required': ['amount', 'category'],
+# 1. כלים פיננסיים (עבור סוכן התקציב)
+FINANCE_TOOLS = [
+    _make_function_declaration(
+        'add_expense',
+        'רישום הוצאה או הכנסה כספית. השתמש בזה כשהמשתמש מדווח שקנה משהו, שילם, הוציא או הרוויח כסף.',
+        {
+            'type': 'object',
+            'properties': {
+                'amount': {'type': 'number', 'description': 'הסכום בשקלים, תמיד מספר חיובי.'},
+                'category': {'type': 'string', 'enum': VALID_CATEGORIES, 'description': 'הקטגוריה המדויקת.'},
+                'description': {'type': 'string', 'description': 'תיאור קצר (למשל "המבורגר").'},
             },
-        ),
-        _make_function_declaration(
-            'delete_expense',
-            'ביטול / מחיקה של הוצאה או הכנסה שכבר נרשמה. השתמש בזה כשהמשתמש '
-            'מבקש לבטל, למחוק או לתקן רישום כספי — למשל "בטל את ההוצאה '
-            'האחרונה", "מחק את ההוצאה של ההמבורגר", "רשמתי בטעות".',
-            {
-                'type': 'object',
-                'properties': {
-                    'last': {
-                        'type': 'boolean',
-                        'description': 'true אם המשתמש מבקש לבטל את הרישום האחרון.',
-                    },
-                    'query': {
-                        'type': 'string',
-                        'description': 'מילות חיפוש בתיאור ההוצאה (למשל "המבורגר", "דלק").',
-                    },
-                },
-                'required': [],
+            'required': ['amount', 'category'],
+        },
+    ),
+    _make_function_declaration(
+        'delete_expense',
+        'ביטול / מחיקה של הוצאה או הכנסה שכבר נרשמה.',
+        {
+            'type': 'object',
+            'properties': {
+                'last': {'type': 'boolean', 'description': 'true אם המשתמש מבקש לבטל את הרישום האחרון.'},
+                'query': {'type': 'string', 'description': 'מילות חיפוש מתיאור ההוצאה.'},
             },
-        ),
-        _make_function_declaration(
-            'update_expense_category',
-            'עדכון או שינוי קטגוריה להוצאה/הכנסה שכבר נרשמה. השתמש כשהמשתמש מתקן אותך (למשל "זה לא קניות זה מזון", "תשנה את ההוצאה האחרונה לבילויים").',
-            {
-                'type': 'object',
-                'properties': {
-                    'new_category': {
-                        'type': 'string',
-                        'enum': VALID_CATEGORIES,
-                        'description': 'הקטגוריה החדשה והנכונה.',
-                    },
-                    'last': {
-                        'type': 'boolean',
-                        'description': 'true אם המשתמש מתייחס לפעולה האחרונה.',
-                    },
-                    'query': {
-                        'type': 'string',
-                        'description': 'מילות חיפוש מתוך התיאור של ההוצאה (למשל "וולט", "זארה").',
-                    },
-                },
-                'required': ['new_category'],
+            'required': [],
+        },
+    ),
+    _make_function_declaration(
+        'update_expense_category',
+        'עדכון קטגוריה להוצאה/הכנסה קיימת. (למשל "זה לא קניות זה מזון").',
+        {
+            'type': 'object',
+            'properties': {
+                'new_category': {'type': 'string', 'enum': VALID_CATEGORIES, 'description': 'הקטגוריה הנכונה.'},
+                'last': {'type': 'boolean', 'description': 'true עבור הפעולה האחרונה.'},
+                'query': {'type': 'string', 'description': 'חיפוש מתוך התיאור.'},
             },
-        ),
-        _make_function_declaration(
-            'show_transactions',
-            'הצגת התנועות הכספיות האחרונות של החודש (הוצאות והכנסות) עם '
-            'המספרים שלהן. השתמש כשהמשתמש מבקש לראות תנועות, רישומים אחרונים, '
-            'או רוצה לבחור רישום לביטול.',
-            {'type': 'object', 'properties': {}, 'required': []},
-        ),
-        _make_function_declaration(
-            'add_task',
-            'הוספת משימה לרשימת המטלות לפי מטריצת אייזנהאואר. השתמש בזה כשהמשתמש '
-            'מבקש להוסיף משימה, לזכור לעשות משהו, או לשים תזכורת למטלה.',
-            {
-                'type': 'object',
-                'properties': {
-                    'quadrant': {
-                        'type': 'string',
-                        'enum': VALID_QUADRANTS,
-                        'description': (
-                            f'רמת הדחיפות/חשיבות. אחת מתוך: {quads}. '
-                            'אם המשתמש לא ציין במפורש, הסק לפי ההקשר '
-                            '(ברירת מחדל סבירה: "חשוב לא דחוף").'
-                        ),
-                    },
-                    'description': {
-                        'type': 'string',
-                        'description': 'תיאור המשימה.',
-                    },
+            'required': ['new_category'],
+        },
+    ),
+    _make_function_declaration(
+        'show_transactions',
+        'הצגת התנועות הכספיות האחרונות של החודש.',
+        {'type': 'object', 'properties': {}, 'required': []},
+    ),
+    _make_function_declaration(
+        'get_budget_status',
+        'הצגת דוח כספי מפורט לחודש הנוכחי (הכנסות, הוצאות, יתרה לכל קטגוריה).',
+        {'type': 'object', 'properties': {}, 'required': []},
+    ),
+    _make_function_declaration(
+        'set_budget_limit',
+        'הגדרה או עדכון של תקרת תקציב חודשית לקטגוריה.',
+        {
+            'type': 'object',
+            'properties': {
+                'category': {
+                    'type': 'string',
+                    'enum': [c for c in VALID_CATEGORIES if c != 'הכנסה'],
+                    'description': 'הקטגוריה. (לא כולל הכנסה).',
                 },
-                'required': ['quadrant', 'description'],
+                'amount': {'type': 'number', 'description': 'תקרת התקציב החדשה בשקלים.'},
             },
-        ),
-        _make_function_declaration(
-            'create_calendar_event',
-            'יצירת אירוע ביומן גוגל (כולל אירועים חוזרים, וטווחי תאריכים מרובי ימים). השתמש בזה לקביעת פגישות, חופשות, אירועים חוזרים וכדומה.',
-            {
-                'type': 'object',
-                'properties': {
-                    'title': {
-                        'type': 'string',
-                        'description': 'כותרת האירוע (למשל "פגישה עם דני", "בוחן באינפי", "חופשה באילת").',
-                    },
-                    'start_time': {
-                        'type': 'string',
-                        'description': 'זמן ההתחלה בפורמט ISO 8601 מלא. באירוע חוזר — זה זמן המופע הראשון.',
-                    },
-                    'end_time': {
-                        'type': 'string',
-                        'description': 'זמן סיום בפורמט ISO 8601 (אופציונלי). חובה למלא עבור טווחי תאריכים מרובי ימים (למשל חופשה מ-10.9 עד 12.9).',
-                    },
-                    'is_all_day': {
-                        'type': 'boolean',
-                        'description': 'true אם מדובר באירוע של יום שלם או מספר ימים מלאים (חופשה, מילואים, קאנטה). false אם יש שעות ספציפיות.',
-                    },
-                    'duration_minutes': {
-                        'type': 'integer',
-                        'description': 'משך האירוע בדקות. התעלם מזה אם סיפקת end_time.',
-                    },
-                    'recurrence': {
-                        'type': 'string',
-                        'description': 'כלל RRULE לאירוע חוזר (למשל "RRULE:FREQ=WEEKLY;COUNT=4").',
-                    },
-                    'location': {
-                        'type': 'string',
-                        'description': 'מיקום האירוע, אם צוין. אחרת השמט.',
-                    },
-                    'color': {
-                        'type': 'string',
-                        'enum': ['אדום', 'כתום', 'צהוב', 'ירוק', 'טורקיז', 'כחול', 'סגול', 'ורוד', 'אפור', 'לבנדר', 'ירקרק'],
-                        'description': 'צבע האירוע, רק אם המשתמש ביקש במפורש.',
-                    },
-                },
-                'required': ['title', 'start_time'],
+            'required': ['category', 'amount'],
+        },
+    ),
+]
+
+# 2. כלים ליומן ולזמן (עבור סוכן הלו"ז)
+SCHEDULE_TOOLS = [
+    _make_function_declaration(
+        'create_calendar_event',
+        'יצירת אירוע ביומן גוגל (לאירועים ברורים וקבועים בלבד).',
+        {
+            'type': 'object',
+            'properties': {
+                'title': {'type': 'string', 'description': 'כותרת האירוע.'},
+                'start_time': {'type': 'string', 'description': 'זמן ההתחלה בפורמט ISO 8601.'},
+                'end_time': {'type': 'string', 'description': 'זמן סיום אופציונלי.'},
+                'is_all_day': {'type': 'boolean', 'description': 'true לאירוע של יום שלם.'},
+                'duration_minutes': {'type': 'integer', 'description': 'משך האירוע בדקות.'},
+                'recurrence': {'type': 'string', 'description': 'כלל RRULE לאירוע חוזר.'},
+                'location': {'type': 'string', 'description': 'מיקום.'},
             },
-        ),
-        _make_function_declaration(
-            'delete_calendar_event',
-            'מחיקת אירוע מיומן גוגל. השתמש כשהמשתמש מבקש לבטל, למחוק או להסיר אירוע/פגישה/אימון מהיומן.',
-            {
-                'type': 'object',
-                'properties': {
-                    'query': {
-                        'type': 'string',
-                        'description': 'מילות חיפוש מתוך כותרת האירוע (למשל "אימון", "רופא").',
-                    },
-                    'date': {
-                        'type': 'string',
-                        'description': 'תאריך האירוע בפורמט ISO 8601, אם צוין (למשל "2026-08-30"). השמט אם לא צוין.',
-                    },
-                },
-                'required': ['query'],
-            }
-        ),
-        _make_function_declaration(
-            'complete_task',
-            'סימון משימה אחת או יותר כהושלמו. השתמש בזה כשהמשתמש אומר שסיים, '
-            'ביצע או השלים מטלות. אם המשתמש סיים כמה משימות — העבר את כולן '
-            'ברשימה אחת (task_queries) בקריאה אחת.',
-            {
-                'type': 'object',
-                'properties': {
-                    'task_queries': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': (
-                            'רשימת תיאורים/מילות מפתח של המשימות שהושלמו '
-                            '(למשל ["חלב", "להתקשר לרופא"]). אפשר גם משימה אחת. '
-                            'אם המשתמש לא פירט איזו — השאר ריק.'
-                        ),
-                    },
-                    'all': {
-                        'type': 'boolean',
-                        'description': 'true אם המשתמש סיים את *כל* המשימות.',
-                    },
-                },
-                'required': [],
+            'required': ['title', 'start_time'],
+        },
+    ),
+    _make_function_declaration(
+        'delete_calendar_event',
+        'מחיקת אירוע מיומן גוגל.',
+        {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'מילות חיפוש מכותרת האירוע.'},
+                'date': {'type': 'string', 'description': 'תאריך האירוע בפורמט ISO 8601.'},
             },
-        ),
-        _make_function_declaration(
-            'delete_task',
-            'מחיקת משימה אחת או יותר מהרשימה (הסרה מוחלטת, לא סימון כהושלמה). '
-            'השתמש בזה כשהמשתמש מבקש למחוק, להסיר או לבטל משימות. אם ביקש '
-            'למחוק כמה — העבר את כולן ברשימה אחת בקריאה אחת.',
-            {
-                'type': 'object',
-                'properties': {
-                    'task_queries': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': 'רשימת תיאורים/מילות מפתח של המשימות למחיקה.',
-                    },
-                    'all': {
-                        'type': 'boolean',
-                        'description': 'true אם המשתמש מבקש למחוק את *כל* המשימות.',
-                    },
-                },
-                'required': [],
+            'required': ['query'],
+        }
+    ),
+    _make_function_declaration(
+        'propose_calendar_event',
+        'הצעת שיבוץ לאירוע ביומן לקבלת אישור. חובה להשתמש בכלי זה לפני שמשבצים חלון למידה או משלימים פערים.',
+        {
+            'type': 'object',
+            'properties': {
+                'title': {'type': 'string', 'description': 'כותרת האירוע להצעה.'},
+                'start_time': {'type': 'string', 'description': 'זמן התחלה מוצע (ISO 8601).'},
+                'duration_minutes': {'type': 'integer', 'description': 'משך בדקות.'},
+                'explanation': {'type': 'string', 'description': 'הסבר קצר למשתמש למה בחרת להציע את הזמן הזה.'}
             },
-        ),
-        _make_function_declaration(
-            'set_budget_limit',
-            'הגדרה או עדכון של תקרת תקציב חודשית לקטגוריה.',
-            {
-                'type': 'object',
-                'properties': {
-                    'category': {
-                        'type': 'string',
-                        'enum': [c for c in VALID_CATEGORIES if c != 'הכנסה'],
-                        'description': f'הקטגוריה. אחת מתוך: {cats} (לא כולל הכנסה).',
-                    },
-                    'amount': {
-                        'type': 'number',
-                        'description': 'תקרת התקציב החדשה בשקלים.',
-                    },
-                },
-                'required': ['category', 'amount'],
+            'required': ['title', 'start_time', 'duration_minutes', 'explanation'],
+        },
+    ),
+]
+
+# 3. כלי משימות (עבור סוכן המשימות)
+TASK_TOOLS = [
+    _make_function_declaration(
+        'add_task',
+        'הוספת משימה לבנק המשימות הכללי.',
+        {
+            'type': 'object',
+            'properties': {
+                'quadrant': {'type': 'string', 'enum': VALID_QUADRANTS, 'description': 'דחיפות המשימה.'},
+                'description': {'type': 'string', 'description': 'תיאור המשימה.'},
             },
-        ),
-        _make_function_declaration(
-            'get_budget_status',
-            'הצגת דוח כספי מפורט לחודש הנוכחי (הכנסות, הוצאות, יתרה לכל קטגוריה). '
-            'השתמש כשהמשתמש שואל על מצב כספי, מאזן, תקציב או כמה הוציא.',
-            {'type': 'object', 'properties': {}, 'required': []},
-        ),
-        _make_function_declaration(
-            'get_tasks_status',
-            'הצגת רשימת כל המשימות הפתוחות. השתמש כשהמשתמש שואל מה יש לו לעשות, '
-            'מבקש את רשימת המשימות או את הסטטוס שלהן.',
-            {'type': 'object', 'properties': {}, 'required': []},
-        ),
-        _make_function_declaration(
-            'show_help',
-            'הצגת תפריט העזרה והפקודות הזמינות. השתמש כשהמשתמש שואל מה אתה יכול '
-            'לעשות, מבקש עזרה או תפריט.',
-            {'type': 'object', 'properties': {}, 'required': []},
-        ),
-    ]
-    return [types.Tool(function_declarations=declarations)]
+            'required': ['quadrant', 'description'],
+        },
+    ),
+    _make_function_declaration(
+        'complete_task',
+        'סימון משימה כהושלמה.',
+        {
+            'type': 'object',
+            'properties': {
+                'task_queries': {'type': 'array', 'items': {'type': 'string'}, 'description': 'מילות מפתח של המשימות.'},
+                'all': {'type': 'boolean', 'description': 'true אם סיים הכל.'},
+            },
+            'required': [],
+        },
+    ),
+    _make_function_declaration(
+        'delete_task',
+        'מחיקת משימה לבלי שוב.',
+        {
+            'type': 'object',
+            'properties': {
+                'task_queries': {'type': 'array', 'items': {'type': 'string'}, 'description': 'מילות מפתח למחיקה.'},
+                'all': {'type': 'boolean', 'description': 'true למחיקת הכל.'},
+            },
+            'required': [],
+        },
+    ),
+    _make_function_declaration(
+        'get_tasks_status',
+        'הצגת כל המשימות הפתוחות בבנק המשימות.',
+        {'type': 'object', 'properties': {}, 'required': []},
+    ),
+]
+
+# 4. כלי הניתוב (עבור הראוטר)
+ROUTER_TOOLS = [
+    _make_function_declaration(
+        'route_to_agent',
+        'ניתוב הבקשה של המשתמש לסוכן המתמחה הנכון.',
+        {
+            'type': 'object',
+            'properties': {
+                'agent_name': {
+                    'type': 'string', 
+                    'enum': ['finance', 'schedule', 'tasks', 'general'], 
+                    'description': 'לאיזה סוכן לנתב את הבקשה.'
+                }
+            },
+            'required': ['agent_name'],
+        }
+    )
+]
 
 
 # Build once at import — declarations are static.
