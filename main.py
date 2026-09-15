@@ -1821,12 +1821,49 @@ def _build_contents(text: str, history) -> list:
     contents.append({'role': 'user', 'parts': [{'text': text}]})
     return contents
 
-
-def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], str]:
+def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
+    """[Agent State Injection] שולף אירועים קיימים בגוגל יומן כדי שהסוכן ידע מתי יש למשתמש זמן פנוי."""
+    cal_id = calendar_id_for(user_id)
+    if not cal_id:
+        return "לא מחובר יומן גוגל."
+    
+    service = get_calendar_service()
+    if not service:
+        return "שגיאת חיבור ליומן."
+    
+    now = now_local()
+    time_min = now.isoformat()
+    time_max = (now + timedelta(days=days)).isoformat()
+    
+    try:
+        events_result = call_with_retry(
+            lambda: service.events().list(
+                calendarId=cal_id, timeMin=time_min, timeMax=time_max,
+                singleEvents=True, orderBy='startTime'
+            ).execute(),
+            what='State background sync'
+        )
+        events = events_result.get('items', [])
+        if not events:
+            return f"היומן ריק ופנוי לחלוטין ל-{days} הימים הקרובים."
+        
+        lines = []
+        for e in events:
+            title = e.get('summary', 'ללא שם')
+            start = e.get('start', {})
+            start_str = start.get('dateTime') or start.get('date', '')
+            end = e.get('end', {})
+            end_str = end.get('dateTime') or end.get('date', '')
+            lines.append(f"- {title}: מ-{start_str} עד {end_str}")
+        return '\n'.join(lines)
+    except Exception as e:
+        logger.warning("Background calendar sync failed: %s", e)
+        return "לא ניתן לשלוף אירועים מהיומן כרגע."
+      
+def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple[str, dict]], str]:
     """
-    ארכיטקטורת סוכנים (Multi-Agent):
-    שלב א: הראוטר (Router) מנתח את הבקשה ומחליט איזה סוכן נדרש.
-    שלב ב: הסוכן המומחה (Expert Agent) מקבל את הבקשה יחד עם הכלים הספציפיים שלו.
+    ארכיטקטורת סוכנים עם הזרקת מצב (State Injection):
+    חוסך לולאות ReAct יקרות על ידי הזרקת מידע קריטי מראש למוח של הסוכן הרלוונטי.
     """
     client = get_genai_client()
     if not client:
@@ -1855,14 +1892,13 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
 
     router_calls, router_text = _extract_calls_and_text(router_resp)
     
-    # חילוץ החלטת הניתוב
     agent_name = 'general'
     if router_calls and router_calls[0][0] == 'route_to_agent':
         agent_name = router_calls[0][1].get('agent_name', 'general')
 
     logger.info("Router decided to route request to agent: %s", agent_name)
 
-    # 2. סמול-טוק / שיחה כללית (לא דורש הפעלת כלים)
+    # 2. שיחה כללית
     if agent_name == 'general':
         try:
             gen_resp = _generate_with_fallback(
@@ -1882,7 +1918,17 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
         except Exception:
             return [], router_text or 'אני כאן! שלח פקודה ואבצע.'
 
-    # 3. הפעלת הסוכן המומחה עם הכלים שלו בלבד
+    # 3. הפעלת הסוכן המומחה - עם הזרקת נתונים!
+    expert_system_prompt = _get_agent_prompt(agent_name)
+    
+    # --- הקסם הארכיטקטוני: State Injection ---
+    if agent_name == 'schedule':
+        # סוכן הלו"ז מקבל את המשימות ואת חלונות הזמן מראש, כדי שלא יצטרך לשאול שאלות!
+        cal_state = get_upcoming_calendar_state(user_id)
+        task_state = get_task_status(user_id)
+        expert_system_prompt += f"\n\n--- מידע קריטי על מצב המשתמש כרגע ---\nאירועים ביומן לימים הקרובים (כדי שתדע מתי הוא פנוי):\n{cal_state}\n\nמשימות פתוחות שיש לשבץ:\n{task_state}"
+    # ----------------------------------------
+
     expert_tools_map = {
         'finance': FINANCE_TOOLS,
         'schedule': SCHEDULE_TOOLS,
@@ -1897,7 +1943,7 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
                 contents=contents, 
                 config=_build_generate_config(
                     mdl,
-                    system_instruction=_get_agent_prompt(agent_name),
+                    system_instruction=expert_system_prompt,
                     tools=[types.Tool(function_declarations=expert_tools)] if expert_tools else None,
                     temperature=0.0
                 )
@@ -1908,6 +1954,7 @@ def get_ai_tool_calls(text: str, history=None) -> tuple[list[tuple[str, dict]], 
     except Exception:
         logger.exception(f'Expert agent {agent_name} failed')
         return [], 'אופס, משהו השתבש בעיבוד הבקשה שלך. נסה שוב 🙏'
+      
 # ── Tool dispatch ────────────────────────────
 
 def _tool_add_expense(args: dict, user_id: str) -> str:
