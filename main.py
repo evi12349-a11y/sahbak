@@ -1572,11 +1572,7 @@ SCHEDULE_TOOLS = [
             'required': ['title', 'start_time', 'duration_minutes', 'explanation'],
         },
     ),
-    _make_function_declaration(
-         'get_tasks_status',
-         'הצגת כל המשימות הפתוחות בבנק המשימות כדי שתוכל לבחור איזה משימות חשובות או דחופות לשבץ ביומן.',
-         {'type': 'object', 'properties': {}, 'required': []},
-    ),
+    
 ]
 
 # 3. כלי משימות (עבור סוכן המשימות)
@@ -1745,9 +1741,9 @@ def _get_agent_prompt(agent_name: str) -> str:
             'אתה מנהל לו"ז אישי בכיר (Executive Assistant). תפקידך לקבוע, למחוק ולעדכן אירועים ביומן Google.\n'
             'חוקי הברזל שלך:\n'
             '1. משימת על (ליבת הלמידה): למשתמש יש יעד קריטי של למידה למבחני הלשכה - כ-9 שעות ביום, בימים א\'-ד\' (08:00-18:00).\n'
-            '2. התאוששות מבלת"מים: אם המשתמש מדווח על משמרת לילה, הטסה או בלת"ם שפגע בשעות הלמידה, עזור לו להשלים את הפער.\n'
-            '3. בקרת אנוש (Human-in-the-Loop): אין לשבץ חלונות למידה, בלת"מים או משימות ללא אישור! השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון שלך, והמתן לאישור המשתמש.\n'
-            '4. שיבוץ משימות מהבנק: אם המשתמש מבקש לשבץ משימות, הפעל קודם את "get_tasks_status" כדי לקרוא אותן. בחר תמיד קודם את המשימות מקטגוריית "חשוב דחוף" או "חשוב לא דחוף", והצע להן שיבוץ מדויק.\n'
+            '2. התאוששות מבלת"מים: עזור למשתמש למצוא זמן חלופי ביומן ללמידה אם פספס.\n'
+            '3. בקרת אנוש (Human-in-the-Loop): אין לשבץ חלונות למידה או משימות ללא אישור! השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון שלך.\n'
+            '4. שיבוץ משימות אקטיבי: בתחתית פרומפט זה קיבלת את מצב היומן ואת בנק המשימות. כשאתה מתבקש לשבץ משימות, הסתכל מיד על חלונות הזמן הפנויים ביומן (אל תשאל "מתי נוח לך"), בחר את המשימות מקטגוריית "חשוב דחוף" או "חשוב לא דחוף", והצע בעזרת הכלי לשבץ אותן בדיוק בחלונות הפנויים שמצאת.\n'
             '5. השתמש תמיד בפורמט ISO 8601 לזמנים.'
         )
     
@@ -2968,7 +2964,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     # ── AI routing with conversation memory (multi-turn understanding) ──
     history = get_recent_conversation(user_id)
     try:
-        tool_calls, reply_text = get_ai_tool_calls(text, history)
+        tool_calls, reply_text = get_ai_tool_calls(text, user_id, history)
     except Exception:
         logger.exception('AI router permanently failed for user %s', user_id)
         return ('יש כרגע עומס זמני על שרתי ה-AI 🛠️\n'
