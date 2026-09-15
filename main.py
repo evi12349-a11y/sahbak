@@ -1722,9 +1722,6 @@ def _generate_with_fallback(build_call, *, what: str,
 # ═════════════════════════════════════════════
 # מוחות הסוכנים (System Prompts)
 # ═════════════════════════════════════════════
-d# ═════════════════════════════════════════════
-# מוחות הסוכנים (System Prompts)
-# ═════════════════════════════════════════════
 def _get_agent_prompt(agent_name: str) -> str:
     now = now_local()
     weekday = HEB_WEEKDAYS[now.weekday()]
