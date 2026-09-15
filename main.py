@@ -1621,24 +1621,24 @@ TASK_TOOLS = [
 ]
 
 # 4. כלי הניתוב (עבור הראוטר)
+# 4. כלי הניתוב (עבור הראוטר)
 ROUTER_TOOLS = [
     _make_function_declaration(
         'route_to_agent',
-        'ניתוב הבקשה של המשתמש לסוכן המתמחה הנכון.',
+        'ניתוב הבקשה של המשתמש לסוכן המתאים. חובה לנתב ל-schedule אם המשתמש מבקש לשבץ, למצוא זמן, או לקבוע משימות ביומן!',
         {
             'type': 'object',
             'properties': {
                 'agent_name': {
                     'type': 'string', 
                     'enum': ['finance', 'schedule', 'tasks', 'general'], 
-                    'description': 'לאיזה סוכן לנתב את הבקשה.'
+                    'description': 'לאיזה סוכן לנתב. בחר ב-schedule עבור כל בקשת שיבוץ/תזמון של משימות.'
                 }
             },
             'required': ['agent_name'],
         }
     )
 ]
-
 
 
 def _gemini_version(model: str) -> tuple[int, int]:
