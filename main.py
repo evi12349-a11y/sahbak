@@ -3716,15 +3716,15 @@ def api_android_pay():
                     'description': merchant
                 }, aid)
 
-                msg = f"🤖 *אנדרואיד אוטומטי:*\n\n{reply}"
+                msg = f"🤖 *אנדרואיד (אוטומטי):*\n\n{reply}"
                 send_whatsapp_message(uid, msg)
 
         except Exception:
             logger.exception('Critical error in Android Pay processing for %s', uid)
 
-    # 2. העברת העיבוד לשרשור רקע ושחרור ה-MacroDroid מיידית
+    # 2. העברת העיבוד לשרשור רקע
     _executor.submit(_process_android_notification_background, user_id_raw, account_id, raw_text)
-    return jsonify({'status': 'processing_in_background'}), 200  
+    return jsonify({'status': 'processing_in_background'}), 200
 
 # ─── POST /api/expense ───────────────────────────────────────────────────────
 @app.route('/api/expense', methods=['POST'])
