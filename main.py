@@ -3634,6 +3634,97 @@ def api_apple_pay():
 
     # 5. שחרור האייפון מיידית
     return jsonify({'status': 'processing_in_background'}), 200
+# ─── POST /api/android-pay ───────────────────────────────────────────────────
+@app.route('/api/android-pay', methods=['POST'])
+def api_android_pay():
+    """
+    [MULTI] Android MacroDroid Webhook.
+    מקבל את כל הטקסט של התראת התשלום (Google Wallet / חברת אשראי), 
+    ונותן ל-Gemini לפענח אותו ולרשום הוצאה.
+    """
+    if not VERIFY_TOKEN:
+        return jsonify({'error': 'VERIFY_TOKEN not configured'}), 503
+
+    data = request.get_json(silent=True) or {}
+    
+    user_id_raw = str(data.get('user_id', '')).strip()
+    secret      = str(data.get('secret', '')).strip()
+    raw_text    = str(data.get('raw_text', '')).strip()
+
+    # 1. אימות אבטחה מחמיר
+    if not user_id_raw or not secret or not hmac.compare_digest(VERIFY_TOKEN, secret):
+        logger.warning('Unauthorized Android webhook attempt for user %s', user_id_raw)
+        return jsonify({'error': 'unauthorized'}), 401
+
+    if not raw_text:
+        return jsonify({'error': 'missing raw_text'}), 400
+
+    account_id = resolve_account(user_id_raw)
+
+    def _process_android_notification_background(uid: str, aid: str, text: str):
+        try:
+            client = get_genai_client()
+            if not client:
+                logger.error('No Gemini client available for Android Pay parsing')
+                return
+
+            allowed_cats = [c for c in VALID_CATEGORIES if c not in POSITIVE_CATEGORIES]
+            
+            prompt = (
+                'לפניך טקסט מהתראה של חברת אשראי או אפליקציית תשלום (כמו Google Pay).\n'
+                f'טקסט ההתראה: "{text}"\n\n'
+                'עליך לחלץ מהטקסט את הסכום ששולם (מספר בלבד) ואת שם בית העסק, ולהחליט לאיזו קטגוריה זה שייך.\n'
+                f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}.\n'
+                'החזר אך ורק JSON תקין במבנה הבא (ללא שום טקסט נוסף או סימוני Markdown):\n'
+                '{"amount": <מספר>, "merchant": "<שם העסק>", "category": "<שם הקטגוריה>"}\n'
+                'אם אינך מצליח לזהות תשלום ודאי, החזר JSON ריק: {}'
+            )
+
+            resp = _generate_with_fallback(
+                lambda mdl: client.models.generate_content(
+                    model=mdl,
+                    contents=prompt,
+                    config=_build_generate_config(mdl, temperature=0.0)
+                ),
+                what='Android Pay AI Parsing', max_attempts=2, base_delay=0.5, max_total=6.0
+            )
+            
+            _, txt = _extract_calls_and_text(resp)
+            raw_reply = re.sub(r'^```(?:json)?\s*|\s*```$', '', (txt or '').strip(), flags=re.IGNORECASE).strip()
+            
+            try:
+                parsed_data = json.loads(raw_reply)
+            except Exception:
+                logger.warning('Android Pay extract: non-JSON reply %r', raw_reply)
+                return
+
+            if not parsed_data or 'amount' not in parsed_data:
+                logger.info('Android Pay AI could not extract payment from: %s', text)
+                return
+
+            amount = float(parsed_data.get('amount', 0))
+            merchant = str(parsed_data.get('merchant', 'תשלום לא ידוע'))
+            category = str(parsed_data.get('category', 'קניות'))
+
+            if category not in allowed_cats:
+                category = 'קניות'
+
+            if amount > 0:
+                reply = _tool_add_expense({
+                    'amount': amount,
+                    'category': category,
+                    'description': merchant
+                }, aid)
+
+                msg = f"🤖 *אנדרואיד אוטומטי:*\n\n{reply}"
+                send_whatsapp_message(uid, msg)
+
+        except Exception:
+            logger.exception('Critical error in Android Pay processing for %s', uid)
+
+    # 2. העברת העיבוד לשרשור רקע ושחרור ה-MacroDroid מיידית
+    _executor.submit(_process_android_notification_background, user_id_raw, account_id, raw_text)
+    return jsonify({'status': 'processing_in_background'}), 200  
 
 # ─── POST /api/expense ───────────────────────────────────────────────────────
 @app.route('/api/expense', methods=['POST'])
