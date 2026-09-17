@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-18-r17'
+BUILD_VERSION = '2026-09-18-r18'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1896,15 +1896,15 @@ def _free_calendar_windows(events: list[dict], start: datetime,
     return windows
 
 
-def get_upcoming_calendar_state(user_id: str, days: int = 7) -> str:
-    """Return existing events and server-calculated free windows."""
+def _read_calendar_events(user_id: str, days: int = 7) -> tuple[list[dict] | None, str | None]:
+    """Read one user's mapped calendar and return events or a useful error."""
     cal_id = calendar_id_for(user_id)
     if not cal_id:
-        return "לא מחובר יומן גוגל."
+        return None, 'לא נמצא יומן ממופה למשתמש הזה.'
     
     service = get_calendar_service()
     if not service:
-        return "שגיאת חיבור ליומן."
+        return None, 'שגיאת התחברות לשירות Google Calendar.'
     
     now = now_local()
     time_min = now.isoformat()
@@ -1918,27 +1918,74 @@ def get_upcoming_calendar_state(user_id: str, days: int = 7) -> str:
             ).execute(),
             what='State background sync'
         )
-        events = events_result.get('items', [])
-        free_windows = _free_calendar_windows(events, now, days)
-        lines = []
-        for e in events:
-            title = e.get('summary', 'ללא שם')
-            start = e.get('start', {})
-            start_str = start.get('dateTime') or start.get('date', '')
-            end = e.get('end', {})
-            end_str = end.get('dateTime') or end.get('date', '')
-            lines.append(f"- {title}: מ-{start_str} עד {end_str}")
-        event_lines = '\n'.join(lines) if lines else 'אין אירועים ביומן בטווח שנבדק.'
-        free_lines = '\n'.join(f'- {window}' for window in free_windows)
-        if not free_lines:
-            free_lines = 'לא נמצא חלון פנוי באורך שעה בימים שנבדקו.'
-        return (
-            f'אירועים קיימים:\n{event_lines}\n\n'
-            f'חלונות פנויים מחושבים (לפחות שעה, 08:00–18:00, א׳–ו׳):\n{free_lines}'
-        )
-    except Exception as e:
-        logger.warning("Background calendar sync failed: %s", e)
-        return "לא ניתן לשלוף אירועים מהיומן כרגע."
+        return events_result.get('items', []), None
+    except HttpError as exc:
+        status = _http_status(exc)
+        logger.exception('Calendar read failed for user=%s calendar=%s status=%s',
+                         user_id, cal_id, status)
+        if status == 403:
+            return None, 'Google Calendar דחה את הקריאה (403). בדוק הרשאת צפייה ביומן.'
+        if status == 404:
+            return None, 'Google Calendar לא מצא את היומן הממופה (404).'
+        return None, f'קריאת היומן נכשלה (קוד {status or "?"}).'
+    except Exception as exc:
+        logger.exception('Calendar read failed for user=%s calendar=%s', user_id, cal_id)
+        return None, f'קריאת היומן נכשלה: {type(exc).__name__}.'
+
+
+def _calendar_state_from_events(events: list[dict], now: datetime,
+                                days: int) -> str:
+    """Format calendar events and computed windows for the schedule agent."""
+    free_windows = _free_calendar_windows(events, now, days)
+    lines = []
+    for e in events:
+        title = e.get('summary', 'ללא שם')
+        start = e.get('start', {})
+        start_str = start.get('dateTime') or start.get('date', '')
+        end = e.get('end', {})
+        end_str = end.get('dateTime') or end.get('date', '')
+        lines.append(f"- {title}: מ-{start_str} עד {end_str}")
+    event_lines = '\n'.join(lines) if lines else 'אין אירועים ביומן בטווח שנבדק.'
+    free_lines = '\n'.join(f'- {window}' for window in free_windows)
+    if not free_lines:
+        free_lines = 'לא נמצא חלון פנוי באורך שעה בימים שנבדקו.'
+    return (
+        f'אירועים קיימים:\n{event_lines}\n\n'
+        f'חלונות פנויים מחושבים (לפחות שעה, 08:00–18:00, א׳–ו׳):\n{free_lines}'
+    )
+
+
+def get_upcoming_calendar_state(user_id: str, days: int = 7) -> str:
+    """Return existing events and server-calculated free windows."""
+    events, error = _read_calendar_events(user_id, days)
+    if error:
+        return error
+    return _calendar_state_from_events(events or [], now_local(), days)
+
+
+def _calendar_slots_reply(user_id: str, days: int = 7) -> str:
+    """Deterministic user-facing calendar read for free-slot requests."""
+    events, error = _read_calendar_events(user_id, days)
+    if error:
+        return f'לא הצלחתי לקרוא את היומן שלך: {error}'
+
+    now = now_local()
+    slots = _free_calendar_windows(events or [], now, days)
+    tasks = get_active_tasks(user_id)
+    if not slots:
+        return 'קראתי את היומן, אבל לא מצאתי חלון פנוי של שעה בימים הקרובים.'
+
+    lines = ['✅ קראתי את היומן שלך בהצלחה.',
+             'חלונות פנויים של שעה לפחות (08:00–18:00, ראשון–שישי):']
+    lines.extend(f'• {slot}' for slot in slots[:12])
+    if len(slots) > 12:
+        lines.append(f'• ועוד {len(slots) - 12} חלונות')
+    if tasks:
+        lines.append('\nמשימות פתוחות שאפשר לשבץ:')
+        lines.extend(f'• [{task_id}] {description}'
+                     for task_id, _quadrant, description in tasks[:12])
+        lines.append('\nבחר מספר משימה וחלון, או כתוב "שבץ את הראשונה בחלון הראשון".')
+    return '\n'.join(lines)
       
 def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple[str, dict]], str]:
     """
@@ -2872,6 +2919,11 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     # [r6] quick access to recent transactions
     if t in ('תנועות', 'תנועות אחרונות', 'רישומים אחרונים', 'הוצאות אחרונות'):
         return _tool_show_transactions({}, user_id)
+
+    # Calendar reads must be deterministic. Do not ask Gemini to infer whether
+    # the calendar was read successfully or to calculate free-time windows.
+    if _is_proactive_schedule_request(t):
+        return _calendar_slots_reply(user_id)
 
     m = _SET_BUDGET_RE.match(t)
     if m:
