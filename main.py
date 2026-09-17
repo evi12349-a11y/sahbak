@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-18-r18'
+BUILD_VERSION = '2026-09-18-r19'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1823,9 +1823,10 @@ def _is_proactive_schedule_request(text: str) -> bool:
     """Detect slot-finding requests that must reach the schedule agent."""
     normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
     has_slot_language = bool(re.search(
-        r'(?:חלונ(?:ות|ות)\s+(?:זמן|פנוי)|חלון\s+פנוי|זמנ(?:ים|י)\s+פנוי|'
+        r'(?:(?:חלון|חלונות)\s+(?:זמן|פנוי)|זמנ(?:ים|י)\s+פנוי|'
         r'מצא\s+לי\s+זמן|תמצא\s+לי\s+זמן|'
         r'שבץ\s+(?:לי\s+)?(?:את\s+)?(?:המשימה|משימות)|'
+        r'(?:יודע|יכול|אפשר|רוצה|צריך)?\s*למצוא\s+(?:לי\s+)?(?:חלון|חלונות|זמן)|'
         r'למצוא\s+זמן\s+ל(?:שבץ|למידה)|'
         r'זמן\s+לכל\s+(?:המשימות|המשימות\s+שנותרו))', normalized
     ))
