@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r15'
+BUILD_VERSION = '2026-09-17-r16'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1818,8 +1818,88 @@ def _build_contents(text: str, history) -> list:
     contents.append({'role': 'user', 'parts': [{'text': text}]})
     return contents
 
-def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
-    """[Agent State Injection] שולף אירועים קיימים בגוגל יומן כדי שהסוכן ידע מתי יש למשתמש זמן פנוי."""
+
+def _is_proactive_schedule_request(text: str) -> bool:
+    """Detect slot-finding requests that must reach the schedule agent."""
+    normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    has_slot_language = bool(re.search(
+        r'(?:חלון\s+פנוי|זמן\s+פנוי|מצא\s+לי\s+זמן|תמצא\s+לי\s+זמן|'
+        r'שבץ\s+(?:לי\s+)?(?:את\s+)?(?:המשימה|משימות)|'
+        r'למצוא\s+זמן\s+ל(?:שבץ|למידה))', normalized
+    ))
+    has_schedule_signal = bool(re.search(
+        r'(?:יומן|משימה|משימות|למידה|שבץ|מחר|היום|השבוע|זמן)', normalized
+    ))
+    return has_slot_language and has_schedule_signal
+
+def _calendar_datetime(value: str | None) -> datetime | None:
+    """Parse a Google Calendar dateTime and normalise it to the bot timezone."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ) if LOCAL_TZ else parsed
+
+
+def _free_calendar_windows(events: list[dict], start: datetime,
+                           days: int, minimum_minutes: int = 60) -> list[str]:
+    """Calculate deterministic workday windows instead of asking Gemini to.
+
+    Free task-scheduling windows cover Sunday-Friday, 08:00-18:00. The
+    learning goal remains Sunday-Wednesday in the agent prompt, but a user
+    asking for a free slot tomorrow may explicitly mean Thursday or Friday.
+    All-day events block the whole day; timed events are merged before free
+    gaps are calculated, so overlapping events cannot create fake slots.
+    """
+    windows: list[str] = []
+    workdays = {6, 0, 1, 2, 3, 4}  # Sunday-Friday; Saturday is 5
+    for offset in range(days):
+        day = (start + timedelta(days=offset)).date()
+        if day < start.date() or day.weekday() not in workdays:
+            continue
+
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=LOCAL_TZ).replace(hour=8)
+        day_end = day_start.replace(hour=18)
+        busy: list[tuple[datetime, datetime]] = []
+
+        for event in events:
+            event_start = event.get('start', {}) or {}
+            event_end = event.get('end', {}) or {}
+            if event_start.get('date'):
+                event_day = event_start['date']
+                event_end_day = event_end.get('date', event_day)
+                if event_day <= day.isoformat() < event_end_day:
+                    busy.append((day_start, day_end))
+                continue
+            event_begin = _calendar_datetime(event_start.get('dateTime'))
+            event_finish = _calendar_datetime(event_end.get('dateTime'))
+            if event_begin and event_finish and event_finish > day_start and event_begin < day_end:
+                busy.append((max(event_begin, day_start), min(event_finish, day_end)))
+
+        busy.sort(key=lambda interval: interval[0])
+        merged: list[tuple[datetime, datetime]] = []
+        for interval_start, interval_end in busy:
+            if merged and interval_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+            else:
+                merged.append((interval_start, interval_end))
+
+        cursor = max(day_start, start) if day == start.date() else day_start
+        for busy_start, busy_end in merged + [(day_end, day_end)]:
+            if busy_start - cursor >= timedelta(minutes=minimum_minutes):
+                windows.append(
+                    f'{day.strftime("%d/%m")} {cursor.strftime("%H:%M")}–{busy_start.strftime("%H:%M")}'
+                )
+            cursor = max(cursor, busy_end)
+    return windows
+
+
+def get_upcoming_calendar_state(user_id: str, days: int = 7) -> str:
+    """[Agent State Injection] Return events plus server-calculated free windows."""
     cal_id = calendar_id_for(user_id)
     if not cal_id:
         return "לא מחובר יומן גוגל."
@@ -1841,9 +1921,7 @@ def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
             what='State background sync'
         )
         events = events_result.get('items', [])
-        if not events:
-            return f"היומן ריק ופנוי לחלוטין ל-{days} הימים הקרובים."
-        
+        free_windows = _free_calendar_windows(events, now, days)
         lines = []
         for e in events:
             title = e.get('summary', 'ללא שם')
@@ -1852,7 +1930,14 @@ def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
             end = e.get('end', {})
             end_str = end.get('dateTime') or end.get('date', '')
             lines.append(f"- {title}: מ-{start_str} עד {end_str}")
-        return '\n'.join(lines)
+        event_lines = '\n'.join(lines) if lines else 'אין אירועים ביומן בטווח שנבדק.'
+        free_lines = '\n'.join(f'- {window}' for window in free_windows)
+        if not free_lines:
+            free_lines = 'לא נמצא חלון פנוי באורך שעה בימי העבודה שהוגדרו.'
+        return (
+            f'אירועים קיימים:\n{event_lines}\n\n'
+            f'חלונות פנויים מחושבים (לפחות שעה, 08:00–18:00, א׳–ו׳):\n{free_lines}'
+        )
     except Exception as e:
         logger.warning("Background calendar sync failed: %s", e)
         return "לא ניתן לשלוף אירועים מהיומן כרגע."
@@ -1892,6 +1977,13 @@ def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple
     agent_name = 'general'
     if router_calls and router_calls[0][0] == 'route_to_agent':
         agent_name = router_calls[0][1].get('agent_name', 'general')
+
+    # Do not let a probabilistic router turn an unambiguous slot request into
+    # a generic reply. The schedule agent is the only agent that receives the
+    # calendar state and calculated free windows.
+    if _is_proactive_schedule_request(text):
+        agent_name = 'schedule'
+        logger.info('Deterministic schedule routing for slot request: %s', text)
 
     logger.info("Router decided to route request to agent: %s", agent_name)
 
@@ -1992,7 +2084,8 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
     return f'נרשם! {BUDGET_CATEGORIES_HE.get(cat, "💵")}\n*{cat}* ({label}): {amt:,.0f} ש"ח{alert}'
 
 
-def _tool_delete_expense(args: dict, user_id: str) -> str:
+def _tool_delete_expense(args: dict, user_id: str,
+                         context_user_id: str | None = None) -> str:
     """[r6] Cancel a recorded expense/income straight from WhatsApp."""
     txs = get_recent_transactions(user_id, 15)
     if not txs:
@@ -2021,7 +2114,7 @@ def _tool_delete_expense(args: dict, user_id: str) -> str:
     else:
         candidates = txs
 
-    set_user_context(user_id, {'type': 'delete_expense'})
+    set_user_context(context_user_id or user_id, {'type': 'delete_expense'})
     msg = '*איזו תנועה לבטל? (שלח את המספר, אפשר כמה)*\n\n'
     for t in candidates[:12]:
         msg += _format_tx(t) + '\n'
@@ -2080,7 +2173,8 @@ def _tool_add_task(args: dict, user_id: str) -> str:
     add_task(quad, desc, user_id)
     return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
 
-def _tool_propose_event(args: dict, user_id: str) -> str:
+def _tool_propose_event(args: dict, user_id: str,
+                        context_user_id: str | None = None) -> str:
     """שומר את הצעת האירוע בחדר המתנה ומבקש אישור מהמשתמש."""
     title = args.get('title', 'אירוע')
     start_time = args.get('start_time')
@@ -2097,7 +2191,7 @@ def _tool_propose_event(args: dict, user_id: str) -> str:
         'start_time': start_time,
         'duration_minutes': duration
     }
-    set_user_context(user_id, context_data)
+    set_user_context(context_user_id or user_id, context_data)
 
     # מעצבים את התאריך למראה יפה בוואטסאפ
     try:
@@ -2113,7 +2207,32 @@ def _tool_propose_event(args: dict, user_id: str) -> str:
         f"⏰ מתי? {time_str} (למשך {duration} דק').\n\n"
         f"האם לאשר את השיבוץ ביומן? (ענה *כן* / *לא*)"
     )
-def _tool_create_event(args: dict, user_id: str) -> str:
+_EXPLICIT_EVENT_VERB_RE = re.compile(
+    r'(?:קבע|לקבוע|תוסיף|הוסף|שים|לשים|צור|תיצור|תכניס|הכנס|שריין|שריין לי)'
+)
+_PROACTIVE_SCHEDULE_RE = re.compile(
+    r'(?:תמצא לי זמן|מצא לי זמן|חלון פנוי|זמן פנוי|שבץ משימות|שבץ לי|תכנן לי|תציע לי)'
+)
+
+
+def _is_explicit_calendar_request(request_text: str) -> bool:
+    """Allow immediate writes only for a direct user scheduling command.
+
+    Proactive scheduling requests must go through propose_calendar_event so
+    the user can approve a slot selected by the assistant.
+    """
+    text = (request_text or '').strip().lower()
+    if not text or _PROACTIVE_SCHEDULE_RE.search(text):
+        return False
+    has_direct_verb = bool(_EXPLICIT_EVENT_VERB_RE.search(text))
+    has_time_signal = bool(re.search(
+        r'(?:מחר|היום|מחרתיים|ביום|בתאריך|בשעה|ב\s*\d{1,2}(?::\d{2})?|\d{1,2}:\d{2})',
+        text
+    ))
+    return has_direct_verb and has_time_signal
+
+
+def _tool_create_event(args: dict, user_id: str, request_text: str = '') -> str:
     # כאן אנחנו מתעדים את מה שהמודל החליט לשלוח, כדי שנוכל לחקור תקלות בעתיד
     logger.info("create_calendar_event called with args: %s", args)
     
@@ -2121,6 +2240,14 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     start_time_iso = args.get('start_time')
     if not start_time_iso:
         return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
+
+    if not _is_explicit_calendar_request(request_text):
+        return _tool_propose_event({
+            'title': title,
+            'start_time': start_time_iso,
+            'duration_minutes': args.get('duration_minutes') or 60,
+            'explanation': 'בחרתי את הזמן הזה מתוך הבקשה שלך. אישור שלך נדרש לפני הכתיבה ליומן.',
+        }, user_id)
     
     end_time_iso = args.get('end_time')
     is_all_day   = bool(args.get('is_all_day', False))
@@ -2161,10 +2288,11 @@ def _collect_task_queries(args: dict) -> list[str]:
     return [q for q in queries if not (q in seen or seen.add(q))]
 
 
-def _task_picker_message(user_id: str, ctype: str, header: str) -> str:
+def _task_picker_message(user_id: str, ctype: str, header: str,
+                         context_user_id: str | None = None) -> str:
     """List active tasks and arm the numeric-choice context."""
     candidates = get_active_tasks(user_id)
-    set_user_context(user_id, {'type': ctype})
+    set_user_context(context_user_id or user_id, {'type': ctype})
     msg = f'*{header}*\n\n'
     for tid, quad, desc in candidates:
         preview = desc[:40] + ('…' if len(desc) > 40 else '')
@@ -2173,7 +2301,8 @@ def _task_picker_message(user_id: str, ctype: str, header: str) -> str:
     return msg
 
 
-def _tool_complete_task(args: dict, user_id: str) -> str:
+def _tool_complete_task(args: dict, user_id: str,
+                        context_user_id: str | None = None) -> str:
     if not get_active_tasks(user_id):
         return 'אין משימות פתוחות לסיים! 🎉'
 
@@ -2211,12 +2340,14 @@ def _tool_complete_task(args: dict, user_id: str) -> str:
         if get_active_tasks(user_id):
             parts.append(_task_picker_message(
                 user_id, 'complete_task',
-                'איזו משימה סיימת? (אפשר כמה מספרים, או "הכל")'))
+                'איזו משימה סיימת? (אפשר כמה מספרים, או "הכל")',
+                context_user_id))
 
     return '\n\n'.join(parts) if parts else 'לא מצאתי משימה מתאימה. נסה "סטטוס משימות".'
 
 
-def _tool_delete_task(args: dict, user_id: str) -> str:
+def _tool_delete_task(args: dict, user_id: str,
+                      context_user_id: str | None = None) -> str:
     if not get_active_tasks(user_id):
         return 'אין משימות פתוחות למחוק.'
 
@@ -2253,7 +2384,8 @@ def _tool_delete_task(args: dict, user_id: str) -> str:
         if get_active_tasks(user_id):
             parts.append(_task_picker_message(
                 user_id, 'delete_task',
-                'איזו משימה למחוק? (אפשר כמה מספרים, או "הכל")'))
+                'איזו משימה למחוק? (אפשר כמה מספרים, או "הכל")',
+                context_user_id))
 
     return '\n\n'.join(parts) if parts else 'לא מצאתי משימה מתאימה. נסה "סטטוס משימות".'
 
@@ -2272,7 +2404,8 @@ def _tool_set_limit(args: dict, user_id: str) -> str:
     return f'✅ תקרת התקציב לקטגוריית *{cat}* עודכנה ל-{amt:,.0f} ש"ח.'
 
 
-def execute_tool(name: str, args: dict, user_id: str) -> str:
+def execute_tool(name: str, args: dict, user_id: str,
+                 request_text: str = '', context_user_id: str | None = None) -> str:
     """Dispatch a single validated tool call to its handler."""
     handlers = {
         'add_expense':            _tool_add_expense,
@@ -2295,6 +2428,16 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
         logger.warning('Unknown tool requested: %s', name)
         return 'לא הצלחתי לבצע את הפעולה. נסה לנסח אחרת או כתוב "תפריט".'
     try:
+        if name == 'create_calendar_event':
+            return _tool_create_event(args, user_id, request_text)
+        if name == 'delete_expense':
+            return _tool_delete_expense(args, user_id, context_user_id)
+        if name == 'propose_calendar_event':
+            return _tool_propose_event(args, user_id, context_user_id)
+        if name == 'complete_task':
+            return _tool_complete_task(args, user_id, context_user_id)
+        if name == 'delete_task':
+            return _tool_delete_task(args, user_id, context_user_id)
         return handler(args, user_id)
     except Exception:
         logger.exception('Tool "%s" failed (args=%s)', name, args)
@@ -2430,7 +2573,8 @@ def _record_confirmed_expenses(items: list[dict], user_id: str) -> str:
 
 
 def process_image_message(image_data: bytes | None, mime_type: str,
-                          caption: str, user_id: str) -> str:
+                          caption: str, user_id: str,
+                          session_user_id: str | None = None) -> str:
     """[r14] Smart image handling via ONE structured multimodal call:
       • receipt OR full bank/credit statement → extract EVERY transaction →
         CONFIRM, then add them all (each to its category).
@@ -2438,6 +2582,7 @@ def process_image_message(image_data: bytes | None, mime_type: str,
       • anything else → a short description.
     Money is NEVER auto-written from an image — it always waits for the user's
     'כן' (the confirm_expenses context in process_message). Safe by construction."""
+    context_user_id = session_user_id or user_id
     client = get_genai_client()
     cap = (caption or '').strip()
     if not client or not image_data:
@@ -2454,7 +2599,7 @@ def process_image_message(image_data: bytes | None, mime_type: str,
     if kind == 'expenses':
         items = _valid_expense_items(data.get('expenses'))
         if items:
-            set_user_context(user_id, {'type': 'confirm_expenses', 'items': items})
+            set_user_context(context_user_id, {'type': 'confirm_expenses', 'items': items})
             return _confirm_expenses_message(items)
 
     # ── A single calendar event ──
@@ -2469,15 +2614,15 @@ def process_image_message(image_data: bytes | None, mime_type: str,
             reply = process_calendar_ai((ev.get('title') or 'אירוע').strip(), start,
                                         (ev.get('location') or '').strip() or None,
                                         user_id, dur if dur > 0 else 60)
-            append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
-            append_conversation(user_id, 'model', reply)
+            append_conversation(context_user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
+            append_conversation(context_user_id, 'model', reply)
             return reply
 
     # ── Anything else → description ──
     txt = (data.get('text') or '').strip()
     reply = f'📷 {txt}' if txt else describe_image_with_ai(image_data, mime_type, caption)
-    append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
-    append_conversation(user_id, 'model', reply)
+    append_conversation(context_user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
+    append_conversation(context_user_id, 'model', reply)
     return reply
 
 
@@ -2802,7 +2947,8 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 # Message Processing
 # ─────────────────────────────────────────────
 
-def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
+def _handle_numeric_context(ctype: str, text: str, user_id: str,
+                           context_user_id: str | None = None) -> str:
     """[r6] Shared numeric-choice flow for complete_task / delete_task /
     delete_expense. Accepts several numbers at once ("1 3 5" / "1,3,5") and
     the word "הכל" for tasks."""
@@ -2814,7 +2960,7 @@ def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
                   else delete_task_by_id(tid, user_id))
             if ok:
                 n += 1
-        delete_user_context(user_id)
+        delete_user_context(context_user_id or user_id)
         if ctype == 'complete_task':
             return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו.'
         return f'🗑️ נמחקו {n} משימות. הרשימה ריקה.'
@@ -2847,7 +2993,7 @@ def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
                 bad_ids.append(item_id)
 
     if ok_lines:
-        delete_user_context(user_id)
+        delete_user_context(context_user_id or user_id)
         head = {'complete_task': 'מעולה! 🎉 סומנו כהושלמו:',
                 'delete_task':   '🗑️ נמחקו:',
                 'delete_expense': '🗑️ בוטלו:'}[ctype]
@@ -2858,16 +3004,19 @@ def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
     return 'לא מצאתי פריט עם המספרים האלה. נסה שוב (או "ביטול").'
 
 
-def process_message(text: str, user_id: str, admin_phone: str | None = None) -> str:
+def process_message(text: str, user_id: str, admin_phone: str | None = None,
+                    session_user_id: str | None = None) -> str:
     text = (text or '').strip()
     if not text:
         return 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
 
+    context_user_id = session_user_id or user_id
+
     # ── Multi-step context flow ──────────────
-    context = get_user_context(user_id)
+    context = get_user_context(context_user_id)
     if context:
         if text in ('ביטול', 'בטל'):
-            delete_user_context(user_id)
+            delete_user_context(context_user_id)
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
@@ -2880,15 +3029,15 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                 title = context.get('title')
                 start_time = context.get('start_time')
                 duration = context.get('duration_minutes', 60)
-                delete_user_context(user_id)
+                delete_user_context(context_user_id)
                 # המשתמש אישר! עכשיו באמת קובעים ביומן דרך הפונקציה הרגילה
                 return process_calendar_ai(title, start_time, None, user_id, duration)
             if no:
-                delete_user_context(user_id)
+                delete_user_context(context_user_id)
                 return 'ביטלתי את השיבוץ 👍 מתי תרצה שאקבע את זה במקום?'
             
             # אם הוא ענה משהו שלא קשור לכן/לא, נמחק את ההצעה וניתן למערכת לעבד כרגיל
-            delete_user_context(user_id)
+            delete_user_context(context_user_id)
         if ctype in ('confirm_expense', 'confirm_expenses'):
             # Confirm expense(s) the bot extracted from a RECEIPT or STATEMENT
             # image. Strict on purpose: a reply containing a DIGIT is treated as
@@ -2900,16 +3049,16 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                    or clean in ('בטח', 'סבבה', 'בסדר', 'yes', 'y', 'ok', 'okay', '👍', '✅', '✓')))
             no = clean.startswith('לא') or clean in ('בטל', 'ביטול', 'no', 'n', '❌')
             if yes:
-                delete_user_context(user_id)
+                delete_user_context(context_user_id)
                 if ctype == 'confirm_expenses':
                     return _record_confirmed_expenses(context.get('items') or [], user_id)
                 return _tool_add_expense(
                     {'amount': context.get('amount'), 'category': context.get('category'),
                      'description': context.get('description', '')}, user_id)
             if no:
-                delete_user_context(user_id)
+                delete_user_context(context_user_id)
                 return 'בוטל — לא רשמתי כלום 👍'
-            delete_user_context(user_id)   # unclear answer — drop & process normally
+            delete_user_context(context_user_id)   # unclear answer — drop & process normally
         if ctype in ('complete_task', 'delete_task', 'delete_expense'):
             # [r6.1] Only treat the reply as a numeric choice if it really is
             # one ("3", "1 4 7", "משימה 2", "הכל"). If the user changed topic
@@ -2918,8 +3067,9 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             leftover = re.sub(r'[\d\s,.\-]+', '', text)
             if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'אתהכול', 'ו', 'וגם',
                             'משימה', 'משימות', 'מספר', 'תנועה', 'הוצאה'):
-                return _handle_numeric_context(ctype, text, user_id)
-            delete_user_context(user_id)   # picker abandoned — fall through
+                return _handle_numeric_context(ctype, text, user_id,
+                                               context_user_id)
+            delete_user_context(context_user_id)   # picker abandoned — fall through
 
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
@@ -2931,7 +3081,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     # Clear this account's conversation memory — the instant cure for a stuck
     # repetition-loop that keeps replaying garbage from history.
     if text.lower() in ('נקה שיחה', 'אפס שיחה', 'איפוס שיחה', 'שכח', 'reset', 'clear'):
-        clear_conversation(user_id)
+        clear_conversation(context_user_id)
         return '🧹 ניקיתי את זיכרון השיחה. אפשר להתחיל מחדש.'
 
     if text.lower() in ('מי אני', 'מי אני?', 'whoami', 'איזה מספר אני', 'המספר שלי'):
@@ -2963,7 +3113,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         return shortcut
 
     # ── AI routing with conversation memory (multi-turn understanding) ──
-    history = get_recent_conversation(user_id)
+    history = get_recent_conversation(context_user_id)
     try:
         tool_calls, reply_text = get_ai_tool_calls(text, user_id, history)
     except Exception:
@@ -2979,7 +3129,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         results: list[str] = []
         seen: set[str] = set()
         for name, args in tool_calls:
-            r = execute_tool(name, args, user_id)
+            r = execute_tool(name, args, user_id, text, context_user_id)
             if r and r not in seen and not _looks_degenerate(r):
                 seen.add(r)
                 results.append(r)
@@ -2990,12 +3140,13 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         reply = 'לא הבנתי בדיוק 🤔 נסה לנסח אחרת, או כתוב "תפריט" לרשימת היכולות.'
 
     # Remember this exchange so follow-up messages have context.
-    append_conversation(user_id, 'user', text)
-    append_conversation(user_id, 'model', reply)
+    append_conversation(context_user_id, 'user', text)
+    append_conversation(context_user_id, 'model', reply)
     return reply
 
 
-def process_media_message(message: dict, user_id: str) -> str:
+def process_media_message(message: dict, user_id: str,
+                          session_user_id: str | None = None) -> str:
     """Handle non-text message types (image, audio, document)."""
     msg_type  = message.get('type', '')
     media_obj = message.get(msg_type, {}) or {}
@@ -3010,14 +3161,16 @@ def process_media_message(message: dict, user_id: str) -> str:
         return 'הקובץ גדול מדי לעיבוד (מעל ~18MB). שלח גרסה קטנה יותר או את הטקסט ישירות.'
 
     if msg_type == 'image':
-        return process_image_message(media_data, mime_type, caption, user_id)
+        return process_image_message(media_data, mime_type, caption, user_id,
+                         session_user_id)
 
     if msg_type == 'audio':
         transcript = transcribe_audio_with_ai(media_data, mime_type)
         if not transcript:
             return ('🎤 קיבלתי הקלטה אך לא הצלחתי לתמלל אותה.\n'
                     'נסה שוב, או שלח את ההודעה כטקסט.')
-        result = process_message(transcript, user_id)
+        result = process_message(transcript, user_id,
+                     session_user_id=session_user_id)
         return f'🎤 _שמעתי:_ "{transcript}"\n\n{result}'
 
     if msg_type == 'document':
@@ -3233,13 +3386,16 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
         if msg_type == 'text':
             text = message.get('text', {}).get('body', '')
             if text and text.strip():
-                response = process_message(text, account_id, admin_phone=from_number)
+                response = process_message(
+                    text, account_id, admin_phone=from_number,
+                    session_user_id=from_number)
             else:
                 response = 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
         elif msg_type in MEDIA_TYPES:
             if SEND_MEDIA_ACK:
                 send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
-            response = process_media_message(message, account_id)
+            response = process_media_message(
+                message, account_id, session_user_id=from_number)
         else:
             logger.warning('Unsupported message type "%s" from %s', msg_type, from_number)
             response = (f'קיבלתי הודעה מסוג שאני עדיין לא יודע לקרוא ({msg_type or "לא ידוע"}).\n'
