@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-06-15-r15'
+BUILD_VERSION = '2026-09-17-r16'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -1818,8 +1818,84 @@ def _build_contents(text: str, history) -> list:
     contents.append({'role': 'user', 'parts': [{'text': text}]})
     return contents
 
-def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
-    """[Agent State Injection] שולף אירועים קיימים בגוגל יומן כדי שהסוכן ידע מתי יש למשתמש זמן פנוי."""
+
+def _is_proactive_schedule_request(text: str) -> bool:
+    """Detect slot-finding requests that must reach the schedule agent."""
+    normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    has_slot_language = bool(re.search(
+        r'(?:חלון\s+פנוי|זמן\s+פנוי|מצא\s+לי\s+זמן|תמצא\s+לי\s+זמן|'
+        r'שבץ\s+(?:לי\s+)?(?:את\s+)?(?:המשימה|משימות)|'
+        r'למצוא\s+זמן\s+ל(?:שבץ|למידה))', normalized
+    ))
+    has_schedule_signal = bool(re.search(
+        r'(?:יומן|משימה|משימות|למידה|שבץ|מחר|היום|השבוע|זמן)', normalized
+    ))
+    return has_slot_language and has_schedule_signal
+
+def _calendar_datetime(value: str | None) -> datetime | None:
+    """Parse a Google Calendar dateTime and normalise it to the bot timezone."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ) if LOCAL_TZ else parsed
+
+
+def _free_calendar_windows(events: list[dict], start: datetime,
+                           days: int, minimum_minutes: int = 60) -> list[str]:
+    """Calculate free task-scheduling windows without relying on Gemini."""
+    windows: list[str] = []
+    workdays = {6, 0, 1, 2, 3, 4}  # Sunday-Friday; Saturday is 5
+    for offset in range(days):
+        day = (start + timedelta(days=offset)).date()
+        if day < start.date() or day.weekday() not in workdays:
+            continue
+
+        day_start = datetime.combine(
+            day, datetime.min.time(), tzinfo=LOCAL_TZ).replace(hour=8)
+        day_end = day_start.replace(hour=18)
+        busy: list[tuple[datetime, datetime]] = []
+        for event in events:
+            event_start = event.get('start', {}) or {}
+            event_end = event.get('end', {}) or {}
+            if event_start.get('date'):
+                event_day = event_start['date']
+                event_end_day = event_end.get('date', event_day)
+                if event_day <= day.isoformat() < event_end_day:
+                    busy.append((day_start, day_end))
+                continue
+            event_begin = _calendar_datetime(event_start.get('dateTime'))
+            event_finish = _calendar_datetime(event_end.get('dateTime'))
+            if (event_begin and event_finish and event_finish > day_start
+                    and event_begin < day_end):
+                busy.append((max(event_begin, day_start),
+                             min(event_finish, day_end)))
+
+        busy.sort(key=lambda interval: interval[0])
+        merged: list[tuple[datetime, datetime]] = []
+        for interval_start, interval_end in busy:
+            if merged and interval_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+            else:
+                merged.append((interval_start, interval_end))
+
+        cursor = max(day_start, start) if day == start.date() else day_start
+        for busy_start, busy_end in merged + [(day_end, day_end)]:
+            if busy_start - cursor >= timedelta(minutes=minimum_minutes):
+                windows.append(
+                    f'{day.strftime("%d/%m")} {cursor.strftime("%H:%M")}–'
+                    f'{busy_start.strftime("%H:%M")}'
+                )
+            cursor = max(cursor, busy_end)
+    return windows
+
+
+def get_upcoming_calendar_state(user_id: str, days: int = 7) -> str:
+    """Return existing events and server-calculated free windows."""
     cal_id = calendar_id_for(user_id)
     if not cal_id:
         return "לא מחובר יומן גוגל."
@@ -1841,9 +1917,7 @@ def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
             what='State background sync'
         )
         events = events_result.get('items', [])
-        if not events:
-            return f"היומן ריק ופנוי לחלוטין ל-{days} הימים הקרובים."
-        
+        free_windows = _free_calendar_windows(events, now, days)
         lines = []
         for e in events:
             title = e.get('summary', 'ללא שם')
@@ -1852,7 +1926,14 @@ def get_upcoming_calendar_state(user_id: str, days: int = 3) -> str:
             end = e.get('end', {})
             end_str = end.get('dateTime') or end.get('date', '')
             lines.append(f"- {title}: מ-{start_str} עד {end_str}")
-        return '\n'.join(lines)
+        event_lines = '\n'.join(lines) if lines else 'אין אירועים ביומן בטווח שנבדק.'
+        free_lines = '\n'.join(f'- {window}' for window in free_windows)
+        if not free_lines:
+            free_lines = 'לא נמצא חלון פנוי באורך שעה בימים שנבדקו.'
+        return (
+            f'אירועים קיימים:\n{event_lines}\n\n'
+            f'חלונות פנויים מחושבים (לפחות שעה, 08:00–18:00, א׳–ו׳):\n{free_lines}'
+        )
     except Exception as e:
         logger.warning("Background calendar sync failed: %s", e)
         return "לא ניתן לשלוף אירועים מהיומן כרגע."
@@ -1892,6 +1973,13 @@ def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple
     agent_name = 'general'
     if router_calls and router_calls[0][0] == 'route_to_agent':
         agent_name = router_calls[0][1].get('agent_name', 'general')
+
+    # Do not let a probabilistic router turn an unambiguous slot request into
+    # a generic reply. The schedule agent is the only agent that receives the
+    # calendar state and calculated free windows.
+    if _is_proactive_schedule_request(text):
+        agent_name = 'schedule'
+        logger.info('Deterministic schedule routing for slot request: %s', text)
 
     logger.info("Router decided to route request to agent: %s", agent_name)
 
