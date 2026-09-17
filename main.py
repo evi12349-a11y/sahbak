@@ -3419,6 +3419,8 @@ PUBLIC_BASE_URL = _clean_base_url(
 # (same origin as the API → zero CORS and a real, shareable URL).
 DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    'dashboard.html')
+EXAMS_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'exams.html')
 
 
 def _get_user_id():
@@ -3475,6 +3477,23 @@ def dashboard_page():
     cfg = {'url': '', 'key': '', 'userId': user_id, 'token': token}
     inject = '<script>window.__SAHBAK_CFG__=' + json.dumps(cfg) + ';</script>'
     html = html.replace('</head>', inject + '\n</head>', 1)
+    return Response(html, mimetype='text/html; charset=utf-8')
+
+
+@app.route('/exams', methods=['GET'])
+def exams_page():
+    """Serve the exam-practice MVP.
+
+    The page intentionally owns a small, clearly marked mock data set until
+    scanned-PDF extraction and persistence are specified. Its UI data shape
+    is already exam -> questions -> options/answer/solution, so a parser can
+    replace the fixture without changing the interaction layer.
+    """
+    try:
+        with open(EXAMS_HTML_PATH, encoding='utf-8') as f:
+            html = f.read()
+    except FileNotFoundError:
+        return 'exams.html חסר בפריסה — יש להעלות אותו לריפו ליד main.py.', 404
     return Response(html, mimetype='text/html; charset=utf-8')
 
 
