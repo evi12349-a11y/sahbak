@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="he" dir="rtl" data-theme="dark">
+<html lang="he" dir="rtl" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -74,18 +74,23 @@ input,select{font:inherit;color:var(--text)}
 .btn-cta:hover{background:var(--primary-h)}
 .btn-cta:active{transform:scale(.98)}
 
-.main{padding:1.5rem;max-width:1280px;margin:0 auto;width:100%}
+.main{padding:1.75rem 1.5rem 5rem;max-width:1160px;margin:0 auto;width:100%}
 @media(max-width:600px){.main{padding:1rem .875rem}}
-.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.875rem;margin-bottom:1.75rem}
-.kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.25rem;box-shadow:var(--sh-sm);transition:box-shadow .15s}
+.page-intro{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;margin:0 0 1.5rem}
+.page-intro h1{font-size:1.45rem;line-height:1.2;margin-bottom:.2rem}
+.page-intro p{color:var(--muted);font-size:.86rem}
+.page-intro .period{font-size:.8rem;color:var(--muted);background:var(--surface);border:1px solid var(--border);padding:.45rem .7rem;border-radius:8px;white-space:nowrap}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin-bottom:1.5rem}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;box-shadow:var(--sh-sm);transition:box-shadow .15s}
 .kpi-lbl{font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.375rem}
 .kpi-val{font-size:1.65rem;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
 .kpi-sub{font-size:.75rem;color:var(--muted);margin-top:.3rem}
 .c-pos{color:var(--success)}.c-neg{color:var(--error)}.c-pri{color:var(--primary)}.c-gold{color:var(--gold)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.125rem;margin-bottom:1.75rem}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem}
 @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+@media(max-width:680px){.kpis{grid-template-columns:repeat(2,1fr)}.page-intro{display:block}.page-intro .period{display:inline-block;margin-top:.75rem}}
 
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.25rem;box-shadow:var(--sh-sm)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.15rem;box-shadow:var(--sh-sm)}
 .card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
 .card-title{font-size:.9rem;font-weight:700}
 .card-meta{font-size:.75rem;color:var(--muted)}
@@ -170,7 +175,6 @@ input,select{font:inherit;color:var(--text)}
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">💸 תנועה</button>
       <button class="tab-btn" onclick="switchTab('bud')" id="tab-btn-bud">📊 תקציב</button>
-      <button class="tab-btn" onclick="switchTab('rec')" id="tab-btn-rec">🗓️ קבוע</button>
       <button class="tab-btn" onclick="switchTab('tsk')" id="tab-btn-tsk">✅ משימה</button>
     </div>
     
@@ -205,14 +209,6 @@ input,select{font:inherit;color:var(--text)}
       <button class="btn-cta" onclick="saveBudgetLimit()">שמור יעד תקציב</button>
     </div>
 
-    <div class="tab-content" id="tab-rec">
-      <div class="f-group"><label>קטגוריה</label><select id="rCat"><option value="בילויים">🎉 בילויים</option><option value="דיור">🏠 דיור</option><option value="רכב">🚗 רכב</option><option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="הכנסה">💰 הכנסה קבועה</option></select></div>
-      <div class="f-group"><label>סכום (₪)</label><input type="number" id="rAmt" placeholder="0"></div>
-      <div class="f-group"><label>יום חיוב בחודש (1-31)</label><input type="number" id="rDay" placeholder="למשל: 10" min="1" max="31"></div>
-      <div class="f-group"><label>תיאור העסק</label><input type="text" id="rDesc" placeholder="למשל: נטפליקס"></div>
-      <button class="btn-cta" onclick="addRecurring()">שמור הוראת קבע</button>
-    </div>
-
     <div class="tab-content" id="tab-tsk">
       <div class="f-group"><label>תיאור המשימה</label><input type="text" id="newTDesc"></div>
       <div class="f-group"><label>דחיפות</label><select id="newTQ"><option value="חשוב דחוף">🔴 חשוב דחוף</option><option value="חשוב לא דחוף" selected>🟡 חשוב לא דחוף</option><option value="דחוף לא חשוב">🟠 דחוף לא חשוב</option><option value="לא דחוף לא חשוב">🟢 לא חשוב</option></select></div>
@@ -223,6 +219,10 @@ input,select{font:inherit;color:var(--text)}
 
 <main class="main" id="main" style="display:none">
   <div class="err-banner" id="errBanner"><span>⚠️</span><div><strong>שגיאת חיבור</strong><br><span id="errMsg"></span></div></div>
+  <div class="page-intro">
+    <div><h1>שלום, זה הסדר שלך</h1><p>תמונת מצב קצרה של הכסף, המשימות והיום שלך.</p></div>
+    <div class="period">החודש: <span id="pageMonth">—</span></div>
+  </div>
   <div class="kpis">
     <div class="kpi"><div class="kpi-lbl">מאזן פנוי</div><div class="kpi-val c-pri" id="kBalance">—</div><div class="kpi-sub" id="kMonth"></div></div>
     <div class="kpi"><div class="kpi-lbl">הוצאות</div><div class="kpi-val c-neg" id="kExp">—</div><div class="kpi-sub">החודש</div></div>
@@ -243,19 +243,12 @@ input,select{font:inherit;color:var(--text)}
 
   <div class="grid2">
     <div class="card">
-      <div class="card-hdr"><div class="card-title">💸 תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
-      <div class="list-cont" id="txList"><div class="sk" style="height:46px;margin-bottom:.35rem"></div></div>
-    </div>
-    <div class="card">
-      <div class="card-hdr"><div class="card-title">🗓️ מינויים והוראות קבע</div></div>
-      <div class="list-cont" id="recList"><div class="empty"><p>בקרוב: מינויים יוצגו כאן!</p></div></div>
-    </div>
-  </div>
-  
-  <div class="grid2" style="grid-template-columns: 1fr;">
-    <div class="card">
       <div class="card-hdr"><div class="card-title">✅ משימות</div><div class="card-meta" id="tCount"></div></div>
       <div class="list-cont" id="tList"><div class="sk" style="height:42px;margin-bottom:.4rem"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><div class="card-title">💸 תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
+      <div class="list-cont" id="txList"><div class="sk" style="height:46px;margin-bottom:.35rem"></div></div>
     </div>
   </div>
 </main>
@@ -331,6 +324,7 @@ function renderKPIs(d){
   document.getElementById('kBalance').className='kpi-val '+(bal>=0?'c-pos':'c-neg');
   document.getElementById('kExp').textContent=fmt(exp); document.getElementById('kInc').textContent=fmt(inc);
   document.getElementById('kMonth').textContent=d.month||''; document.getElementById('bMonth').textContent=d.month||'';
+  document.getElementById('pageMonth').textContent=d.month||'—';
   document.getElementById('kTasks').textContent=(d.tasks||[]).length; document.getElementById('kTaskSub').textContent=`הושלמו ${d.tasks_completed||0}/${d.tasks_total||0}`;
   document.getElementById('tCount').textContent=(d.tasks||[]).length+' משימות'; document.getElementById('txCount').textContent=(d.transactions||[]).length+' תנועות';
 }
@@ -424,8 +418,6 @@ async function addExp(){
   if(!amt||amt<=0){toast('⚠️ הכנס סכום');return;}
   try{await api('/api/expense','POST',{user_id:C.userId,category:cat,amount:amt,description:desc});document.getElementById('eAmt').value='';document.getElementById('eDesc').value=''; closeAddModal(); toast('✅ נרשם'); await load();}catch(e){toast('❌ '+e.message);}
 }
-
-async function addRecurring(){toast('🔄 שומר הוראת קבע (השרת יעודכן בקרוב)...');closeAddModal();}
 
 // הפונקציה החדשה שמקפיצה את המודל המעוצב במקום ה-prompt המיושן
 function editBudget(cat){
