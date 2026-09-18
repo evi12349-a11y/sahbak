@@ -98,6 +98,8 @@ input,select{font:inherit;color:var(--text)}
 .b-list{display:flex;flex-direction:column;gap:.7rem}
 .b-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.25rem}
 .b-cat{font-size:.85rem;font-weight:600;display:flex;align-items:center;gap:6px}
+.budget-action{display:inline-flex;align-items:center;gap:.35rem;padding:.38rem .62rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-2);color:var(--primary);font-size:.76rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
+.budget-action:hover{background:var(--primary-hl);color:var(--primary-h)}
 .b-edit-btn{color:var(--muted);background:var(--surface-off);border-radius:4px;padding:2px 5px;font-size:.7rem;cursor:pointer;transition:.2s}
 .b-edit-btn:hover{color:var(--text);background:var(--divider)}
 .b-amounts{font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
@@ -232,7 +234,7 @@ input,select{font:inherit;color:var(--text)}
 
   <div class="grid2">
     <div class="card">
-      <div class="card-hdr"><div class="card-title">📊 תקציב לפי קטגוריה</div><div class="card-meta" id="bMonth"></div></div>
+      <div class="card-hdr"><div class="card-title">📊 תקציב לפי קטגוריה</div><button class="budget-action" onclick="editBudget('')" title="הגדרת תקציב">✏️ עריכת תקציב</button><div class="card-meta" id="bMonth"></div></div>
       <div class="b-list" id="bList"><div class="sk" style="height:36px;margin-bottom:.5rem"></div></div>
     </div>
     <div class="card">
