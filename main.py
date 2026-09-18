@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-18-r19'
+BUILD_VERSION = '2026-09-18-r20'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -440,7 +440,14 @@ def init_db() -> None:
                 description TEXT    NOT NULL,
                 created_at  TEXT    NOT NULL,
                 completed   INTEGER NOT NULL DEFAULT 0,
-                user_id     TEXT    NOT NULL
+                user_id     TEXT    NOT NULL,
+                duration_minutes INTEGER NOT NULL DEFAULT 60,
+                color_id    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id        TEXT PRIMARY KEY,
+                preferences_json TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS contexts (
@@ -487,6 +494,8 @@ def init_db() -> None:
         # 3) Migrate OLD budget/tasks tables that predate the user_id column.
         _ensure_column(conn, 'budget', 'user_id', 'TEXT')
         _ensure_column(conn, 'tasks',  'user_id', 'TEXT')
+        _ensure_column(conn, 'tasks',  'duration_minutes', 'INTEGER NOT NULL DEFAULT 60')
+        _ensure_column(conn, 'tasks',  'color_id', 'TEXT')
 
         # 4) Indexes — only now that user_id is guaranteed to exist.
         c.executescript('''
@@ -919,11 +928,55 @@ def _format_tx(t: dict) -> str:
 
 # ── Task helpers ─────────────────────────────
 
-def add_task(quadrant: str, description: str, user_id: str) -> None:
+def add_task(quadrant: str, description: str, user_id: str,
+             duration_minutes: int = 60, color_id: str | None = None) -> None:
     with _connect() as conn:
         conn.execute(
-            'INSERT INTO tasks (quadrant, description, created_at, completed, user_id) VALUES (?, ?, ?, 0, ?)',
-            (quadrant, description, now_local().isoformat(), user_id)
+            'INSERT INTO tasks (quadrant, description, created_at, completed, user_id, '
+            'duration_minutes, color_id) VALUES (?, ?, ?, 0, ?, ?, ?)',
+            (quadrant, description, now_local().isoformat(), user_id,
+             duration_minutes, color_id)
+        )
+        conn.commit()
+
+
+def get_task_details(task_id: int, user_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT id, quadrant, description, duration_minutes, color_id '
+            'FROM tasks WHERE id = ? AND user_id = ? AND completed = 0',
+            (task_id, user_id)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        'id': row[0], 'quadrant': row[1], 'description': row[2],
+        'duration_minutes': max(15, min(int(row[3] or 60), 12 * 60)),
+        'color_id': row[4],
+    }
+
+
+def get_user_preferences(user_id: str) -> dict:
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT preferences_json FROM user_preferences WHERE user_id = ?',
+            (user_id,)
+        ).fetchone()
+    if not row:
+        return {}
+    try:
+        value = json.loads(row[0])
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def set_user_preferences(user_id: str, preferences: dict) -> None:
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO user_preferences (user_id, preferences_json) '
+            'VALUES (?, ?)',
+            (user_id, json.dumps(preferences, ensure_ascii=False))
         )
         conn.commit()
 
@@ -1542,6 +1595,7 @@ SCHEDULE_TOOLS = [
                 'duration_minutes': {'type': 'integer', 'description': 'משך האירוע בדקות.'},
                 'recurrence': {'type': 'string', 'description': 'כלל RRULE לאירוע חוזר.'},
                 'location': {'type': 'string', 'description': 'מיקום.'},
+                'color': {'type': 'string', 'description': 'צבע האירוע/התראה בעברית.'},
             },
             'required': ['title', 'start_time'],
         },
@@ -1572,6 +1626,20 @@ SCHEDULE_TOOLS = [
             'required': ['title', 'start_time', 'duration_minutes', 'explanation'],
         },
     ),
+    _make_function_declaration(
+        'set_schedule_preferences',
+        'שמירת העדפות תכנון אישיות למשתמש. שמור רק העדפות מפורשות וברורות.',
+        {
+            'type': 'object',
+            'properties': {
+                'preferred_start': {'type': 'string', 'description': 'שעת התחלה מועדפת, למשל 08:00.'},
+                'preferred_end': {'type': 'string', 'description': 'שעת סיום מועדפת, למשל 18:00.'},
+                'avoid_weekdays': {'type': 'array', 'items': {'type': 'string'}, 'description': 'ימים שהמשתמש ביקש לא לשבץ בהם.'},
+                'break_minutes': {'type': 'integer', 'description': 'מרווח מועדף בין משימות בדקות.'},
+            },
+            'required': [],
+        },
+    ),
     
 ]
 
@@ -1585,6 +1653,8 @@ TASK_TOOLS = [
             'properties': {
                 'quadrant': {'type': 'string', 'enum': VALID_QUADRANTS, 'description': 'דחיפות המשימה.'},
                 'description': {'type': 'string', 'description': 'תיאור המשימה.'},
+                'duration_minutes': {'type': 'integer', 'description': 'משך משוער בדקות. ברירת מחדל 60.'},
+                'color': {'type': 'string', 'description': 'צבע התראה אופציונלי בעברית.'},
             },
             'required': ['quadrant', 'description'],
         },
@@ -1744,7 +1814,8 @@ def _get_agent_prompt(agent_name: str) -> str:
             '2. התאוששות מבלת"מים: עזור למשתמש למצוא זמן חלופי ביומן ללמידה אם פספס.\n'
             '3. בקרת אנוש (Human-in-the-Loop): אין לשבץ חלונות למידה או משימות ללא אישור! השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון שלך.\n'
             '4. שיבוץ משימות אקטיבי: בתחתית פרומפט זה קיבלת את מצב היומן ואת בנק המשימות. כשמבקשים לשבץ משימות או למצוא חלונות זמן, נתח מיד את רשימת "חלונות פנויים מחושבים". לעולם אל תשאל "מתי נוח לך" ואל תבקש מהמשתמש לבחור שעה אם כבר קיימים חלונות ברשימה. בחר את החלון הראשון שמתאים למשימה, ואם מחר הוא שבת או שאין בו חלון, הצע את יום העבודה הבא שמופיע ברשימה. עבור כל משימה הפעל את הכלי "propose_calendar_event" כדי לשלוח הצעת שיבוץ מסודרת ביומן.\n'
-            '5. השתמש תמיד בפורמט ISO 8601 לזמנים.'
+            '5. השתמש תמיד בפורמט ISO 8601 לזמנים.\n'
+            '6. אם המשתמש מציין העדפה אישית ברורה לשעות, ימי מנוחה או הפסקות, שמור אותה באמצעות set_schedule_preferences. אל תנחש העדפות.'
         )
     
     elif agent_name == 'tasks':
@@ -1987,6 +2058,136 @@ def _calendar_slots_reply(user_id: str, days: int = 7) -> str:
                      for task_id, _quadrant, description in tasks[:12])
         lines.append('\nבחר מספר משימה וחלון, או כתוב "שבץ את הראשונה בחלון הראשון".')
     return '\n'.join(lines)
+
+
+def _is_week_plan_request(text: str) -> bool:
+    normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    return bool(re.search(
+        r'(?:תכנן|תכנון|סדר|ארגן).*(?:שבוע|משימות)|'
+        r'(?:שבץ|לשבץ).*(?:כל המשימות|השבוע)', normalized
+    ))
+
+
+def _task_priority_key(task: dict) -> tuple[int, int]:
+    order = {
+        'חשוב דחוף': 0,
+        'דחוף לא חשוב': 1,
+        'חשוב לא דחוף': 2,
+        'לא דחוף לא חשוב': 3,
+    }
+    return order.get(task['quadrant'], 4), task['id']
+
+
+def _parse_slot_label(label: str, reference: datetime) -> tuple[datetime, datetime] | None:
+    match = re.match(r'^(\d{2})/(\d{2}) (\d{2}:\d{2})–(\d{2}:\d{2})$', label)
+    if not match:
+        return None
+    day, month, start_text, end_text = match.groups()
+    try:
+        start = datetime.fromisoformat(
+            f'{reference.year:04d}-{month}-{day}T{start_text}'
+        ).replace(tzinfo=LOCAL_TZ)
+        end = datetime.fromisoformat(
+            f'{reference.year:04d}-{month}-{day}T{end_text}'
+        ).replace(tzinfo=LOCAL_TZ)
+        if end <= start:
+            return None
+        return start, end
+    except ValueError:
+        return None
+
+
+def _build_week_plan(user_id: str, days: int = 7) -> str:
+    events, error = _read_calendar_events(user_id, days)
+    if error:
+        return f'לא הצלחתי לבנות תוכנית: {error}'
+    slots = _free_calendar_windows(events or [], now_local(), days,
+                                   minimum_minutes=15)
+    preferences = get_user_preferences(user_id)
+    avoid_weekdays = set(preferences.get('avoid_weekdays') or [])
+    weekday_names = {
+        'ראשון': 6, 'שני': 0, 'שלישי': 1, 'רביעי': 2,
+        'חמישי': 3, 'שישי': 4, 'שבת': 5,
+    }
+    preferred_start = preferences.get('preferred_start')
+    preferred_end = preferences.get('preferred_end')
+    filtered_slots = []
+    for label in slots:
+        parsed = _parse_slot_label(label, now_local())
+        if not parsed:
+            continue
+        slot_start, slot_end = parsed
+        if any(slot_start.weekday() == weekday_names.get(day) for day in avoid_weekdays):
+            continue
+        if preferred_start:
+            try:
+                hour, minute = map(int, preferred_start.split(':'))
+                slot_start = slot_start.replace(hour=hour, minute=minute)
+            except (TypeError, ValueError):
+                pass
+        if preferred_end:
+            try:
+                hour, minute = map(int, preferred_end.split(':'))
+                slot_end = slot_end.replace(hour=hour, minute=minute)
+            except (TypeError, ValueError):
+                pass
+        if slot_end > slot_start:
+            filtered_slots.append((slot_start, slot_end))
+    slots = filtered_slots
+    tasks = [get_task_details(task_id, user_id)
+             for task_id, _quadrant, _description in get_active_tasks(user_id)]
+    tasks = sorted((task for task in tasks if task), key=_task_priority_key)
+    if not tasks:
+        return 'אין כרגע משימות פתוחות לתכנון.'
+    if not slots:
+        return 'קראתי את היומן, אבל לא מצאתי חלונות פנויים לתכנון השבוע.'
+
+    proposals = []
+    break_minutes = max(0, min(int(preferences.get('break_minutes') or 0), 180))
+    slot_index = 0
+    slot_start = None
+    slot_end = None
+    for task in tasks:
+        remaining = task['duration_minutes']
+        while remaining > 0 and slot_index < len(slots):
+            if slot_start is None or slot_start >= slot_end:
+                slot_index += 1
+                slot_start, slot_end = slots[slot_index - 1]
+            available = int((slot_end - slot_start).total_seconds() // 60)
+            if available < 15:
+                slot_start = slot_end
+                continue
+            chunk = min(remaining, available)
+            if chunk < 15:
+                break
+            proposals.append({
+                'task_id': task['id'],
+                'title': task['description'],
+                'start_time': slot_start.isoformat(),
+                'duration_minutes': chunk,
+                'color_id': task['color_id'],
+            })
+            slot_start += timedelta(minutes=chunk)
+            remaining -= chunk
+            if remaining > 0 or break_minutes:
+                slot_start += timedelta(minutes=break_minutes)
+
+    if not proposals:
+        return 'לא הצלחתי להתאים את המשימות לחלונות הפנויים.'
+    set_user_context(user_id, {'type': 'pending_schedule_plan',
+                               'proposals': proposals})
+    lines = ['🗓️ *הצעת תכנון לשבוע הקרוב:*']
+    for index, proposal in enumerate(proposals, start=1):
+        start = _parse_event_datetime(proposal['start_time'])
+        end = start + timedelta(minutes=proposal['duration_minutes'])
+        lines.append(
+            f'{index}. *{proposal["title"]}* — '
+            f'{start.strftime("%d/%m %H:%M")}–{end.strftime("%H:%M")} '
+            f'({proposal["duration_minutes"]} דק׳)'
+        )
+    lines.append('\nלאישור מלא כתוב *אשר הכל*. לאישור חלקי כתוב *אשר 1 3*.')
+    lines.append('לשינוי משך: כתוב למשל *משימה 1 שעה וחצי*.')
+    return '\n'.join(lines)
       
 def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple[str, dict]], str]:
     """
@@ -2215,8 +2416,19 @@ def _tool_add_task(args: dict, user_id: str) -> str:
         quad = 'חשוב לא דחוף'  # safe default rather than failing
     if not desc:
         return 'מה המשימה שתרצה להוסיף?'
-    add_task(quad, desc, user_id)
-    return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}'
+    try:
+        duration = int(args.get('duration_minutes') or 60)
+    except (TypeError, ValueError):
+        duration = 60
+    duration = max(15, min(duration, 12 * 60))
+    color_name = (args.get('color') or '').strip()
+    color_id = CALENDAR_COLORS_HE.get(color_name)
+    add_task(quad, desc, user_id, duration, color_id)
+    color_note = f'\n🎨 צבע: {color_name}' if color_id else ''
+    duration_note = f'\n⏱️ משך משוער: {duration} דקות'
+    tip = '' if args.get('duration_minutes') or color_name else \
+        '\n💡 טיפ קטן: אפשר לציין משך וצבע התראה, למשל "למשך 90 דקות בצבע כחול".'
+    return f'משימה נוספה! ✅\n{TASK_QUADRANTS_EMOJI[quad]} *{quad}*\n{desc}{duration_note}{color_note}{tip}'
 
 def _tool_propose_event(args: dict, user_id: str) -> str:
     """שומר את הצעת האירוע בחדר המתנה ומבקש אישור מהמשתמש."""
@@ -2251,6 +2463,25 @@ def _tool_propose_event(args: dict, user_id: str) -> str:
         f"⏰ מתי? {time_str} (למשך {duration} דק').\n\n"
         f"האם לאשר את השיבוץ ביומן? (ענה *כן* / *לא*)"
     )
+
+
+def _tool_set_schedule_preferences(args: dict, user_id: str) -> str:
+    preferences = get_user_preferences(user_id)
+    for key in ('preferred_start', 'preferred_end'):
+        value = (args.get(key) or '').strip()
+        if value and re.fullmatch(r'\d{1,2}:\d{2}', value):
+            preferences[key] = value
+    weekdays = args.get('avoid_weekdays')
+    if isinstance(weekdays, list):
+        preferences['avoid_weekdays'] = [str(day).strip() for day in weekdays if str(day).strip()]
+    try:
+        break_minutes = int(args.get('break_minutes'))
+        if 0 <= break_minutes <= 180:
+            preferences['break_minutes'] = break_minutes
+    except (TypeError, ValueError):
+        pass
+    set_user_preferences(user_id, preferences)
+    return '✅ שמרתי את העדפות התכנון שלך. אשתמש בהן בעדינות בתוכניות הבאות.'
 def _tool_create_event(args: dict, user_id: str) -> str:
     # כאן אנחנו מתעדים את מה שהמודל החליט לשלוח, כדי שנוכל לחקור תקלות בעתיד
     logger.info("create_calendar_event called with args: %s", args)
@@ -2302,11 +2533,14 @@ def _collect_task_queries(args: dict) -> list[str]:
 def _task_picker_message(user_id: str, ctype: str, header: str) -> str:
     """List active tasks and arm the numeric-choice context."""
     candidates = get_active_tasks(user_id)
-    set_user_context(user_id, {'type': ctype})
+    set_user_context(user_id, {
+        'type': ctype,
+        'task_ids': [task_id for task_id, _quadrant, _description in candidates],
+    })
     msg = f'*{header}*\n\n'
-    for tid, quad, desc in candidates:
+    for index, (tid, quad, desc) in enumerate(candidates, start=1):
         preview = desc[:40] + ('…' if len(desc) > 40 else '')
-        msg += f'{tid}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
+        msg += f'{index}. {TASK_QUADRANTS_EMOJI.get(quad, "📌")} {preview}\n'
     msg += '\n(או "ביטול")'
     return msg
 
@@ -2421,6 +2655,7 @@ def execute_tool(name: str, args: dict, user_id: str) -> str:
         'create_calendar_event':  _tool_create_event,
         'delete_calendar_event':  _tool_delete_event,  # <-- השורה החדשה שהוספנו
         'propose_calendar_event': _tool_propose_event,
+        'set_schedule_preferences': _tool_set_schedule_preferences,
         'complete_task':          _tool_complete_task,
         'delete_task':            _tool_delete_task,
         'set_budget_limit':       _tool_set_limit,
@@ -2748,6 +2983,27 @@ def send_whatsapp_message(to: str, message: str) -> bool:
     return ok
 
 
+def send_whatsapp_action_buttons(to: str, body: str,
+                                 buttons: list[tuple[str, str]]) -> bool:
+    """Send up to three WhatsApp reply buttons for a pending decision."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not buttons:
+        return False
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to': to,
+        'type': 'interactive',
+        'interactive': {
+            'type': 'button',
+            'body': {'text': body[:1024]},
+            'action': {'buttons': [
+                {'type': 'reply', 'reply': {'id': button_id, 'title': title[:20]}}
+                for button_id, title in buttons[:3]
+            ]},
+        },
+    }
+    return _post_whatsapp(payload)
+
+
 def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
     """Download media bytes from WhatsApp. Returns (data, mime_type)."""
     if not WHATSAPP_TOKEN:
@@ -2921,6 +3177,9 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     if t in ('תנועות', 'תנועות אחרונות', 'רישומים אחרונים', 'הוצאות אחרונות'):
         return _tool_show_transactions({}, user_id)
 
+    if _is_week_plan_request(t):
+        return _build_week_plan(user_id)
+
     # Calendar reads must be deterministic. Do not ask Gemini to infer whether
     # the calendar was read successfully or to calculate free-time windows.
     if _is_proactive_schedule_request(t):
@@ -2945,7 +3204,8 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 # Message Processing
 # ─────────────────────────────────────────────
 
-def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
+def _handle_numeric_context(ctype: str, text: str, user_id: str,
+                           context: dict | None = None) -> str:
     """[r6] Shared numeric-choice flow for complete_task / delete_task /
     delete_expense. Accepts several numbers at once ("1 3 5" / "1,3,5") and
     the word "הכל" for tasks."""
@@ -2962,12 +3222,15 @@ def _handle_numeric_context(ctype: str, text: str, user_id: str) -> str:
             return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו.'
         return f'🗑️ נמחקו {n} משימות. הרשימה ריקה.'
 
-    ids = [int(x) for x in re.findall(r'\d+', text)]
+    selected_numbers = [int(x) for x in re.findall(r'\d+', text)]
+    task_ids = (context or {}).get('task_ids') or []
+    ids = [task_ids[number - 1] for number in selected_numbers
+           if 1 <= number <= len(task_ids)] if task_ids else selected_numbers
     if not ids:
         what = {'complete_task': 'שסיימת',
                 'delete_task':   'למחיקה',
                 'delete_expense': 'לביטול'}.get(ctype, '')
-        return f'שלח רק את המספר {what} — אפשר גם כמה מספרים (או "ביטול").'
+        return f'שלח מספר מתוך הרשימה {what} — אפשר גם כמה מספרים (או "ביטול").'
 
     ok_lines: list[str] = []
     bad_ids:  list[int] = []
@@ -3014,6 +3277,32 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
+        if ctype == 'pending_schedule_plan':
+            clean = re.sub(r'[\s!.,?]+', '', text).lower()
+            if clean in ('ביטול', 'בטל', 'לא'):
+                delete_user_context(user_id)
+                return 'ביטלתי את התכנון. שום אירוע לא נוצר.'
+            if clean.startswith(('אשר', 'כן')):
+                numbers = [int(value) for value in re.findall(r'\d+', text)]
+                proposals = context.get('proposals') or []
+                selected = proposals if ('הכל' in clean or not numbers) else [
+                    proposal for index, proposal in enumerate(proposals, start=1)
+                    if index in numbers
+                ]
+                if not selected:
+                    return 'לא זיהיתי מספרי הצעות. כתוב למשל: אשר 1 3 או אשר הכל.'
+                delete_user_context(user_id)
+                results = []
+                reverse_colors = {value: key for key, value in CALENDAR_COLORS_HE.items()}
+                for proposal in selected:
+                    results.append(process_calendar_ai(
+                        proposal['title'], proposal['start_time'], None, user_id,
+                        proposal['duration_minutes'], color=reverse_colors.get(
+                            proposal.get('color_id'))
+                    ))
+                return '\n\n'.join(results)
+            return 'התכנון מוכן. כתוב *אשר הכל* או *אשר 1 3*, או *ביטול*.'
+
         if ctype == 'pending_schedule_approval':
             clean = re.sub(r'[\s!.,?]+', '', text).lower()
             yes = clean.startswith(('כן', 'אשר', 'אוקי', 'סבבה', 'מעולה', 'בטח', 'יאללה', '👍', '✅'))
@@ -3061,7 +3350,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             leftover = re.sub(r'[\d\s,.\-]+', '', text)
             if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'אתהכול', 'ו', 'וגם',
                             'משימה', 'משימות', 'מספר', 'תנועה', 'הוצאה'):
-                return _handle_numeric_context(ctype, text, user_id)
+                return _handle_numeric_context(ctype, text, user_id, context)
             delete_user_context(user_id)   # picker abandoned — fall through
 
     if text in ('ביטול', 'בטל'):
@@ -3379,6 +3668,11 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
                 response = process_message(text, account_id, admin_phone=from_number)
             else:
                 response = 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
+        elif msg_type == 'interactive':
+            interactive = message.get('interactive', {}) or {}
+            reply = interactive.get('button_reply') or interactive.get('list_reply') or {}
+            text = reply.get('title') or reply.get('id') or ''
+            response = process_message(text, account_id, admin_phone=from_number)
         elif msg_type in MEDIA_TYPES:
             if SEND_MEDIA_ACK:
                 send_whatsapp_message(from_number, '📥 קיבלתי! עובד על זה רגע…')
@@ -3389,6 +3683,15 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
                         'אם זו קבלה/הוצאה — צלם *צילום מסך* רגיל ושלח אותו כ*תמונה* '
                         '(לא דרך "העבר"/שיתוף מהאפליקציה) — ואז אקרא ואוסיף אותה.')
         send_whatsapp_message(from_number, response)
+        pending = get_user_context(account_id)
+        if pending and pending.get('type') == 'pending_schedule_plan':
+            proposals = pending.get('proposals') or []
+            buttons = [('schedule_all', 'אשר הכל')]
+            if proposals:
+                buttons.append(('schedule_first', 'אשר 1'))
+            buttons.append(('schedule_cancel', 'ביטול'))
+            send_whatsapp_action_buttons(
+                from_number, 'אפשר לבחור פעולה לתוכנית:', buttons)
     except Exception:
         logger.exception('Failed to handle message from %s', from_number)
         try:
