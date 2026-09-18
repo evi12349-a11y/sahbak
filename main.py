@@ -3874,6 +3874,8 @@ PUBLIC_BASE_URL = _clean_base_url(
 # (same origin as the API → zero CORS and a real, shareable URL).
 DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    'dashboard.html')
+GUIDE_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'user-guide.html')
 
 
 def _get_user_id():
@@ -3930,6 +3932,17 @@ def dashboard_page():
     cfg = {'url': '', 'key': '', 'userId': user_id, 'token': token}
     inject = '<script>window.__SAHBAK_CFG__=' + json.dumps(cfg) + ';</script>'
     html = html.replace('</head>', inject + '\n</head>', 1)
+    return Response(html, mimetype='text/html; charset=utf-8')
+
+
+@app.route('/guide', methods=['GET'])
+def user_guide_page():
+    """Serve the public Hebrew product guide."""
+    try:
+        with open(GUIDE_HTML_PATH, encoding='utf-8') as f:
+            html = f.read()
+    except FileNotFoundError:
+        return 'user-guide.html חסר בפריסה.', 404
     return Response(html, mimetype='text/html; charset=utf-8')
 
 

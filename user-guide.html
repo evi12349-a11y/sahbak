@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>סחבק | מדריך שימוש</title>
+  <style>
+    :root { --ink:#17221f; --muted:#5f6c68; --paper:#f5f3ed; --card:#fffdf8; --green:#0f6b4f; --green-dark:#0b3d32; --gold:#c88d32; --line:#dce1d9; --mint:#dff0e5; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font-family:Arial, sans-serif; line-height:1.65; }
+    header { padding:56px 24px 42px; background:radial-gradient(circle at 80% 10%,#2b8967 0 12%,transparent 36%),linear-gradient(135deg,#103f35,#1d7455); color:white; }
+    header > div, main { max-width:980px; margin:auto; }
+    .hero-layout { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(280px,.95fr); gap:46px; align-items:center; }
+    .eyebrow { color:#d8edc4; font-weight:700; letter-spacing:.04em; }
+    h1 { margin:8px 0; font-size:clamp(2.2rem,6vw,4.6rem); line-height:1.05; }
+    header p { max-width:620px; color:#e8f1e9; font-size:1.1rem; }
+    .cta { display:inline-block; margin-top:14px; padding:11px 18px; color:#17352d; background:#f3c86b; text-decoration:none; border-radius:8px; font-weight:700; }
+    main { padding:34px 24px 70px; }
+    .intro { font-size:1.12rem; max-width:760px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; margin:24px 0 42px; }
+    section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:22px; }
+    section h2 { margin-top:0; color:var(--green); }
+    h3 { margin-bottom:4px; }
+    .example { padding:12px 14px; background:#eef4eb; border-right:4px solid var(--gold); border-radius:5px; margin:10px 0; }
+    .chat-demo { max-width:340px; margin:auto; padding:16px; background:#12221f; border:8px solid #0c1715; border-radius:24px; box-shadow:0 18px 35px #08251c55; direction:rtl; }
+    .chat-top { color:#e8f1e9; border-bottom:1px solid #355048; padding:3px 4px 12px; font-weight:700; }
+    .bubble { width:fit-content; max-width:90%; padding:9px 12px; margin:12px 0 0; border-radius:15px; font-size:.9rem; line-height:1.35; }
+    .bubble.user { margin-right:auto; background:#176347; color:white; border-bottom-right-radius:4px; }
+    .bubble.bot { background:#f5f5ee; color:var(--ink); border-bottom-left-radius:4px; }
+    .mock-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:26px 0 44px; }
+    .mock-panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:17px; box-shadow:0 8px 24px #173e2c0d; }
+    .mock-panel h3 { color:var(--green); margin-top:0; }
+    .metric { font-size:1.65rem; font-weight:800; color:var(--green-dark); }
+    .bar { height:8px; background:#e5ebe3; border-radius:99px; overflow:hidden; margin:8px 0 4px; }
+    .bar i { display:block; height:100%; background:var(--gold); border-radius:inherit; }
+    .timeline { border-right:3px solid var(--green); padding-right:13px; }
+    .timeline div { background:var(--mint); padding:6px 9px; margin:8px 0; border-radius:5px; font-size:.9rem; }
+    code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; direction:ltr; unicode-bidi:embed; }
+    ul { padding-right:22px; }
+    .note { background:#fff4d8; border-color:#ead29a; }
+    footer { color:var(--muted); border-top:1px solid var(--line); padding-top:20px; }
+    @media (max-width:760px) { .hero-layout,.mock-grid { grid-template-columns:1fr; } header { padding-top:38px; } main { padding-inline:16px; } section { padding:18px; } .chat-demo { max-width:310px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero-layout">
+      <div>
+      <div class="eyebrow">המדריך הקצר לסחבק</div>
+      <h1>יותר סדר.<br>פחות התעסקות.</h1>
+      <p>סחבק הוא עוזר אישי ב-WhatsApp לניהול יומן, משימות ותקציב. כותבים אליו בשפה טבעית והוא עוזר להפוך בקשה לפעולה ברורה.</p>
+      <a class="cta" href="https://wa.me/972553181335">פותחים שיחה עם סחבק</a>
+      </div>
+      <div class="chat-demo" aria-label="הדמיית שיחה עם סחבק">
+        <div class="chat-top">sahbak · עכשיו</div>
+        <div class="bubble user">תכנן לי את השבוע</div>
+        <div class="bubble bot">מצאתי 5 חלונות פנויים. לאשר את כל התוכנית?</div>
+        <div class="bubble user">אשר הכל</div>
+        <div class="bubble bot">✅ התוכנית נכנסה ליומן</div>
+      </div>
+    </div>
+  </header>
+  <main>
+    <p class="intro">לא צריך לזכור פקודות. אפשר לכתוב, להקליט הודעה קולית, לשלוח תמונה או PDF. כשפעולה משנה את היומן, סחבק מציג הצעה ומבקש אישור במקומות שבהם נדרש.</p>
+
+    <div class="mock-grid" aria-label="תצוגת יכולות">
+      <div class="mock-panel"><h3>📅 השבוע שלך</h3><div class="timeline"><div>09:00 · הכנה למבחן</div><div>12:30 · פגישה</div><div>16:00 · סידורים</div></div></div>
+      <div class="mock-panel"><h3>✅ משימות פתוחות</h3><div class="metric">5</div><div class="bar"><i style="width:68%"></i></div><small>68% מהיעדים בתהליך</small></div>
+      <div class="mock-panel"><h3>💰 תקציב החודש</h3><div class="metric">₪2,430</div><div class="bar"><i style="width:54%"></i></div><small>מתוך ₪4,500 שהוגדרו</small></div>
+    </div>
+
+    <div class="grid">
+      <section>
+        <h2>📅 יומן ותכנון</h2>
+        <p>קובעים פגישות ואירועים, יוצרים אירועים חוזרים ומחפשים חלונות פנויים לפי היומן האישי.</p>
+        <div class="example">"קבע לי פגישה עם דני מחר ב-10"</div>
+        <div class="example">"תמצא לי חלונות זמן לכל המשימות שלי"</div>
+        <div class="example">"תכנן לי את השבוע"</div>
+        <ul>
+          <li>אירוע ברור עם זמן מוגדר יכול להיווצר מיד.</li>
+          <li>תכנון משימות מוצג כהצעה לפני הכתיבה ליומן.</li>
+          <li>אפשר לאשר את כל התוכנית או לבחור משימות מסוימות.</li>
+          <li>משימות ארוכות יכולות להתפצל לכמה חלונות.</li>
+        </ul>
+      </section>
+      <section>
+        <h2>✅ משימות</h2>
+        <p>המשימות מסודרות לפי מטריצת אייזנהאואר: חשוב ודחוף, דחוף ולא חשוב, חשוב ולא דחוף, ולא דחוף ולא חשוב.</p>
+        <div class="example">"תוסיף משימה חשובה להכין מצגת"</div>
+        <div class="example">"סיימתי את המשימה של המצגת"</div>
+        <ul>
+          <li>משך ברירת המחדל הוא 60 דקות.</li>
+          <li>אפשר לציין משך אחר, למשל 90 דקות.</li>
+          <li>אפשר לבקש צבע לאירוע, למשל כחול.</li>
+          <li>בבחירות משתמשים במספרים זמניים שמופיעים באותה הודעה.</li>
+        </ul>
+      </section>
+      <section>
+        <h2>💰 תקציב</h2>
+        <p>רושמים הוצאות, הכנסות וחיסכון ומקבלים תמונה ברורה של החודש.</p>
+        <div class="example">"שילמתי 250 שקל על דלק"</div>
+        <div class="example">"מאזן"</div>
+        <div class="example">"הגדר תקציב מזון 3000"</div>
+        <ul>
+          <li>אפשר לראות תנועות אחרונות ולבטל רישום.</li>
+          <li>אפשר להגדיר תקרות לפי קטגוריה.</li>
+          <li>שליחת צילום קבלה מציגה הצעה לפני הרישום.</li>
+        </ul>
+      </section>
+      <section>
+        <h2>🎙️ קלט מכל מקום</h2>
+        <p>סחבק מבין טקסט, הודעות קוליות, תמונות וקובצי PDF.</p>
+        <ul>
+          <li>הקלטה קולית מתומללת ומעובדת כמו הודעה כתובה.</li>
+          <li>תמונה יכולה להיות מסוכמת או להפוך להצעת רישום.</li>
+          <li>PDF וקובצי טקסט יכולים לקבל סיכום קצר.</li>
+          <li>Apple Pay ו-Android Pay זמינים כאשר האוטומציה מחוברת ומוגדרת.</li>
+        </ul>
+      </section>
+    </div>
+
+    <section>
+      <h2>🧭 פעולות שימושיות</h2>
+      <div class="grid">
+        <div><h3>תפריט</h3><p>מציג את היכולות והפקודות העיקריות.</p></div>
+        <div><h3>סטטוס משימות</h3><p>מציג משימות פתוחות ומצב השלמה.</p></div>
+        <div><h3>תנועות אחרונות</h3><p>מציג את הרישומים הכספיים האחרונים.</p></div>
+        <div><h3>קישור</h3><p>מחזיר קישור אישי לדשבורד.</p></div>
+        <div><h3>מי אני</h3><p>מציג את המספר שהבוט מזהה ואת היומן הממופה.</p></div>
+        <div><h3>נקה שיחה</h3><p>מנקה את זיכרון השיחה של המשתמש בלבד.</p></div>
+      </div>
+    </section>
+
+    <section class="note">
+      <h2>🔒 פרטיות ושליטה</h2>
+      <p>הנתונים נשמרים בנפרד לכל משתמש. שיתוף בין משתמשים קיים רק כאשר הוא הוגדר במפורש. לפני תכנון אוטומטי ביומן מוצגת הצעה, וניתן לבטל אותה לפני יצירה.</p>
+    </section>
+
+    <footer>
+      WhatsApp: <code>+972 55-318-1335</code>
+    </footer>
+  </main>
+</body>
+</html>
