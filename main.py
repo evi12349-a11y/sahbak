@@ -126,7 +126,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-18-r20'
+BUILD_VERSION = '2026-09-18-r21'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -3282,6 +3282,10 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             if clean in ('ביטול', 'בטל', 'לא'):
                 delete_user_context(user_id)
                 return 'ביטלתי את התכנון. שום אירוע לא נוצר.'
+            if clean in ('בחירתמשימות', 'בחרמשימות', 'בחירה'):
+                return ('בחר את המשימות שתרצה לשבץ מתוך התוכנית.\n'
+                        'לדוגמה: *אשר 1 3 5*\n'
+                        'אפשר גם *אשר הכל* או *ביטול*.')
             if clean.startswith(('אשר', 'כן')):
                 numbers = [int(value) for value in re.findall(r'\d+', text)]
                 proposals = context.get('proposals') or []
@@ -3671,7 +3675,12 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
         elif msg_type == 'interactive':
             interactive = message.get('interactive', {}) or {}
             reply = interactive.get('button_reply') or interactive.get('list_reply') or {}
-            text = reply.get('title') or reply.get('id') or ''
+            action_text = {
+                'schedule_all': 'אשר הכל',
+                'schedule_select': 'בחר משימות',
+                'schedule_cancel': 'ביטול',
+            }
+            text = action_text.get(reply.get('id')) or reply.get('title') or ''
             response = process_message(text, account_id, admin_phone=from_number)
         elif msg_type in MEDIA_TYPES:
             if SEND_MEDIA_ACK:
@@ -3688,7 +3697,7 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
             proposals = pending.get('proposals') or []
             buttons = [('schedule_all', 'אשר הכל')]
             if proposals:
-                buttons.append(('schedule_first', 'אשר 1'))
+                buttons.append(('schedule_select', 'בחר משימות'))
             buttons.append(('schedule_cancel', 'ביטול'))
             send_whatsapp_action_buttons(
                 from_number, 'אפשר לבחור פעולה לתוכנית:', buttons)
