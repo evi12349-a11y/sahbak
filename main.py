@@ -129,7 +129,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r29'
+BUILD_VERSION = '2026-09-19-r30'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -2245,6 +2245,7 @@ def _build_week_plan(user_id: str, days: int = 7) -> str:
         'color_id': current.get('color_id'),
         'remaining_proposals': remaining,
         'skipped_proposals': [],
+        'accepted_proposals': [],
         'alternatives': alternatives,
         'no_count': 0,
     })
@@ -2269,9 +2270,13 @@ def _format_schedule_proposal(proposal: dict, index: int,
     )
 
 
-def _schedule_alternatives(current: dict, remaining: list[dict]) -> list[dict]:
+def _schedule_alternatives(current: dict, remaining: list[dict],
+                           excluded: set[str] | None = None) -> list[dict]:
     """Pick a morning and late-day alternative without asking the model."""
-    candidates = [p for p in remaining if p.get('duration_minutes') == current.get('duration_minutes')]
+    excluded = excluded or set()
+    candidates = [p for p in remaining
+                  if p.get('duration_minutes') == current.get('duration_minutes')
+                  and p.get('start_time') not in excluded]
     morning = [p for p in candidates
                if (_parse_event_datetime(p['start_time']) or now_local()).hour < 13]
     evening = [p for p in candidates
@@ -2299,7 +2304,8 @@ def _format_schedule_alternatives(current: dict, alternatives: list[dict]) -> st
         lines.append(
             f'{index}. {label}: {start.strftime("%d/%m %H:%M")}–{end.strftime("%H:%M")}'
         )
-    lines.append('\nענה *1* או *2* לבחירה, או *לא* כדי לעצור את התכנון.')
+    lines.append('\nענה *1* או *2* לבחירה, או כתוב *מוקדם יותר* / *מאוחר יותר*.')
+    lines.append('לחלופות נוספות כתוב *תציע חלופות אחרות*; לדחייה כתוב *לא*.')
     return '\n'.join(lines)
       
 def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple[str, dict]], str]:
@@ -3642,10 +3648,10 @@ def _advance_sequential_schedule(user_id: str, context: dict,
     """Move a sequential plan to its next proposal without losing state."""
     remaining = list(context.get('remaining_proposals') or [])
     skipped = list(context.get('skipped_proposals') or [])
+    accepted = list(context.get('accepted_proposals') or [])
     if not remaining:
         delete_user_context(user_id)
-        tail = f'\n\nדולגו {len(skipped)} משימות.' if skipped else ''
-        return (result_prefix + '\n\n✅ סיימנו את תכנון המשימות.' + tail).strip()
+        return _schedule_summary(result_prefix, accepted, skipped, [])
 
     next_proposal = remaining.pop(0)
     next_context = {
@@ -3657,6 +3663,7 @@ def _advance_sequential_schedule(user_id: str, context: dict,
         'color_id': next_proposal.get('color_id'),
         'remaining_proposals': remaining,
         'skipped_proposals': skipped,
+        'accepted_proposals': accepted,
         'alternatives': _schedule_alternatives(next_proposal, remaining),
         'no_count': 0,
     }
@@ -3666,6 +3673,16 @@ def _advance_sequential_schedule(user_id: str, context: dict,
     proposal_message = _format_schedule_proposal(
         next_proposal, index, total, len(skipped))
     return f'{result_prefix}\n\n{proposal_message}'.strip()
+
+
+def _schedule_summary(prefix: str, accepted: list[dict],
+                      skipped: list[dict], remaining: list[dict]) -> str:
+    lines = [prefix.strip(), '\n✅ *סיכום התכנון:*',
+             f'שובצו: {len(accepted)}', f'נדחו: {len(skipped)}',
+             f'לא שובצו: {len(remaining)}']
+    if remaining:
+        lines.append('נשארו לתכנון: ' + ', '.join(p['title'] for p in remaining[:5]))
+    return '\n'.join(line for line in lines if line).strip()
 
 
 def process_message(text: str, user_id: str, admin_phone: str | None = None) -> str:
@@ -3718,7 +3735,21 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
 
             if context.get('mode') == 'sequential_plan' and context.get('alternatives'):
                 alternatives = context['alternatives']
-                selected_index = None
+                if clean in ('תציעחלופותאחרות', 'חלופותאחרות', 'חלופהאחרת'):
+                    excluded = {item.get('start_time') for item in alternatives}
+                    fresh = _schedule_alternatives(
+                        context, context.get('remaining_proposals') or [], excluded)
+                    if fresh:
+                        context['alternatives'] = fresh
+                        set_user_context(user_id, context)
+                        return _format_schedule_alternatives(context, fresh)
+                    return 'לא מצאתי חלופות נוספות בטווח הקרוב.'
+                if clean in ('מוקדםיותר', 'שעהמוקדמתיותר'):
+                    selected_index = 0
+                elif clean in ('מאוחריותר', 'שעהמאוחרתיותר'):
+                    selected_index = 1
+                else:
+                    selected_index = None
                 if clean in ('1', 'בוקר'):
                     selected_index = 0
                 elif clean in ('2', 'ערב', 'לקראתערב'):
@@ -3729,6 +3760,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                                   if proposal.get('start_time') != selected.get('start_time')]
                     context['remaining_proposals'] = remaining
                     context['alternatives'] = []
+                    context.setdefault('accepted_proposals', []).append(selected)
                     result = process_calendar_ai(
                         selected['title'], selected['start_time'], None, user_id,
                         selected['duration_minutes'],
@@ -3767,6 +3799,12 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                         title, start_time, None, user_id, duration,
                         color=reverse_colors.get(context.get('color_id'))
                     )
+                    context.setdefault('accepted_proposals', []).append({
+                        'title': title,
+                        'start_time': start_time,
+                        'duration_minutes': duration,
+                        'color_id': context.get('color_id'),
+                    })
                     return _advance_sequential_schedule(user_id, context, result)
                 delete_user_context(user_id)
                 # המשתמש אישר! עכשיו באמת קובעים ביומן דרך הפונקציה הרגילה
@@ -3789,12 +3827,13 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                         'color_id': context.get('color_id'),
                     })
                     context['skipped_proposals'] = skipped
-                    delete_user_context(user_id)
-                    return (
-                        f'עצרתי את התכנון אחרי שתי דחיות עבור *{context["title"]}*.\n'
-                        f'לא שיבצתי את המשימה. נדחו {len(skipped)} משימות בסך הכול.\n'
-                        'כשתרצה להמשיך, כתוב "תכנן את שאר המשימות".'
-                    )
+                    if len(skipped) >= 2:
+                        delete_user_context(user_id)
+                        return _schedule_summary(
+                            f'עצרתי את התכנון אחרי שתי דחיות עבור *{context["title"]}*.',
+                            context.get('accepted_proposals') or [], skipped,
+                            context.get('remaining_proposals') or [])
+                    return _advance_sequential_schedule(user_id, context)
                 delete_user_context(user_id)
                 return 'ביטלתי את השיבוץ 👍 מתי תרצה שאקבע את זה במקום?'
             
