@@ -92,6 +92,7 @@ import random
 import hmac
 import hashlib
 import logging
+import math
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -128,7 +129,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r23'
+BUILD_VERSION = '2026-09-19-r25'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -2096,8 +2097,9 @@ def _calendar_slots_reply(user_id: str, days: int = 7) -> str:
         lines.append(f'• ועוד {len(slots) - 12} חלונות')
     if tasks:
         lines.append('\nמשימות פתוחות שאפשר לשבץ:')
-        lines.extend(f'• [{task_id}] {description}'
-                     for task_id, _quadrant, description in tasks[:12])
+        lines.extend(f'• [{index}] {description}'
+                     for index, (_task_id, _quadrant, description)
+                     in enumerate(tasks[:12], start=1))
         lines.append('\nבחר מספר משימה וחלון, או כתוב "שבץ את הראשונה בחלון הראשון".')
     return '\n'.join(lines)
 
@@ -2126,11 +2128,14 @@ def _parse_slot_label(label: str, reference: datetime) -> tuple[datetime, dateti
         return None
     day, month, start_text, end_text = match.groups()
     try:
+        year = reference.year
+        if int(month) < reference.month and reference.month == 12:
+            year += 1
         start = datetime.fromisoformat(
-            f'{reference.year:04d}-{month}-{day}T{start_text}'
+            f'{year:04d}-{month}-{day}T{start_text}'
         ).replace(tzinfo=LOCAL_TZ)
         end = datetime.fromisoformat(
-            f'{reference.year:04d}-{month}-{day}T{end_text}'
+            f'{year:04d}-{month}-{day}T{end_text}'
         ).replace(tzinfo=LOCAL_TZ)
         if end <= start:
             return None
@@ -2161,16 +2166,19 @@ def _build_week_plan(user_id: str, days: int = 7) -> str:
         slot_start, slot_end = parsed
         if any(slot_start.weekday() == weekday_names.get(day) for day in avoid_weekdays):
             continue
+        original_start, original_end = slot_start, slot_end
         if preferred_start:
             try:
                 hour, minute = map(int, preferred_start.split(':'))
-                slot_start = slot_start.replace(hour=hour, minute=minute)
+                preferred = slot_start.replace(hour=hour, minute=minute)
+                slot_start = max(original_start, min(preferred, original_end))
             except (TypeError, ValueError):
                 pass
         if preferred_end:
             try:
                 hour, minute = map(int, preferred_end.split(':'))
-                slot_end = slot_end.replace(hour=hour, minute=minute)
+                preferred = slot_end.replace(hour=hour, minute=minute)
+                slot_end = min(original_end, max(preferred, original_start))
             except (TypeError, ValueError):
                 pass
         if slot_end > slot_start:
@@ -3201,7 +3209,7 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
 
 def _try_direct_task_add(text: str, user_id: str) -> str | None:
     """Persist clear task-add commands without trusting a free-form AI reply."""
-    match = re.match(r'^(?:הוסף|תוסיף|שים|תכניס)\s+משימה\s+(.+)$', text.strip())
+    match = re.match(r'^(?:הוסף|תוסיף|שים|תכניס)\s+(?:לי\s+)?משימה\s+(.+)$', text.strip())
     if not match:
         return None
     raw = match.group(1).strip()
@@ -3221,11 +3229,24 @@ def _try_direct_task_add(text: str, user_id: str) -> str | None:
         raw = raw[:duration_match.start()].strip()
 
     quadrant = 'חשוב לא דחוף'
+    important = r'(?:חשוב|חשובה|חשובים|חשובות)'
+    urgent = r'(?:דחוף|דחופה|דחופים|דחופות)'
+    connector = r'(?:ו|אבל)'
+    # Check the two-negative quadrant first; otherwise its text can be
+    # partially mistaken for the less-specific "important, not urgent" case.
     quadrant_patterns = (
-        ('חשוב דחוף', r'(?:חשוב(?:ה)?\s+ודחוף|דחוף\s+וחשוב)'),
-        ('דחוף לא חשוב', r'דחוף\s+ולא\s+חשוב'),
-        ('חשוב לא דחוף', r'חשוב\s+ולא\s+דחוף'),
-        ('לא דחוף לא חשוב', r'לא\s+דחוף\s+ולא\s+חשוב'),
+        ('לא דחוף לא חשוב',
+         rf'לא\s+{urgent}\s*{connector}\s*לא\s+{important}|'
+         rf'לא\s+{important}\s*{connector}\s*לא\s+{urgent}'),
+        ('דחוף לא חשוב',
+         rf'{urgent}\s*{connector}\s*לא\s+{important}|'
+         rf'לא\s+{important}\s*{connector}\s*{urgent}'),
+        ('חשוב לא דחוף',
+         rf'{important}\s*{connector}\s*לא\s+{urgent}|'
+         rf'לא\s+{urgent}\s*{connector}\s*{important}'),
+        ('חשוב דחוף',
+         rf'{important}\s*{connector}\s*{urgent}|'
+         rf'{urgent}\s*{connector}\s*{important}'),
     )
     for candidate, pattern in quadrant_patterns:
         if re.search(pattern, raw):
@@ -3574,12 +3595,14 @@ def get_task_status(user_id: str) -> str:
     for tid, quad, desc in active_tasks:
         grouped.setdefault(quad, []).append((tid, desc))
     status = '*משימות פתוחות*\n\n'
+    display_index = 1
     for quad, emoji in TASK_QUADRANTS_EMOJI.items():
         if grouped.get(quad):
             status += f'{emoji} *{quad}*\n'
             for tid, desc in grouped[quad]:
                 preview = desc[:50] + ('…' if len(desc) > 50 else '')
-                status += f'  [{tid}] {preview}\n'
+                status += f'  [{display_index}] {preview}\n'
+                display_index += 1
             status += '\n'
     status += f'סה"כ: {len(active_tasks)} פתוחות | {completed}/{total} הושלמו החודש\n'
     status += '(לסיום: "סיימתי X ו-Y" · למחיקה: "מחק X" · אפשר כמה ביחד!)'
@@ -4074,7 +4097,16 @@ def api_dashboard():
         })
 
     active = get_active_tasks(user_id)
-    tasks  = [{'id': t[0], 'quadrant': t[1], 'description': t[2]} for t in active]
+    tasks = []
+    for task_id, quadrant, description in active:
+        details = get_task_details(task_id, user_id) or {}
+        tasks.append({
+            'id': task_id,
+            'quadrant': quadrant,
+            'description': description,
+            'duration_minutes': details.get('duration_minutes', 60),
+            'color': details.get('color_id'),
+        })
 
     completed, total_tasks = get_tasks_completion_stats(user_id)
 
@@ -4363,8 +4395,20 @@ def api_add_task():
         return jsonify({'error': 'description required'}), 400
     if quad not in TASK_QUADRANTS_EMOJI:
         quad = 'חשוב לא דחוף'
-    add_task(quad, desc, user_id)
-    return jsonify({'status': 'ok', 'quadrant': quad, 'description': desc}), 201
+    try:
+        duration = int(data.get('duration_minutes') or 60)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'invalid duration_minutes'}), 400
+    if duration < 15 or duration > 12 * 60:
+        return jsonify({'error': 'duration_minutes must be between 15 and 720'}), 400
+    color_name = (data.get('color') or '').strip()
+    color_id = CALENDAR_COLORS_HE.get(color_name)
+    task_id = add_task(quad, desc, user_id, duration, color_id)
+    if not get_task_details(task_id, user_id):
+        return jsonify({'error': 'task insert verification failed'}), 500
+    return jsonify({'status': 'ok', 'task_id': task_id, 'quadrant': quad,
+                    'description': desc, 'duration_minutes': duration,
+                    'color': color_name or None}), 201
 
 
 # ─── PATCH /api/tasks/<id>/complete?user_id=<PHONE> ─────────────────────────
@@ -4418,7 +4462,10 @@ def api_set_budget_limits():
             continue
         if cat in BUDGET_CATEGORIES_HE and cat != 'הכנסה':
             try:
-                set_budget_limit(cat, float(amt), user_id)   # [MULTI] per-user
+                value = float(amt)
+                if not math.isfinite(value) or value < 0:
+                    continue
+                set_budget_limit(cat, value, user_id)   # [MULTI] per-user
                 updated.append(cat)
             except (TypeError, ValueError):
                 pass
