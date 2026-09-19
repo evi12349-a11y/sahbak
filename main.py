@@ -84,6 +84,7 @@ allowlist, onboarding, live calendar linking via "חבר יומן".
 from __future__ import annotations  # makes type hints version-proof (3.9+)
 
 import os
+import queue
 import re
 import json
 import time
@@ -92,6 +93,7 @@ import hmac
 import hashlib
 import logging
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -126,7 +128,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-18-r21'
+BUILD_VERSION = '2026-09-19-r22'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -210,6 +212,45 @@ DB_PERSISTENT = bool(os.getenv('DB_PATH'))
 # at once (far safer than spawning one raw Thread per message).
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '8'))
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix='sahbak-msg')
+_account_locks: dict[str, threading.Lock] = {}
+_account_locks_guard = threading.Lock()
+_account_queues: dict[str, queue.Queue] = {}
+_account_workers: set[str] = set()
+
+
+def _account_lock(account_id: str) -> threading.Lock:
+    """Return the serial-processing lock for one isolated account."""
+    with _account_locks_guard:
+        return _account_locks.setdefault(account_id, threading.Lock())
+
+
+def _account_worker(account_id: str) -> None:
+    """Drain one account's messages FIFO, preserving conversational order."""
+    while True:
+        with _account_locks_guard:
+            messages = _account_queues.get(account_id)
+        if messages is None:
+            return
+        message, from_number = messages.get()
+        try:
+            _handle_message_safely(message, from_number)
+        finally:
+            messages.task_done()
+
+
+def _enqueue_account_message(message: dict, from_number: str) -> None:
+    account_id = resolve_account(from_number)
+    with _account_locks_guard:
+        messages = _account_queues.setdefault(account_id, queue.Queue())
+        messages.put((message, from_number))
+        if account_id not in _account_workers:
+            _account_workers.add(account_id)
+            threading.Thread(
+                target=_account_worker,
+                args=(account_id,),
+                name=f'sahbak-account-{account_id[-6:]}',
+                daemon=True,
+            ).start()
 
 # Gemini client (constructing it makes no network call, so module-level is fine)
 _genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -929,15 +970,16 @@ def _format_tx(t: dict) -> str:
 # ── Task helpers ─────────────────────────────
 
 def add_task(quadrant: str, description: str, user_id: str,
-             duration_minutes: int = 60, color_id: str | None = None) -> None:
+             duration_minutes: int = 60, color_id: str | None = None) -> int:
     with _connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             'INSERT INTO tasks (quadrant, description, created_at, completed, user_id, '
             'duration_minutes, color_id) VALUES (?, ?, ?, 0, ?, ?, ?)',
             (quadrant, description, now_local().isoformat(), user_id,
              duration_minutes, color_id)
         )
         conn.commit()
+        return int(cursor.lastrowid)
 
 
 def get_task_details(task_id: int, user_id: str) -> dict | None:
@@ -2423,7 +2465,11 @@ def _tool_add_task(args: dict, user_id: str) -> str:
     duration = max(15, min(duration, 12 * 60))
     color_name = (args.get('color') or '').strip()
     color_id = CALENDAR_COLORS_HE.get(color_name)
-    add_task(quad, desc, user_id, duration, color_id)
+    task_id = add_task(quad, desc, user_id, duration, color_id)
+    if not get_task_details(task_id, user_id):
+        logger.error('Task insert verification failed (task_id=%s, user=%s)',
+                     task_id, user_id)
+        return 'לא הצלחתי לשמור את המשימה. נסה שוב בעוד רגע.'
     color_note = f'\n🎨 צבע: {color_name}' if color_id else ''
     duration_note = f'\n⏱️ משך משוער: {duration} דקות'
     tip = '' if args.get('duration_minutes') or color_name else \
@@ -3653,7 +3699,7 @@ def get_help_menu() -> str:
 SEND_MEDIA_ACK = os.getenv('SEND_MEDIA_ACK', 'true').lower() in ('true', '1', 'yes')
 
 
-def _handle_message_safely(message: dict, from_number: str) -> None:
+def _handle_message_safely_unlocked(message: dict, from_number: str) -> None:
     """Runs on the thread pool: build the reply and send it."""
     try:
         # [MULTI] Resolve a shared-household account (if this phone is linked).
@@ -3712,6 +3758,13 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
             logger.exception('Also failed to send error reply to %s', from_number)
 
 
+def _handle_message_safely(message: dict, from_number: str) -> None:
+    """Process messages for one account in arrival order."""
+    account_id = resolve_account(from_number)
+    with _account_lock(account_id):
+        _handle_message_safely_unlocked(message, from_number)
+
+
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
     mode      = request.args.get('hub.mode')
@@ -3765,7 +3818,7 @@ def webhook():
                 logger.info('Duplicate message %s ignored', message_id)
                 continue
 
-            _executor.submit(_handle_message_safely, message, from_number)
+            _enqueue_account_message(message, from_number)
             queued += 1
 
         return jsonify({'status': 'ok', 'queued': queued}), 200
