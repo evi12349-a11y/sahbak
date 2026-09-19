@@ -129,7 +129,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r25'
+BUILD_VERSION = '2026-09-19-r26'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -163,6 +163,8 @@ GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
 WHATSAPP_API_VERSION  = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
 # Railway often sets TZ rather than TIMEZONE — accept both.
 TIMEZONE_NAME         = os.getenv('TIMEZONE') or os.getenv('TZ') or 'Asia/Jerusalem'
+SHABBAT_NOTIFICATIONS = os.getenv('SHABBAT_NOTIFICATIONS', 'true').lower() in ('1', 'true', 'yes')
+SHABBAT_NOTIFICATION_HOUR = int(os.getenv('SHABBAT_NOTIFICATION_HOUR', '12'))
 
 # ── [MULTI] Multi-user access control & calendar mapping ──────────────────
 # ALLOWED_USERS: comma-separated phone numbers (in WhatsApp format, e.g.
@@ -527,6 +529,12 @@ def init_db() -> None:
                 role       TEXT NOT NULL,
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_runs (
+                run_date   TEXT PRIMARY KEY,
+                claimed_at TEXT NOT NULL,
+                sent_at    TEXT
             );
         ''')
 
@@ -3058,6 +3066,197 @@ def send_whatsapp_action_buttons(to: str, body: str,
     return _post_whatsapp(payload)
 
 
+SHABBAT_LOCATIONS = {
+    'ירושלים': {'latitude': 31.7683, 'longitude': 35.2137, 'before': 40},
+    'תל אביב': {'latitude': 32.0853, 'longitude': 34.7818, 'before': 18},
+}
+HEBCAL_SHABBAT_URL = 'https://www.hebcal.com/shabbat'
+
+
+def _fetch_shabbat_location(location_name: str, date: datetime) -> dict:
+    """Fetch current Shabbat/holiday data from Hebcal for one city.
+
+    Hebcal is used as the source of truth; Gemini is intentionally not involved
+    in astronomical or Jewish-calendar calculations.
+    """
+    location = SHABBAT_LOCATIONS[location_name]
+    date_text = date.strftime('%Y-%m-%d')
+    params = {
+        'cfg': 'json',
+        'latitude': location['latitude'],
+        'longitude': location['longitude'],
+        'tzid': TIMEZONE_NAME,
+        'b': location['before'],
+        'M': 'on',
+        'm': 50,
+        'dt': date_text,
+        'lg': 'he',
+    }
+
+    def _request():
+        response = http_requests.get(HEBCAL_SHABBAT_URL, params=params, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise ValueError('Hebcal returned an invalid payload')
+        return payload
+
+    return call_with_retry(_request, what=f'Hebcal {location_name}',
+                           max_attempts=3, base_delay=0.7, max_total=8.0)
+
+
+def _event_local_date(item: dict) -> str:
+    value = item.get('date', '')
+    if not value:
+        return ''
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(
+            LOCAL_TZ).date().isoformat() if LOCAL_TZ else value[:10]
+    except (TypeError, ValueError):
+        return value[:10]
+
+
+def _format_event_time(item: dict) -> str:
+    value = item.get('date', '')
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if LOCAL_TZ:
+            parsed = parsed.astimezone(LOCAL_TZ)
+        return parsed.strftime('%H:%M')
+    except (TypeError, ValueError):
+        title = str(item.get('title', ''))
+        match = re.search(r'(\d{1,2}:\d{2})', title)
+        return match.group(1) if match else '—'
+
+
+def _shabbat_notification_for_date(date: datetime) -> str | None:
+    """Build one notification only when today has candles or a holiday eve."""
+    date_text = date.date().isoformat()
+    city_data: dict[str, dict] = {}
+    for city in SHABBAT_LOCATIONS:
+        try:
+            city_data[city] = _fetch_shabbat_location(city, date)
+        except Exception as exc:
+            logger.exception('Failed to fetch Hebcal data for %s', city)
+            raise RuntimeError(f'Hebcal unavailable for {city}') from exc
+
+    candles: dict[str, dict] = {}
+    havdalah: dict[str, dict] = {}
+    holidays: set[str] = set()
+    for city, payload in city_data.items():
+        for item in payload.get('items', []):
+            category = item.get('category')
+            item_date = _event_local_date(item)
+            if category == 'candles' and item_date == date_text:
+                candles[city] = item
+            elif category == 'havdalah' and item_date > date_text and city not in havdalah:
+                havdalah[city] = item
+            elif category == 'holiday' and item_date in (date_text,):
+                title = (item.get('hebrew') or item.get('title') or '').strip()
+                if title:
+                    holidays.add(title)
+
+    if not candles:
+        return None
+
+    kind = 'חג' if holidays else 'שבת'
+    title = f'🕯️ זמני {kind} מעודכנים'
+    if holidays:
+        title += f' — {", ".join(sorted(holidays))}'
+    lines = [title, f'יום {HEB_WEEKDAYS[date.weekday()]} {date.strftime("%d/%m/%Y")}', '']
+    for city in SHABBAT_LOCATIONS:
+        candle = candles.get(city)
+        end = havdalah.get(city)
+        if candle:
+            exit_time = _format_event_time(end) if end else '—'
+            lines.append(f'{city}: כניסה {_format_event_time(candle)} | יציאה {exit_time}')
+    lines.extend(['', 'הזמנים מחושבים לפי Hebcal ולפי המיקום המקומי של כל עיר.',
+                  'אפשר לכתוב לי בכל עת: "זמני שבת"'])
+    return '\n'.join(lines)
+
+
+def _claim_notification_run(run_date: str) -> bool:
+    try:
+        with _connect() as conn:
+            cursor = conn.execute(
+                'INSERT OR IGNORE INTO notification_runs (run_date, claimed_at) VALUES (?, ?)',
+                (run_date, now_local().isoformat())
+            )
+            conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        logger.exception('Failed to claim notification run %s', run_date)
+        return False
+
+
+def _release_notification_run(run_date: str) -> None:
+    try:
+        with _connect() as conn:
+            conn.execute('DELETE FROM notification_runs WHERE run_date = ? AND sent_at IS NULL',
+                         (run_date,))
+            conn.commit()
+    except Exception:
+        logger.exception('Failed to release notification run %s', run_date)
+
+
+def _mark_notification_sent(run_date: str) -> None:
+    with _connect() as conn:
+        conn.execute('UPDATE notification_runs SET sent_at = ? WHERE run_date = ?',
+                     (now_local().isoformat(), run_date))
+        conn.commit()
+
+
+def _send_shabbat_notification() -> None:
+    today = now_local()
+    run_date = today.date().isoformat()
+    if not _claim_notification_run(run_date):
+        return
+    try:
+        message = _shabbat_notification_for_date(today)
+    except Exception:
+        logger.exception('Could not calculate Shabbat notification for %s', run_date)
+        _release_notification_run(run_date)
+        return
+    if not message:
+        _mark_notification_sent(run_date)
+        return
+    try:
+        with _connect() as conn:
+            users = [row[0] for row in conn.execute(
+                'SELECT user_id FROM known_users ORDER BY user_id').fetchall()]
+        if ALLOWED_USERS:
+            users = [user for user in users if user in ALLOWED_USERS]
+        failures = [user for user in users if not send_whatsapp_message(user, message)]
+        if failures:
+            logger.error('Shabbat notification failed for %d users: %s',
+                         len(failures), failures)
+            _release_notification_run(run_date)
+        else:
+            _mark_notification_sent(run_date)
+    except Exception:
+        logger.exception('Shabbat notification send failed')
+        _release_notification_run(run_date)
+
+
+def _notification_scheduler_loop() -> None:
+    """Run once around noon; SQLite dedup makes multiple Gunicorn workers safe."""
+    while True:
+        try:
+            now = now_local()
+            if (SHABBAT_NOTIFICATIONS and now.hour == SHABBAT_NOTIFICATION_HOUR
+                    and now.minute < 10):
+                _send_shabbat_notification()
+        except Exception:
+            logger.exception('Notification scheduler loop failed')
+        time.sleep(30)
+
+
+def _start_notification_scheduler() -> None:
+    if SHABBAT_NOTIFICATIONS:
+        threading.Thread(target=_notification_scheduler_loop,
+                         name='sahbak-notifications', daemon=True).start()
+
+
 def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str]:
     """Download media bytes from WhatsApp. Returns (data, mime_type)."""
     if not WHATSAPP_TOKEN:
@@ -3231,7 +3430,7 @@ def _try_direct_task_add(text: str, user_id: str) -> str | None:
     quadrant = 'חשוב לא דחוף'
     important = r'(?:חשוב|חשובה|חשובים|חשובות)'
     urgent = r'(?:דחוף|דחופה|דחופים|דחופות)'
-    connector = r'(?:ו|אבל)'
+    connector = r'(?:ו|אבל)?'
     # Check the two-negative quadrant first; otherwise its text can be
     # partially mistaken for the less-specific "important, not urgent" case.
     quadrant_patterns = (
@@ -3927,6 +4126,8 @@ def health():
         'admins':         len(ADMIN_USERS),
         'db_path':        DB_FILE,
         'db_persistent':  DB_PERSISTENT,   # False = data wiped on every deploy!
+        'shabbat_notifications': SHABBAT_NOTIFICATIONS,
+        'shabbat_notification_hour': SHABBAT_NOTIFICATION_HOUR,
     }), 200
 
 
@@ -4479,6 +4680,7 @@ def api_set_budget_limits():
 # Run at import time so it also executes under gunicorn (production).
 init_db()
 _log_startup_config()
+_start_notification_scheduler()
 
 
 # ─────────────────────────────────────────────
