@@ -129,7 +129,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r26'
+BUILD_VERSION = '2026-09-19-r27'
 
 # ─────────────────────────────────────────────
 # App & Config
