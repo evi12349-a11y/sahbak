@@ -128,7 +128,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r22'
+BUILD_VERSION = '2026-09-19-r23'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -3199,6 +3199,54 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
     return None
 
 
+def _try_direct_task_add(text: str, user_id: str) -> str | None:
+    """Persist clear task-add commands without trusting a free-form AI reply."""
+    match = re.match(r'^(?:הוסף|תוסיף|שים|תכניס)\s+משימה\s+(.+)$', text.strip())
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if not raw:
+        return 'מה המשימה שתרצה להוסיף?'
+
+    color_name = next((name for name in CALENDAR_COLORS_HE if name in raw), '')
+    if color_name:
+        raw = re.sub(r'\s*(?:בצבע|צבע)\s*' + re.escape(color_name), '', raw).strip()
+
+    duration = 60
+    duration_match = re.search(
+        r'(?:למשך|במשך)\s+(\d+)\s*(?:דקות|דק׳|דק|שעות?|שעה)', raw)
+    if duration_match:
+        amount = int(duration_match.group(1))
+        duration = amount * 60 if 'שעה' in duration_match.group(0) else amount
+        raw = raw[:duration_match.start()].strip()
+
+    quadrant = 'חשוב לא דחוף'
+    quadrant_patterns = (
+        ('חשוב דחוף', r'(?:חשוב(?:ה)?\s+ודחוף|דחוף\s+וחשוב)'),
+        ('דחוף לא חשוב', r'דחוף\s+ולא\s+חשוב'),
+        ('חשוב לא דחוף', r'חשוב\s+ולא\s+דחוף'),
+        ('לא דחוף לא חשוב', r'לא\s+דחוף\s+ולא\s+חשוב'),
+    )
+    for candidate, pattern in quadrant_patterns:
+        if re.search(pattern, raw):
+            quadrant = candidate
+            raw = re.sub(pattern, '', raw).strip(' ,.-')
+            break
+
+    raw = re.sub(r'^(?:לקנות|להכין|לטפל|לסדר|לבדוק)\s+',
+                 lambda match: match.group(0), raw).strip()
+    if not raw:
+        return 'מה המשימה שתרצה להוסיף?'
+    args = {
+        'quadrant': quadrant,
+        'description': raw,
+        'duration_minutes': duration,
+    }
+    if color_name:
+        args['color'] = color_name
+    return _tool_add_task(args, user_id)
+
+
 def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     """Return a reply if `text` is an unambiguous command we can serve without
     the AI; otherwise None (let the AI router handle it)."""
@@ -3222,6 +3270,10 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
     # [r6] quick access to recent transactions
     if t in ('תנועות', 'תנועות אחרונות', 'רישומים אחרונים', 'הוצאות אחרונות'):
         return _tool_show_transactions({}, user_id)
+
+    task_reply = _try_direct_task_add(t, user_id)
+    if task_reply is not None:
+        return task_reply
 
     if _is_week_plan_request(t):
         return _build_week_plan(user_id)
