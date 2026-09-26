@@ -65,10 +65,10 @@ r6 fixes the issues observed in production on 2026-06-11:
      legacy CALENDAR_ID env var is used (so the owner is never locked out
      of his own bot after a DB wipe).
 
- 10. [FIX] Calendar service no longer "latches" dead forever after one
+  10. [FIX] Calendar service no longer "latches" dead forever after one
      transient failure — it retries after a 5-minute cooldown.
 
- 11. Calendar events now include default Google reminders (useDefault),
+  11. Calendar events now include default Google reminders (useDefault),
      so "תשלח לי תזכורת ביומן" actually pops a notification on the
      user's phone via Google Calendar.
 
@@ -95,8 +95,10 @@ import logging
 import math
 import sqlite3
 import threading
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
@@ -129,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-19-r30'
+BUILD_VERSION = '2026-09-25-r31'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -161,6 +163,8 @@ GEMINI_API_KEY       = os.getenv('GEMINI_API_KEY')
 GEMINI_MODEL          = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
 WHATSAPP_API_VERSION  = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
+SHABBAT_TEMPLATE_NAME = os.getenv('SHABBAT_TEMPLATE_NAME', '').strip()
+SHABBAT_TEMPLATE_LANGUAGE = os.getenv('SHABBAT_TEMPLATE_LANGUAGE', 'he')
 # Railway often sets TZ rather than TIMEZONE — accept both.
 TIMEZONE_NAME         = os.getenv('TIMEZONE') or os.getenv('TZ') or 'Asia/Jerusalem'
 SHABBAT_NOTIFICATIONS = os.getenv('SHABBAT_NOTIFICATIONS', 'true').lower() in ('1', 'true', 'yes')
@@ -292,13 +296,34 @@ def _normalize_phone(raw: str) -> str:
     return p
 
 
+# [FIX] Normalize once so allowlist/admin checks can't silently mismatch on
+# formatting the way the calendar mapping already guards against.
+ALLOWED_USERS = {_normalize_phone(n) for n in ALLOWED_USERS}
+ADMIN_USERS   = {_normalize_phone(n) for n in ADMIN_USERS}
+
+
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
 BUDGET_CATEGORIES_HE = {
-    'דיור': '🏠', 'רכב': '🚗', 'נופש': '✈️',
-    'מזון': '🍔', 'בריאות': '💊', 'חינוך': '📚',
-    'בילויים': '🎉', 'קניות': '🛒', 'חיסכון': '🐷', 'הכנסה': '💰',
+    'אוכל': '🍔', 'ביגוד וקוסמטיקה': '👗', 'תחבורה': '🚌',
+    'לימודים והתפתחות': '📚', 'פינוקים': '🍫', 'רפואה': '💊',
+    'הוצאות בית': '🏠', 'חשבונות': '🧾', 'צדקה': '🤝',
+    'מסגרות ילדים': '🧸', 'רכב + דלק': '🚗', 'שונות': '📦',
+    'חיסכון': '🐷', 'ביטוחים': '🛡️', 'אירועים ומתנות': '🎁',
+    'הכנסה': '💰',
+}
+# [MULTI] old category name -> new category name, used once by the
+# _migrate_budget_categories() one-shot DB migration below.
+_CATEGORY_RENAME_MAP = {
+    'מזון': 'אוכל',
+    'רכב': 'רכב + דלק',
+    'דיור': 'הוצאות בית',
+    'בריאות': 'רפואה',
+    'חינוך': 'לימודים והתפתחות',
+    'בילויים': 'פינוקים',
+    'קניות': 'שונות',
+    'נופש': 'שונות',
 }
 VALID_CATEGORIES = list(BUDGET_CATEGORIES_HE.keys())
 # 'חיסכון' (savings) and 'הכנסה' (income) are stored as POSITIVE amounts that
@@ -458,6 +483,34 @@ def _migrate_or_create_budget_limits(conn) -> None:
         logger.info('Created per-user budget_limits table')
 
 
+def _migrate_budget_categories(conn) -> None:
+    """Rename old category labels and merge limits where old categories converge."""
+    for old, new in _CATEGORY_RENAME_MAP.items():
+        conn.execute('UPDATE budget SET category = ? WHERE category = ?', (new, old))
+        old_limits = conn.execute(
+            'SELECT user_id, amount FROM budget_limits WHERE category = ?', (old,)
+        ).fetchall()
+        for user_id, amount in old_limits:
+            existing = conn.execute(
+                'SELECT amount FROM budget_limits WHERE user_id = ? AND category = ?',
+                (user_id, new)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    'UPDATE budget_limits SET amount = ? WHERE user_id = ? AND category = ?',
+                    (existing[0] + amount, user_id, new)
+                )
+                conn.execute(
+                    'DELETE FROM budget_limits WHERE user_id = ? AND category = ?',
+                    (user_id, old)
+                )
+            else:
+                conn.execute(
+                    'UPDATE budget_limits SET category = ? WHERE user_id = ? AND category = ?',
+                    (new, user_id, old)
+                )
+
+
 def init_db() -> None:
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
@@ -522,6 +575,14 @@ def init_db() -> None:
                 account_id TEXT NOT NULL
             );
 
+            -- [MULTI] DB-backed allowlist: admin approval takes effect instantly,
+            -- no Railway redeploy needed. Merged with the ALLOWED_USERS env var.
+            CREATE TABLE IF NOT EXISTS allowed_users (
+                user_id  TEXT PRIMARY KEY,
+                label    TEXT,
+                added_at TEXT NOT NULL
+            );
+
             -- conversation memory for multi-turn understanding.
             CREATE TABLE IF NOT EXISTS conversations (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -546,6 +607,11 @@ def init_db() -> None:
         _ensure_column(conn, 'tasks',  'user_id', 'TEXT')
         _ensure_column(conn, 'tasks',  'duration_minutes', 'INTEGER NOT NULL DEFAULT 60')
         _ensure_column(conn, 'tasks',  'color_id', 'TEXT')
+
+        # 3b) [MULTI] Rename old budget category labels to the new 16-category
+        # list. Naturally idempotent — a WHERE category = <old name> match is a
+        # no-op once every row already carries the new name.
+        _migrate_budget_categories(conn)
 
         # 4) Indexes — only now that user_id is guaranteed to exist.
         c.executescript('''
@@ -673,9 +739,50 @@ def calendar_id_for(user_id: str) -> str | None:
     cal = get_user_calendar(user_id)
     if cal:
         return cal
-    if user_id in ADMIN_USERS and CALENDAR_ID and CALENDAR_ID != 'primary':
+    if _normalize_phone(user_id) in ADMIN_USERS and CALENDAR_ID and CALENDAR_ID != 'primary':
         return CALENDAR_ID
     return None
+
+
+# ── [MULTI] DB-backed allowlist (instant admin approval, no redeploy) ──
+
+def get_allowed_users_db() -> set[str]:
+    try:
+        with _connect() as conn:
+            rows = conn.execute('SELECT user_id FROM allowed_users').fetchall()
+        return {row[0] for row in rows}
+    except Exception:
+        logger.exception('get_allowed_users_db failed')
+        return set()
+
+
+def add_allowed_user(phone: str, label: str | None = None) -> str:
+    norm = _normalize_phone(phone)
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO allowed_users (user_id, label, added_at) VALUES (?, ?, ?)',
+            (norm, label, now_local().isoformat())
+        )
+        conn.commit()
+    return norm
+
+
+def remove_allowed_user(phone: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute('DELETE FROM allowed_users WHERE user_id = ?',
+                              (_normalize_phone(phone),))
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def is_user_allowed(phone: str) -> bool:
+    """True if this phone may talk to the bot: env ALLOWED_USERS, DB-approved,
+    or an open bot (no allowlist configured anywhere)."""
+    db_allowed = get_allowed_users_db()
+    if not ALLOWED_USERS and not db_allowed:
+        return True
+    norm = _normalize_phone(phone)
+    return norm in ALLOWED_USERS or norm in db_allowed
 
 
 # ── [MULTI] Household sharing (account aliases) ──
@@ -1330,6 +1437,7 @@ def process_calendar_ai(title: str, start_time_iso: str,
         return ('שגיאה ביצירת אירוע. ודא שהיומן שלך משותף עם חשבון השירות '
                 'עם הרשאת עריכה.')
 
+
 def delete_calendar_event_ai(query: str, date_iso: str | None, user_id: str) -> str:
     cal_id = calendar_id_for(user_id)
     if not cal_id:
@@ -1386,6 +1494,7 @@ def delete_calendar_event_ai(query: str, date_iso: str | None, user_id: str) -> 
     except Exception:
         logger.exception('Calendar delete completely failed')
         return 'שגיאה כללית במחיקת האירוע.'
+
 
 def _admin_check_calendar(target_phone: str) -> str:
     """[r6] Live diagnostic: verify we can READ and WRITE the calendar mapped
@@ -1508,11 +1617,13 @@ def _admin_check_ai() -> str:
 def _admin_system_diag() -> str:
     """[r6] One-shot system status for the admin: אבחון"""
     users = cals = aliases = '?'
+    allowed_db = set()
     try:
         with _connect() as conn:
             users   = conn.execute('SELECT COUNT(*) FROM known_users').fetchone()[0]
             cals    = conn.execute('SELECT COUNT(*) FROM user_calendars').fetchone()[0]
             aliases = conn.execute('SELECT COUNT(*) FROM user_aliases').fetchone()[0]
+        allowed_db = get_allowed_users_db()
     except Exception:
         logger.exception('diag DB query failed')
     sa = _service_account_email()
@@ -1526,7 +1637,11 @@ def _admin_system_diag() -> str:
          '   DB_PATH=<mount-path>/sahbak.db'),
         f'משתמשים: {users} | יומנים מחוברים: {cals} (DB) + {len(USER_CALENDARS)} (env) '
         f'| שיתופי בית: {aliases}',
-        f'Allowlist: {len(ALLOWED_USERS)} | Admins: {len(ADMIN_USERS)}',
+        f'Allowlist: {len(ALLOWED_USERS)} (env) + {len(allowed_db)} (DB, מאושרים ב-"אשר משתמש") | '
+        f'Admins: {len(ADMIN_USERS)}',
+        ('תבנית שבת מאושרת: ' + SHABBAT_TEMPLATE_NAME + ' (' + SHABBAT_TEMPLATE_LANGUAGE + ')'
+         if SHABBAT_TEMPLATE_NAME else
+         '⚠️ אין תבנית שבת מאושרת — מחוץ לחלון 24 השעות Meta עלולה לדחות הודעות יזומות.'),
         f'חשבון שירות: {sa or "—"}',
         f'כתובת דשבורד: {PUBLIC_BASE_URL or "(נתיב יחסי — הגדר PUBLIC_URL)"}',
         f'WhatsApp: {"✅" if (WHATSAPP_TOKEN and PHONE_NUMBER_ID) else "❌"} | '
@@ -1592,7 +1707,7 @@ FINANCE_TOOLS = [
     ),
     _make_function_declaration(
         'update_expense_category',
-        'עדכון קטגוריה להוצאה/הכנסה קיימת. (למשל "זה לא קניות זה מזון").',
+        'עדכון קטגוריה להוצאה/הכנסה קיימת. (למשל "זה לא שונות זה אוכל").',
         {
             'type': 'object',
             'properties': {
@@ -1672,7 +1787,7 @@ SCHEDULE_TOOLS = [
                 'title': {'type': 'string', 'description': 'כותרת האירוע להצעה.'},
                 'start_time': {'type': 'string', 'description': 'זמן התחלה מוצע (ISO 8601).'},
                 'duration_minutes': {'type': 'integer', 'description': 'משך בדקות.'},
-                'explanation': {'type': 'string', 'description': 'הסבר קצר למשתמש למה בחרת להציע את הזמן הזה.'}
+                'explanation': {'type': 'string', 'description': 'הסבר קצר למשתמש למה בחרת להציע את התכנון הזה.'}
             },
             'required': ['title', 'start_time', 'duration_minutes', 'explanation'],
         },
@@ -1861,12 +1976,12 @@ def _get_agent_prompt(agent_name: str) -> str:
         return base + (
             'אתה מנהל לו"ז אישי בכיר (Executive Assistant). תפקידך לקבוע, למחוק ולעדכן אירועים ביומן Google.\n'
             'חוקי הברזל שלך:\n'
-            '1. משימת על (ליבת הלמידה): למשתמש יש יעד קריטי של למידה למבחני הלשכה - כ-9 שעות ביום, בימים א\'-ד\' (08:00-18:00).\n'
+            '1. משימות על (ליבת הלמידה): למשתמש יש יעד קריטי של למידה למבחני הלשכה - כ-9 שעות ביום, בימים א\'-ד\' (08:00-18:00).\n'
             '2. התאוששות מבלת"מים: עזור למשתמש למצוא זמן חלופי ביומן ללמידה אם פספס.\n'
             '3. בקרת אנוש (Human-in-the-Loop): אין לשבץ חלונות למידה או משימות ללא אישור! השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון שלך.\n'
             '4. שיבוץ משימות אקטיבי: בתחתית פרומפט זה קיבלת את מצב היומן ואת בנק המשימות. כשמבקשים לשבץ משימות או למצוא חלונות זמן, נתח מיד את רשימת "חלונות פנויים מחושבים". לעולם אל תשאל "מתי נוח לך" ואל תבקש מהמשתמש לבחור שעה אם כבר קיימים חלונות ברשימה. בחר את החלון הראשון שמתאים למשימה, ואם מחר הוא שבת או שאין בו חלון, הצע את יום העבודה הבא שמופיע ברשימה. עבור כל משימה הפעל את הכלי "propose_calendar_event" כדי לשלוח הצעת שיבוץ מסודרת ביומן.\n'
             '5. השתמש תמיד בפורמט ISO 8601 לזמנים.\n'
-            '6. אם המשתמש מציין העדפה אישית ברורה לשעות, ימי מנוחה או הפסקות, שמור אותה באמצעות set_schedule_preferences. אל תנחש העדפות.'
+            '6. אם המשתמש מציין העדפות אישית ברורה לשעות, ימי מנוחה או הפסקות, שמור אותה באמצעות set_schedule_preferences. אל תנחש העדפות.'
         )
     
     elif agent_name == 'tasks':
@@ -2132,6 +2247,58 @@ def _task_priority_key(task: dict) -> tuple[int, int]:
     return order.get(task['quadrant'], 4), task['id']
 
 
+def _parse_custom_schedule_time(text: str, reference: datetime) -> datetime | None:
+    """Deterministic free-text time parser for the schedule "custom date" reply
+    (no AI call, so it can't silently misfire). Supports: 'HH:MM', 'מחר HH:MM',
+    'היום HH:MM', 'מחרתיים HH:MM', 'DD/MM[/YYYY] HH:MM', '<weekday> HH:MM'."""
+    t = (text or '').strip()
+    time_match = re.search(r'(\d{1,2}):(\d{2})', t)
+    if not time_match:
+        return None
+    hour, minute = int(time_match.group(1)), int(time_match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    rest = (t[:time_match.start()] + t[time_match.end():]).strip()
+
+    date_match = re.search(r'(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', rest)
+    if date_match:
+        day, month = int(date_match.group(1)), int(date_match.group(2))
+        year = reference.year
+        if date_match.group(3):
+            year = int(date_match.group(3))
+            if year < 100:
+                year += 2000
+        try:
+            candidate = reference.replace(year=year, month=month, day=day,
+                                          hour=hour, minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None
+        if candidate < reference and not date_match.group(3):
+            candidate = candidate.replace(year=candidate.year + 1)
+        return candidate
+
+    weekday_names = {
+        'ראשון': 6, 'שני': 0, 'שלישי': 1, 'רביעי': 2,
+        'חמישי': 3, 'שישי': 4, 'שבת': 5,
+    }
+    for name, weekday in weekday_names.items():
+        if name in rest:
+            days_ahead = (weekday - reference.weekday()) % 7 or 7
+            return (reference + timedelta(days=days_ahead)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+
+    if 'מחרתיים' in rest:
+        base = reference + timedelta(days=2)
+    elif 'מחר' in rest:
+        base = reference + timedelta(days=1)
+    elif 'היום' in rest:
+        base = reference
+    else:
+        candidate_today = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return candidate_today if candidate_today > reference else candidate_today + timedelta(days=1)
+    return base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def _parse_slot_label(label: str, reference: datetime) -> tuple[datetime, datetime] | None:
     match = re.match(r'^(\d{2})/(\d{2}) (\d{2}:\d{2})–(\d{2}:\d{2})$', label)
     if not match:
@@ -2152,6 +2319,26 @@ def _parse_slot_label(label: str, reference: datetime) -> tuple[datetime, dateti
         return start, end
     except ValueError:
         return None
+
+
+def _custom_schedule_time_is_free(user_id: str, start: datetime,
+                                 duration_minutes: int) -> bool | None:
+    now = now_local()
+    days_ahead = (start.date() - now.date()).days
+    if days_ahead < 0 or days_ahead > 30:
+        return False
+    end = start + timedelta(minutes=duration_minutes)
+    if start.weekday() == 5 or start.hour < 8 or end.date() != start.date() or end.hour > 18 or (end.hour == 18 and end.minute > 0):
+        return False
+    events, error = _read_calendar_events(user_id, max(days_ahead + 1, 1))
+    if error:
+        return None
+    day_start = start.replace(hour=8, minute=0, second=0, microsecond=0)
+    for label in _free_calendar_windows(events or [], day_start, 1, duration_minutes):
+        interval = _parse_slot_label(label, start)
+        if interval and interval[0] <= start and end <= interval[1]:
+            return True
+    return False
 
 
 def _build_week_plan(user_id: str, days: int = 7) -> str:
@@ -2239,6 +2426,7 @@ def _build_week_plan(user_id: str, days: int = 7) -> str:
     set_user_context(user_id, {
         'type': 'pending_schedule_approval',
         'mode': 'sequential_plan',
+        'ui': 'proposal',
         'title': current['title'],
         'start_time': current['start_time'],
         'duration_minutes': current['duration_minutes'],
@@ -2264,8 +2452,7 @@ def _format_schedule_proposal(proposal: dict, index: int,
         f'📅 {start.strftime("%d/%m/%Y")} בשעה '
         f'{start.strftime("%H:%M")}–{end.strftime("%H:%M")} '
         f'(משך {proposal["duration_minutes"]} דק׳)\n\n'
-        'לאשר את השיבוץ? ענה *כן* או *לא*.\n'
-        'אפשר גם *אשר הכל*, *דלג*, או *ביטול*.'
+        'בחר פעולה מהתפריט: אישור, שינוי מועד, דילוג או עצירה.'
         f'{skipped_note}'
     )
 
@@ -2416,7 +2603,7 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
     try:
         amt = abs(float(args.get('amount', 0)))
     except (TypeError, ValueError):
-        return 'לא הצלחתי להבין את הסכום. נסה שוב, למשל "הוצאתי 50 שקל על מזון".'
+        return 'לא הצלחתי להבין את הסכום. נסה שוב, למשל "הוצאתי 50 שקל על אוכל".'
     if amt <= 0:
         return 'הסכום חייב להיות גדול מאפס. נסה שוב 🙂'
     cat  = (args.get('category') or '').strip()
@@ -2436,7 +2623,7 @@ def _tool_add_expense(args: dict, user_id: str) -> str:
             alert = (f'\nנחסכו {saved:,.0f}/{goal:,.0f} ש"ח החודש' +
                      (f' (עוד {rem:,.0f} ליעד 🎯)' if rem > 0 else ' — היעד הושג! 🎉'))
         else:
-            alert = f'\nסה"כ נחסך החודש: {saved:,.0f} ש"ח'
+            alert = f'\nסה"כ נחסכו החודש: {saved:,.0f} ש"ח'
     elif cat != 'הכנסה':
         limit = get_budget_limit(cat, user_id)   # [MULTI] per-user
         if limit > 0:
@@ -2480,7 +2667,7 @@ def _tool_delete_expense(args: dict, user_id: str) -> str:
         candidates = txs
 
     set_user_context(user_id, {'type': 'delete_expense'})
-    msg = '*איזו תנועה לבטל? (שלח את המספר, אפשר כמה)*\n\n'
+    msg = '*איזו תנועה לבטל? (שלח את המספר, אפשר כמה מספרים, או "הכל")*\n\n'
     for t in candidates[:12]:
         msg += _format_tx(t) + '\n'
     msg += '\n(או "ביטול")'
@@ -2555,38 +2742,38 @@ def _tool_add_task(args: dict, user_id: str) -> str:
 
 def _tool_propose_event(args: dict, user_id: str) -> str:
     """שומר את הצעת האירוע בחדר המתנה ומבקש אישור מהמשתמש."""
-    title = args.get('title', 'אירוע')
+    title = (args.get('title') or 'אירוע').strip()
     start_time = args.get('start_time')
-    duration = args.get('duration_minutes', 60)
+    try:
+        duration = max(15, min(int(args.get('duration_minutes') or 60), 720))
+    except (TypeError, ValueError):
+        duration = 60
     explanation = args.get('explanation', 'מצאתי זמן פנוי.')
 
     if not start_time:
         return 'חסר זמן התחלה להצעה.'
+    start = _parse_event_datetime(start_time)
+    if not start:
+        return 'לא הצלחתי להבין את תאריך ושעת ההצעה.'
 
     # שומרים את הנתונים ב"חדר ההמתנה" (מסד הנתונים)
     context_data = {
         'type': 'pending_schedule_approval',
+        'ui': 'proposal',
         'title': title,
-        'start_time': start_time,
+        'start_time': start.isoformat(),
         'duration_minutes': duration
     }
     set_user_context(user_id, context_data)
-
-    # מעצבים את התאריך למראה יפה בוואטסאפ
-    try:
-        dt = datetime.fromisoformat(start_time)
-        time_str = dt.strftime("%d/%m/%Y בשעה %H:%M")
-    except Exception:
-        time_str = start_time
-
+    end = start + timedelta(minutes=duration)
     return (
-        f"🤖 *הצעת שיבוץ בלו״ז:*\n"
-        f"_{explanation}_\n\n"
-        f"📅 מציע לשבץ: *{title}*\n"
-        f"⏰ מתי? {time_str} (למשך {duration} דק').\n\n"
-        f"האם לאשר את השיבוץ ביומן? (ענה *כן* / *לא*)"
+        f'🤖 *הצעת שיבוץ בלו״ז:*\n_{explanation}_\n\n'
+        f'📌 *{title}*\n'
+        f'📅 {start.strftime("%d/%m/%Y")} בשעה '
+        f'{start.strftime("%H:%M")}–{end.strftime("%H:%M")} '
+        f'(משך {duration} דק׳)\n\n'
+        'בחר פעולה מהתפריט: אישור, שינוי מועד או ביטול.'
     )
-
 
 def _tool_set_schedule_preferences(args: dict, user_id: str) -> str:
     preferences = get_user_preferences(user_id)
@@ -2612,8 +2799,8 @@ def _tool_create_event(args: dict, user_id: str) -> str:
     title          = (args.get('title') or 'אירוע').strip()
     start_time_iso = args.get('start_time')
     if not start_time_iso:
-        return 'חסר תאריך ושעה לאירוע. מתי לקבוע אותו?'
-    
+        return 'חסר זמן התחלה להצעה.'
+
     end_time_iso = args.get('end_time')
     is_all_day   = bool(args.get('is_all_day', False))
     location     = (args.get('location') or '').strip() or None
@@ -2678,7 +2865,8 @@ def _tool_complete_task(args: dict, user_id: str) -> str:
         for tid, _q, _d in get_active_tasks(user_id):
             if mark_task_completed(tid, user_id):
                 n += 1
-        return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו. שולחן נקי!'
+        return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו.'
+        return f'מעולה! 🎉 כל {n} המשימות סומנו כהושלמו.'
 
     queries = _collect_task_queries(args)
     done: list[tuple[int, str]] = []
@@ -3007,7 +3195,7 @@ def summarize_document_with_ai(doc_data: bytes | None, mime_type: str, filename:
                 'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
     can_read = mime_type.startswith('application/pdf') or mime_type.startswith('text/')
     if not can_read:
-        return (f'📄 קיבלתי מסמך: *{name}* ({mime_type or "סוג לא ידוע"}).\n'
+        return (f'📄 קיבלתי מסמך: *{name}*\n({mime_type or "סוג לא ידוע"}).\n'
                 'אני יכול לקרוא כרגע רק PDF או קובצי טקסט. '
                 'העתק את הטקסט ושלח אותו ישירות ואשמח לעזור.')
     try:
@@ -3106,6 +3294,26 @@ def send_whatsapp_message(to: str, message: str) -> bool:
     return ok
 
 
+def send_whatsapp_template_message(to: str, template_name: str,
+                                   language: str, body_text: str) -> bool:
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not template_name:
+        return False
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to': to,
+        'type': 'template',
+        'template': {
+            'name': template_name,
+            'language': {'code': language},
+            'components': [{
+                'type': 'body',
+                'parameters': [{'type': 'text', 'text': body_text[:1024]}],
+            }],
+        },
+    }
+    return _post_whatsapp(payload)
+
+
 def send_whatsapp_action_buttons(to: str, body: str,
                                  buttons: list[tuple[str, str]]) -> bool:
     """Send up to three WhatsApp reply buttons for a pending decision."""
@@ -3122,6 +3330,51 @@ def send_whatsapp_action_buttons(to: str, body: str,
                 {'type': 'reply', 'reply': {'id': button_id, 'title': title[:20]}}
                 for button_id, title in buttons[:3]
             ]},
+        },
+    }
+    return _post_whatsapp(payload)
+
+
+def send_whatsapp_cta_url(to: str, body: str, button_text: str, url: str) -> bool:
+    """Send a WhatsApp 'call to action' URL button (interactive.type=cta_url)."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not url:
+        return False
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to': to,
+        'type': 'interactive',
+        'interactive': {
+            'type': 'cta_url',
+            'body': {'text': body[:1024]},
+            'action': {
+                'name': 'cta_url',
+                'parameters': {'display_text': button_text[:20], 'url': url},
+            },
+        },
+    }
+    return _post_whatsapp(payload)
+
+
+def send_whatsapp_list_message(to: str, body: str, button_text: str,
+                               rows: list[tuple[str, str, str]]) -> bool:
+    """Send a WhatsApp interactive list message (up to 10 rows, unlike the
+    3-button cap of send_whatsapp_action_buttons). rows = [(id, title, description), ...]."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID or not rows:
+        return False
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to': to,
+        'type': 'interactive',
+        'interactive': {
+            'type': 'list',
+            'body': {'text': body[:1024]},
+            'action': {
+                'button': button_text[:20],
+                'sections': [{'rows': [
+                    {'id': row_id, 'title': title[:24], 'description': desc[:72]}
+                    for row_id, title, desc in rows[:10]
+                ]}],
+            },
         },
     }
     return _post_whatsapp(payload)
@@ -3283,11 +3536,22 @@ def _send_shabbat_notification() -> None:
         return
     try:
         with _connect() as conn:
-            users = [row[0] for row in conn.execute(
+            known = [row[0] for row in conn.execute(
                 'SELECT user_id FROM known_users ORDER BY user_id').fetchall()]
-        if ALLOWED_USERS:
-            users = [user for user in users if user in ALLOWED_USERS]
-        failures = [user for user in users if not send_whatsapp_message(user, message)]
+        # [FIX] Message every ALLOWED number directly — previously this only
+        # reached people who had ALSO texted the bot before (known_users),
+        # so family members added to the allowlist but who never opened a
+        # chat never got the Shabbat message. Fall back to known_users only
+        # when no allowlist is configured anywhere (fully open bot).
+        allowed = ALLOWED_USERS | get_allowed_users_db()
+        users = sorted(allowed) if allowed else known
+        if SHABBAT_TEMPLATE_NAME:
+            template_body = message.removeprefix('🕯️ זמני שבת מעודכנים').strip()
+            sender = lambda user: send_whatsapp_template_message(
+                user, SHABBAT_TEMPLATE_NAME, SHABBAT_TEMPLATE_LANGUAGE, template_body)
+        else:
+            sender = lambda user: send_whatsapp_message(user, message)
+        failures = [user for user in users if not sender(user)]
         if failures:
             logger.error('Shabbat notification failed for %d users: %s',
                          len(failures), failures)
@@ -3369,7 +3633,7 @@ _GREETINGS = {
     'start', 'התחל', 'התחלה',
 }
 
-# "הגדר תקציב <קטגוריה> <סכום>" (תומך כעת גם ב-"על סך", "בסך", "ל")
+# "הגדר תקציב <קטגוריה> < summed>" (תומך כעת גם ב-"על סך", "בסך", "ל")
 _SET_BUDGET_RE = re.compile(
     r'^(?:הגדר|עדכן|קבע|שנה)\s+תקציב\s+([א-ת]+)(?:\s+(?:על סך|בסך|ל|לסך|ב))?\s+([\d,\.]+)\s*(?:ש"ח|שקל|שקלים|₪)?\s*$'
 )
@@ -3392,10 +3656,15 @@ _LINK_DASH_RE  = re.compile(r'^(?:קישור|לינק|דשבורד)\s+(\+?[\d\s\
 _LINK_ALIAS_RE   = re.compile(r'^שתף\s+(\+?[\d\s\-()]{6,})\s+עם\s+(\+?[\d\s\-()]{6,})\s*$')
 _UNLINK_ALIAS_RE = re.compile(r'^בטל\s+שיתוף\s+(\+?[\d\s\-()]{6,})\s*$')
 
+# [MULTI] Admin-only instant allowlist approval (DB-backed, no redeploy):
+#   "אשר משתמש 972501234567 דני"   /   "הסר משתמש 972501234567"
+_APPROVE_USER_RE = re.compile(r'^אשר\s+משתמש\s+(\+?[\d\s\-()]{6,})(?:\s+(.+))?\s*$')
+_REVOKE_USER_RE  = re.compile(r'^הסר\s+משתמש\s+(\+?[\d\s\-()]{6,})\s*$')
+
 
 def _try_admin_command(text: str, user_id: str) -> str | None:
     """Handle admin-only commands. Returns a reply if handled, else None."""
-    if user_id not in ADMIN_USERS:
+    if _normalize_phone(user_id) not in ADMIN_USERS:
         return None
     t = text.strip()
 
@@ -3425,7 +3694,29 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
                  f'לבדיקה חיה: בדוק יומן {target}')
         if not DB_PERSISTENT:
             reply += ('\n⚠️ אזהרה: DB_PATH לא מוגדר — החיבור הזה יימחק בדיפלוי '
-                      'הבא! שלח "אבחון" לפרטים.')
+                      'הבא! שלח "אבחון".')
+        # [NEW] Message the FRIEND directly with a button that opens their own
+        # calendar's sharing settings — Google can't pre-fill the invite email,
+        # so it's sent right after in its own copyable bubble.
+        sa = _service_account_email()
+        if sa:
+            settings_url = ('https://calendar.google.com/calendar/u/0/r/settings/calendar/'
+                            + quote(email, safe=''))
+            sent = send_whatsapp_cta_url(
+                target,
+                '📅 כדי שסחבק יוכל לקבוע לך אירועים ביומן, שתף את היומן שלך עם '
+                'חשבון השירות שלו:\n\n1️⃣ לחץ על הכפתור למטה\n'
+                '2️⃣ לחץ על "+ הוספת אנשים"\n'
+                '3️⃣ הדבק את הכתובת הבאה ותן הרשאת "ביצוע שינויים באירועים"',
+                'פתח הגדרות יומן', settings_url,
+            )
+            email_sent = send_whatsapp_message(target, BUBBLE_BREAK + sa)
+            if sent:
+                reply += f'\n📨 שלחתי ל-{target} כפתור ישיר לשיתוף היומן.'
+            if not sent or not email_sent:
+                reply += ('\n⚠️ לא הצלחתי לשלוח את הוראות החיבור ישירות למשתמש. '
+                          'העבר לו את הקישור ואת כתובת חשבון השירות שמופיעים בהודעות הבאות:'
+                          + BUBBLE_BREAK + settings_url + BUBBLE_BREAK + sa)
         return reply
 
     m = _UNLINK_CAL_RE.match(t)
@@ -3452,6 +3743,24 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         member = _normalize_phone(m.group(1))
         delete_user_alias(member)
         return f'🔌 ביטלתי את השיתוף של {member}. מעכשיו הנתונים שלו נפרדים.'
+
+    m = _APPROVE_USER_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        label  = (m.group(2) or '').strip() or None
+        if not target:
+            return 'מספר לא תקין. נסה: אשר משתמש 972501234567 דני'
+        add_allowed_user(target, label)
+        who = f' ({label})' if label else ''
+        return (f'✅ אישרתי גישה מיידית ל-{target}{who} — בלי דיפלוי, נכנס לתוקף '
+                'כבר עכשיו. הוא יכול לדבר עם הבוט מיד.')
+
+    m = _REVOKE_USER_RE.match(t)
+    if m:
+        target = _normalize_phone(m.group(1))
+        remove_allowed_user(target)
+        return (f'🔌 הסרתי את {target} מרשימת האישורים המיידית. '
+                '(אם הוא גם ברשימת ALLOWED_USERS ב-Railway, הוא עדיין מורשה משם.)')
 
     # Generate someone else's personal dashboard link (to send them).
     m = _LINK_DASH_RE.match(t)
@@ -3657,6 +3966,7 @@ def _advance_sequential_schedule(user_id: str, context: dict,
     next_context = {
         'type': 'pending_schedule_approval',
         'mode': 'sequential_plan',
+        'ui': 'proposal',
         'title': next_proposal['title'],
         'start_time': next_proposal['start_time'],
         'duration_minutes': next_proposal['duration_minutes'],
@@ -3689,6 +3999,10 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     text = (text or '').strip()
     if not text:
         return 'לא קיבלתי טקסט 🙂 כתוב לי מה לעשות, או שלח "תפריט".'
+    if not user_id:
+        return 'לא קיבלתי את הכתובת של המשתמש.'
+    if not admin_phone:
+        admin_phone = user_id
 
     # ── Multi-step context flow ──────────────
     context = get_user_context(user_id)
@@ -3698,49 +4012,99 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
             return 'הפעולה בוטלה ✅'
 
         ctype = context.get('type')
-        if ctype == 'pending_schedule_plan':
-            clean = re.sub(r'[\s!.,?]+', '', text).lower()
-            if clean in ('ביטול', 'בטל', 'לא'):
-                delete_user_context(user_id)
-                return 'ביטלתי את התכנון. שום אירוע לא נוצר.'
-            if clean in ('בחירתמשימות', 'בחרמשימות', 'בחירה'):
-                return ('בחר את המשימות שתרצה לשבץ מתוך התוכנית.\n'
-                        'לדוגמה: *אשר 1 3 5*\n'
-                        'אפשר גם *אשר הכל* או *ביטול*.')
-            if clean.startswith(('אשר', 'כן')):
-                numbers = [int(value) for value in re.findall(r'\d+', text)]
-                proposals = context.get('proposals') or []
-                selected = proposals if ('הכל' in clean or not numbers) else [
-                    proposal for index, proposal in enumerate(proposals, start=1)
-                    if index in numbers
-                ]
-                if not selected:
-                    return 'לא זיהיתי מספרי הצעות. כתוב למשל: אשר 1 3 או אשר הכל.'
-                delete_user_context(user_id)
-                results = []
-                reverse_colors = {value: key for key, value in CALENDAR_COLORS_HE.items()}
-                for proposal in selected:
-                    results.append(process_calendar_ai(
-                        proposal['title'], proposal['start_time'], None, user_id,
-                        proposal['duration_minutes'], color=reverse_colors.get(
-                            proposal.get('color_id'))
-                    ))
-                return '\n\n'.join(results)
-            return 'התכנון מוכן. כתוב *אשר הכל* או *אשר 1 3*, או *ביטול*.'
-
         if ctype == 'pending_schedule_approval':
+            # [NEW] Free-text reply to the "✍️ תאריך אחר" custom-time prompt.
+            if context.get('awaiting_custom_time'):
+                parsed = _parse_custom_schedule_time(text, now_local())
+                if not parsed:
+                    return ('לא הצלחתי להבין את הזמן. נסה למשל "מחר 16:00" או '
+                            '"10/10 09:00", או "ביטול".')
+                duration = max(15, min(int(context.get('duration_minutes') or 60), 720))
+                is_free = _custom_schedule_time_is_free(user_id, parsed, duration)
+                if is_free is None:
+                    return 'לא הצלחתי לבדוק את היומן כרגע. ההצעה נשמרה; נסה שוב בעוד רגע.'
+                if not is_free:
+                    return ('הזמן הזה מחוץ לשעות התכנון (08:00–18:00), בשבת, רחוק מדי, '
+                            'או תפוס ביומן. נסה זמן פנוי אחר.')
+                context['start_time'] = parsed.isoformat()
+                context['awaiting_custom_time'] = False
+                context['ui'] = 'proposal'
+                context['no_count'] = 0
+                context['alternatives'] = _schedule_alternatives(
+                    context, context.get('remaining_proposals') or [])
+                set_user_context(user_id, context)
+                remaining_n = len(context.get('remaining_proposals') or [])
+                skipped_n = len(context.get('skipped_proposals') or [])
+                total = remaining_n + skipped_n + 1
+                return _format_schedule_proposal(context, total - remaining_n, total, skipped_n)
+
             clean = re.sub(r'[\s!.,?]+', '', text).lower()
             yes = clean.startswith(('כן', 'אשר', 'אוקי', 'סבבה', 'מעולה', 'בטח', 'יאללה', '👍', '✅'))
             no = clean.startswith(('לא', 'דלג', 'בטל', 'ביטול', 'פחות', '❌'))
+            change_time = clean == 'שנהמועד'
+            skip = clean == 'דלג'
+            stop = clean in ('עצור', 'סיום', 'סיים', 'עצורותןסיכום')
+
+            # [NEW] "שנה מועד" opens the same alternatives sub-menu as a first
+            # rejection would, WITHOUT counting it as a rejection.
+            if change_time and context.get('mode') == 'sequential_plan' and context.get('alternatives'):
+                context['ui'] = 'alternatives'
+                set_user_context(user_id, context)
+                return _format_schedule_alternatives(context, context['alternatives'])
+            if change_time:
+                context['awaiting_custom_time'] = True
+                context['ui'] = 'awaiting_custom'
+                set_user_context(user_id, context)
+                return (f'באיזה זמן תרצה לשבץ את *{context["title"]}*? אפשר לכתוב '
+                        'למשל "מחר 16:00" או "10/10 09:00".\n(או "ביטול")')
+
+            # [NEW] Explicit "עצור" ends the plan immediately (unlike a plain
+            # "לא", which first offers alternatives before stopping).
+            if stop:
+                if context.get('mode') == 'sequential_plan':
+                    current = {
+                        'title': context['title'],
+                        'start_time': context['start_time'],
+                        'duration_minutes': context.get('duration_minutes', 60),
+                        'color_id': context.get('color_id'),
+                    }
+                    skipped = list(context.get('skipped_proposals') or [])
+                    remaining = [current] + list(context.get('remaining_proposals') or [])
+                    delete_user_context(user_id)
+                    return _schedule_summary('עצרתי את התכנון לבקשתך.',
+                                             context.get('accepted_proposals') or [],
+                                             skipped, remaining)
+                delete_user_context(user_id)
+                return 'ביטלתי את השיבוץ 👍 מתי תרצה שאקבע את זה במקום?'
+
+            if skip and context.get('mode') == 'sequential_plan':
+                skipped = list(context.get('skipped_proposals') or [])
+                skipped.append({
+                    'title': context['title'],
+                    'start_time': context['start_time'],
+                    'duration_minutes': context.get('duration_minutes', 60),
+                    'color_id': context.get('color_id'),
+                })
+                context['skipped_proposals'] = skipped
+                context['alternatives'] = []
+                context['no_count'] = 0
+                return _advance_sequential_schedule(user_id, context)
 
             if context.get('mode') == 'sequential_plan' and context.get('alternatives'):
                 alternatives = context['alternatives']
+                if clean == 'תאריךאחר':
+                    context['awaiting_custom_time'] = True
+                    context['ui'] = 'awaiting_custom'
+                    set_user_context(user_id, context)
+                    return (f'באיזה זמן תרצה לשבץ את *{context["title"]}*? אפשר לכתוב '
+                            'למשל "מחר 16:00" או "10/10 09:00".\n(או "ביטול")')
                 if clean in ('תציעחלופותאחרות', 'חלופותאחרות', 'חלופהאחרת'):
                     excluded = {item.get('start_time') for item in alternatives}
                     fresh = _schedule_alternatives(
                         context, context.get('remaining_proposals') or [], excluded)
                     if fresh:
                         context['alternatives'] = fresh
+                        context['ui'] = 'alternatives'
                         set_user_context(user_id, context)
                         return _format_schedule_alternatives(context, fresh)
                     return 'לא מצאתי חלופות נוספות בטווח הקרוב.'
@@ -3756,18 +4120,21 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                     selected_index = 1
                 if selected_index is not None and selected_index < len(alternatives):
                     selected = alternatives[selected_index]
-                    remaining = [proposal for proposal in context.get('remaining_proposals', [])
-                                  if proposal.get('start_time') != selected.get('start_time')]
-                    context['remaining_proposals'] = remaining
+                    context['remaining_proposals'] = [
+                        proposal for proposal in context.get('remaining_proposals', [])
+                        if proposal.get('start_time') != selected.get('start_time')
+                    ]
+                    context['start_time'] = selected['start_time']
+                    context['duration_minutes'] = selected['duration_minutes']
                     context['alternatives'] = []
-                    context.setdefault('accepted_proposals', []).append(selected)
-                    result = process_calendar_ai(
-                        selected['title'], selected['start_time'], None, user_id,
-                        selected['duration_minutes'],
-                        color={value: key for key, value in CALENDAR_COLORS_HE.items()}.get(
-                            selected.get('color_id'))
-                    )
-                    return _advance_sequential_schedule(user_id, context, result)
+                    context['ui'] = 'proposal'
+                    context['no_count'] = 0
+                    set_user_context(user_id, context)
+                    remaining_n = len(context['remaining_proposals'])
+                    skipped_n = len(context.get('skipped_proposals') or [])
+                    total = remaining_n + skipped_n + 1
+                    return _format_schedule_proposal(
+                        context, total - remaining_n, total, skipped_n)
 
             if context.get('mode') == 'sequential_plan' and clean in ('ביטול', 'בטל'):
                 delete_user_context(user_id)
@@ -3813,6 +4180,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                 if context.get('mode') == 'sequential_plan':
                     if int(context.get('no_count') or 0) == 0 and context.get('alternatives'):
                         context['no_count'] = 1
+                        context['ui'] = 'alternatives'
                         set_user_context(user_id, context)
                         return _format_schedule_alternatives(
                             context, context['alternatives'])
@@ -3863,7 +4231,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         if ctype in ('complete_task', 'delete_task', 'delete_expense'):
             # [r6.1] Only treat the reply as a numeric choice if it really is
             # one ("3", "1 4 7", "משימה 2", "הכל"). If the user changed topic
-            # ("תקבע פגישה מחר ב-10"), drop the pending picker instead of
+            # ("תקבע פגישות מחר ב-10"), drop the pending picker instead of
             # hijacking its digits as task/expense IDs.
             leftover = re.sub(r'[\d\s,.\-]+', '', text)
             if leftover in ('', 'הכל', 'הכול', 'אתהכל', 'אתהכול', 'ו', 'וגם',
@@ -3898,7 +4266,7 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
         # Send the URL in its OWN pure-ASCII bubble (after BUBBLE_BREAK). A
         # bubble with no Hebrew renders left-to-right, so WhatsApp can't clip
         # the URL's leading "h".
-        return ('🔗 לוח הבקרה האישי שלך — שמור את הקישור, מציג רק את הנתונים שלך:'
+        return ('🔗 לוח בקרה אישי עבור {user_id} — שלח לו, יראה רק את הנתונים שלו:'
                 + BUBBLE_BREAK + _dash_link(user_id))
 
     # ── [MULTI] Admin commands (calendar linking, diagnostics, sharing) ──
@@ -4006,7 +4374,7 @@ def get_task_status(user_id: str) -> str:
 
 def get_detailed_budget(user_id: str) -> str:
     summary_dict = {cat: total for cat, total in get_all_budget_summary(user_id)}
-    limits = get_all_budget_limits(user_id)
+    limits = get_all_budget_limits(user_id)   # [MULTI] per-user
     month = now_local().strftime('%m/%Y')
     
     total_inc, total_exp, total_sav = 0.0, 0.0, 0.0
@@ -4101,7 +4469,7 @@ def get_welcome_message() -> str:
         '📅 *יומן:* "תקבע לי פגישה עם דני מחר ב-8"\n'
         '🔁 *קבוע:* "קבע כל יום שלישי 16-19 אימון לחודש הקרוב"\n'
         '✅ *משימות:* "שים לי משימה דחופה לקנות חלב"\n'
-        '💵 *תקציב:* "אכלתי המבורגר ב-70 שקל"\n\n'
+        '💵 *תקציב:* "שילמתי 50 שקל על אוכל"\n\n'
         'אפשר גם לשלוח לי *הקלטה קולית*, *תמונה* או *קובץ PDF* 🎤📷📄\n\n'
         'לדוחות ועזרה שלח *"תפריט"*'
     )
@@ -4116,7 +4484,7 @@ def get_onboarding_message(user_id: str) -> str:
         'אני העוזר האישי שלך לניהול *משימות*, *תקציב* ו*יומן*.\n\n'
         'אפשר להתחיל מיד — כתוב לי בחופשי:\n'
         '✅ "תוסיף משימה לקנות חלב"\n'
-        '💵 "שילמתי 50 שקל על מזון"\n'
+        '💵 "שילמתי 50 שקל על אוכל"\n'
     )
     if not calendar_id_for(user_id):
         sa = _service_account_email()
@@ -4134,7 +4502,7 @@ def get_onboarding_message(user_id: str) -> str:
                 '3️⃣ שלח את כתובת ה-Gmail שלך למי שהקים את הבוט — והוא יחבר אותך תוך רגע.\n'
             )
         else:
-            msg += 'דבר עם מי שהקים את הבוט כדי לחבר את היומן שלך.\n'
+            msg += 'דבר עם מי שהקים את הבוט כדי לחבר את היומן שלך.'
     msg += '\nלרשימת הפקודות המלאה כתוב *"תפריט"* 📋'
     return msg
 
@@ -4154,7 +4522,7 @@ def get_help_menu() -> str:
         '• "סטטוס משימות" / "מה יש לי לעשות"\n'
         '• "סטטוס כלכלי" / "מאזן"\n'
         '• "תנועות אחרונות"\n'
-        '• "הגדר תקציב מזון 3000"\n'
+        '• "הגדר תקציב אוכל 3000"\n'
         '• "מחק משימה ..." · "ביטול"\n\n'
         '*קטגוריות תקציב:*\n'
         + '  '.join(f'{e} {c}' for c, e in BUDGET_CATEGORIES_HE.items()) +
@@ -4191,10 +4559,17 @@ def _handle_message_safely_unlocked(message: dict, from_number: str) -> None:
         elif msg_type == 'interactive':
             interactive = message.get('interactive', {}) or {}
             reply = interactive.get('button_reply') or interactive.get('list_reply') or {}
+            # [FIX] Map interactive ids to the exact clean-text equivalents the
+            # scheduling state machine already understands — no emoji, so the
+            # whitespace-stripped `clean` comparisons in process_message match.
             action_text = {
-                'schedule_all': 'אשר הכל',
-                'schedule_select': 'בחר משימות',
-                'schedule_cancel': 'ביטול',
+                'sched_confirm':      'כן',
+                'sched_change':       'שנה מועד',
+                'sched_skip':         'דלג',
+                'sched_stop':         'עצור',
+                'sched_time_morning': '1',
+                'sched_time_evening': '2',
+                'sched_time_custom':  'תאריך אחר',
             }
             text = action_text.get(reply.get('id')) or reply.get('title') or ''
             response = process_message(text, account_id, admin_phone=from_number)
@@ -4207,16 +4582,29 @@ def _handle_message_safely_unlocked(message: dict, from_number: str) -> None:
             response = (f'קיבלתי הודעה מסוג שאני עדיין לא יודע לקרוא ({msg_type or "לא ידוע"}).\n'
                         'אם זו קבלה/הוצאה — צלם *צילום מסך* רגיל ושלח אותו כ*תמונה* '
                         '(לא דרך "העבר"/שיתוף מהאפליקציה) — ואז אקרא ואוסיף אותה.')
-        send_whatsapp_message(from_number, response)
+
+        # [NEW] A pending scheduling proposal is sent as a real interactive
+        # message (list of 4 actions, or 3 time-choice buttons) instead of a
+        # plain-text bubble with a "כן/לא" prompt.
         pending = get_user_context(account_id)
-        if pending and pending.get('type') == 'pending_schedule_plan':
-            proposals = pending.get('proposals') or []
-            buttons = [('schedule_all', 'אשר הכל')]
-            if proposals:
-                buttons.append(('schedule_select', 'בחר משימות'))
-            buttons.append(('schedule_cancel', 'ביטול'))
-            send_whatsapp_action_buttons(
-                from_number, 'אפשר לבחור פעולה לתוכנית:', buttons)
+        ui = (pending or {}).get('ui') if pending and pending.get('type') == 'pending_schedule_approval' else None
+        if ui == 'alternatives':
+            if not send_whatsapp_action_buttons(from_number, response, [
+                ('sched_time_morning', '🌅 בוקר'),
+                ('sched_time_evening', '🌇 ערב'),
+                ('sched_time_custom', '✍️ תאריך אחר'),
+            ]):
+                send_whatsapp_message(from_number, response)
+        elif ui == 'proposal':
+            if not send_whatsapp_list_message(from_number, response, 'פעולות', [
+                ('sched_confirm', '✅ אשר ושבץ', 'קבע את האירוע ביומן במועד שהוצע'),
+                ('sched_change', '🕐 שנה מועד', 'הצע לי זמן אחר למשימה הזו'),
+                ('sched_skip', '⏭️ דלג למשימה זו', 'המשך למשימה הבאה בתוכנית'),
+                ('sched_stop', '⛔ עצור ותן סיכום', 'עצור את התכנון וסכם מה שובץ'),
+            ]):
+                send_whatsapp_message(from_number, response)
+        else:
+            send_whatsapp_message(from_number, response)
     except Exception:
         logger.exception('Failed to handle message from %s', from_number)
         try:
@@ -4280,7 +4668,7 @@ def webhook():
 
             # [MULTI] Allowlist: if configured, silently ignore anyone not on it.
             # Protects your Gemini quota and your calendar from strangers.
-            if ALLOWED_USERS and from_number not in ALLOWED_USERS:
+            if not is_user_allowed(from_number):
                 logger.info('Ignoring message from non-allowed number %s', from_number)
                 continue
 
@@ -4524,7 +4912,7 @@ def api_dashboard():
 def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str, currency: str = 'ILS', original_amount: float | None = None) -> None:
     try:
         client = get_genai_client()
-        category = 'קניות'  
+        category = 'שונות'
         
         # --- תוספת הזיכויים ---
         if amount < 0:
@@ -4538,11 +4926,11 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
                 f'לאיזו קטגוריה הכי מתאים לשייך הוצאה בבית העסק "{merchant}"?\n'
                 f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}.\n\n'
                 'הנחיות סיווג מיוחדות למשק הישראלי:\n'
-                '- סופרמרקטים ומכולות (Superyuda, Shufersal, AM:PM) -> מזון\n'
-                '- תחבורה ודלק (M Thbora, Pango, רכבת, Gett) -> רכב\n'
-                '- מסעדות, בתי קפה ומשלוחים (Wolt, ארומה, McDonald) -> בילויים (או מזון)\n'
-                '- בתי מרקחת וקופ"ח (Super-Pharm, Be) -> בריאות\n'
-                '- ביגוד והנעלה (Zara, Fox) -> קניות\n\n'
+                '- סופרמרקטים ומכולות (Superyuda, Shufersal, AM:PM) -> אוכל\n'
+                '- תחבורה ודלק (M Thbora, Pango, רכבת, Gett) -> רכב + דלק\n'
+                '- מסעדות, בתי קפה ומשלוחים (Wolt, ארומה, McDonald) -> פינוקים (או אוכל)\n'
+                '- בתי מרקחת וקופ"ח (Super-Pharm, Be) -> רפואה\n'
+                '- ביגוד והנעלה (Zara, Fox) -> ביגוד וקוסמטיקה\n\n'
                 'החזר אך ורק את שם הקטגוריה המדויק בעברית מתוך הרשימה, ללא שום מילה נוספת או הסבר.'
             )
             try:
@@ -4571,7 +4959,7 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
             'description': merchant
         }, account_id)
 
-        msg = f"🍏 *Apple Pay (אוטומטי):*\n\n{reply}"
+        msg = f"🍏 *Apple Pay (אוטומ):*\n\n{reply}"
         send_whatsapp_message(user_id_raw, msg)
         
     except Exception:
@@ -4609,7 +4997,7 @@ def api_apple_pay():
         return jsonify({'error': 'invalid amount format'}), 400
 
     # זיהוי עסקאות אימות (Pre-auth) של 0 ש"ח, הנפוצות בתחבורה ציבורית.
-    # אנחנו מחזירים 200 לאייפון כדי שהאוטומציה תרוץ חלק, אבל עוצרים פה כדי לא לרשום הוצאת סרק.
+    # אנחנו מחזירים 200 לאייפון כדי שהאוטומציה תרוץ חלק, אבל עוצרים פה כדי לא לרשום הוצאה.
     if amount == 0:
         logger.info('Apple Pay received a 0 NIS transaction (likely transit pre-auth) for %s - ignoring quietly.', merchant)
         return jsonify({'status': 'ignored_zero_amount'}), 200
@@ -4674,7 +5062,7 @@ def api_android_pay():
             
             prompt = (
                 'לפניך טקסט מהתראה של חברת אשראי או אפליקציית תשלום (כמו Google Pay).\n'
-                f'טקסט ההתראה: "{text}"\n\n'
+                f'טקסט התראה: "{text}"\n\n'
                 'עליך לחלץ מהטקסט את הסכום ששולם (מספר בלבד) ואת שם בית העסק, ולהחליט לאיזו קטגוריה זה שייך.\n'
                 f'הקטגוריות האפשריות הן: {", ".join(allowed_cats)}.\n'
                 'החזר אך ורק JSON תקין במבנה הבא (ללא שום טקסט נוסף או סימוני Markdown):\n'
@@ -4706,10 +5094,10 @@ def api_android_pay():
 
             amount = float(parsed_data.get('amount', 0))
             merchant = str(parsed_data.get('merchant', 'תשלום לא ידוע'))
-            category = str(parsed_data.get('category', 'קניות'))
+            category = str(parsed_data.get('category', 'שונות'))
 
             if category not in allowed_cats:
-                category = 'קניות'
+                category = 'שונות'
 
             if amount > 0:
                 reply = _tool_add_expense({
@@ -4718,7 +5106,7 @@ def api_android_pay():
                     'description': merchant
                 }, aid)
 
-                msg = f"🤖 *אנדרואיד (אוטומטי):*\n\n{reply}"
+                msg = f"🤖 *אנדרואיד (אוטומ):*\n\n{reply}"
                 send_whatsapp_message(uid, msg)
 
         except Exception:
@@ -4844,7 +5232,7 @@ def api_delete_task_route(task_id):
 @app.route('/api/budget-limits', methods=['PUT'])
 def api_set_budget_limits():
     """עדכן מגבלות תקציב מהדשבורד (פר-משתמש).
-    Body: { "מזון": 3000, "רכב": 2000, ... }  +  ?user_id=<PHONE>
+    Body: { "אוכל": 3000, "רכב + דלק": 2000, ... }  +  ?user_id=<PHONE>
     (אפשר גם לשלוח user_id בתוך ה-body.)"""
     err = _require_dashboard_key()
     if err:

@@ -181,7 +181,7 @@ input,select{font:inherit;color:var(--text)}
     </div>
     
     <div class="tab-content active" id="tab-exp">
-      <div class="f-group"><label>קטגוריה</label><select id="eCat"><option value="מזון">🍔 מזון</option><option value="רכב">🚗 רכב</option><option value="דיור">🏠 דיור</option><option value="בריאות">💊 בריאות</option><option value="חינוך">📚 חינוך</option><option value="בילויים">🎉 בילויים</option><option value="קניות">🛒 קניות</option><option value="נופש">✈️ נופש</option><option value="הכנסה">💰 הכנסה</option></select></div>
+      <div class="f-group"><label>קטגוריה</label><select id="eCat"><option value="אוכל">🍔 אוכל</option><option value="ביגוד וקוסמטיקה">👗 ביגוד וקוסמטיקה</option><option value="תחבורה">🚌 תחבורה</option><option value="לימודים והתפתחות">📚 לימודים והתפתחות</option><option value="פינוקים">🍫 פינוקים</option><option value="רפואה">💊 רפואה</option><option value="הוצאות בית">🏠 הוצאות בית</option><option value="חשבונות">🧾 חשבונות</option><option value="צדקה">🤝 צדקה</option><option value="מסגרות ילדים">🧸 מסגרות ילדים</option><option value="רכב + דלק">🚗 רכב + דלק</option><option value="שונות">📦 שונות</option><option value="חיסכון">🐷 חיסכון</option><option value="ביטוחים">🛡️ ביטוחים</option><option value="אירועים ומתנות">🎁 אירועים ומתנות</option><option value="הכנסה">💰 הכנסה</option></select></div>
       <div class="f-group"><label>סכום (₪)</label><input type="number" id="eAmt" placeholder="0"></div>
       <div class="f-group"><label>תיאור</label><input type="text" id="eDesc" placeholder="למשל: סופר"></div>
       <button class="btn-cta" onclick="addExp()">הוסף תנועה</button>
@@ -193,14 +193,20 @@ input,select{font:inherit;color:var(--text)}
       <div class="f-group">
         <label>בחר קטגוריה</label>
         <select id="bCat">
-          <option value="מזון">🍔 מזון</option>
-          <option value="רכב">🚗 רכב</option>
-          <option value="דיור">🏠 דיור</option>
-          <option value="בריאות">💊 בריאות</option>
-          <option value="חינוך">📚 חינוך</option>
-          <option value="בילויים">🎉 בילויים</option>
-          <option value="קניות">🛒 קניות</option>
-          <option value="נופש">✈️ נופש</option>
+          <option value="אוכל">🍔 אוכל</option>
+          <option value="ביגוד וקוסמטיקה">👗 ביגוד וקוסמטיקה</option>
+          <option value="תחבורה">🚌 תחבורה</option>
+          <option value="לימודים והתפתחות">📚 לימודים והתפתחות</option>
+          <option value="פינוקים">🍫 פינוקים</option>
+          <option value="רפואה">💊 רפואה</option>
+          <option value="הוצאות בית">🏠 הוצאות בית</option>
+          <option value="חשבונות">🧾 חשבונות</option>
+          <option value="צדקה">🤝 צדקה</option>
+          <option value="מסגרות ילדים">🧸 מסגרות ילדים</option>
+          <option value="רכב + דלק">🚗 רכב + דלק</option>
+          <option value="שונות">📦 שונות</option>
+          <option value="ביטוחים">🛡️ ביטוחים</option>
+          <option value="אירועים ומתנות">🎁 אירועים ומתנות</option>
           <option value="חיסכון">🐷 חיסכון</option>
         </select>
       </div>
@@ -265,7 +271,7 @@ for (const k in _inj) if (_inj[k] !== '' && _inj[k] != null) _injClean[k] = _inj
 let C = Object.assign({ url:'', key:'', userId:'', token:'' }, JSON.parse(localStorage.getItem('sahbak_cfg') || '{}'), _injClean);
 (function(){const q = new URLSearchParams(location.search);const uid = q.get('user_id') || q.get('u');const tok = q.get('token') || q.get('t');if(uid) C.userId = uid;if(tok) C.token = tok;})();
 
-const EMO = {דיור:'🏠',רכב:'🚗',נופש:'✈️',מזון:'🍔',בריאות:'💊',חינוך:'📚',בילויים:'🎉',קניות:'🛒',הכנסה:'💰'};
+const EMO = {'אוכל':'🍔','ביגוד וקוסמטיקה':'👗','תחבורה':'🚌','לימודים והתפתחות':'📚','פינוקים':'🍫','רפואה':'💊','הוצאות בית':'🏠','חשבונות':'🧾','צדקה':'🤝','מסגרות ילדים':'🧸','רכב + דלק':'🚗','שונות':'📦','חיסכון':'🐷','ביטוחים':'🛡️','אירועים ומתנות':'🎁','הכנסה':'💰'};
 const QC = {'חשוב דחוף':'q1','חשוב לא דחוף':'q2','דחוף לא חשוב':'q3','לא דחוף לא חשוב':'q4'};
 let pieChart = null;
 
