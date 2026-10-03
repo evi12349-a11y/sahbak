@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-03-r33'
+BUILD_VERSION = '2026-10-03-r34'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -4684,6 +4684,7 @@ def index():
 
 _WA_LIVE_CACHE: dict = {'at': 0.0, 'value': None}
 _WA_LIVE_TTL = 600  # seconds; keeps monitors from hammering the Graph API
+_WA_BAD_STATUSES = {'BANNED', 'RESTRICTED', 'FLAGGED', 'DISCONNECTED', 'DELETED', 'MIGRATED'}
 
 
 def _whatsapp_live_check() -> dict:
@@ -4701,12 +4702,18 @@ def _whatsapp_live_check() -> dict:
     try:
         resp = http_requests.get(
             f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}',
-            params={'fields': 'display_phone_number,quality_rating'},
+            params={'fields': 'display_phone_number,quality_rating,status'},
             headers={'Authorization': f'Bearer {WHATSAPP_TOKEN}'},
             timeout=5,
         )
         if resp.status_code == 200:
-            result = {'whatsapp_live': True, 'whatsapp_error': None}
+            status = str((resp.json() or {}).get('status') or 'UNKNOWN').upper()
+            bad = status in _WA_BAD_STATUSES
+            result = {
+                'whatsapp_live': not bad,
+                'whatsapp_status': status,
+                'whatsapp_error': f'phone_status_{status}' if bad else None,
+            }
         else:
             try:
                 err = (resp.json().get('error') or {})
