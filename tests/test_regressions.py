@@ -17,11 +17,29 @@ class RegressionTests(unittest.TestCase):
     def setUp(self):
         with main._connect() as conn:
             for table in ('budget', 'budget_limits', 'allowed_users', 'known_users',
-                          'contexts', 'notification_runs'):
+                          'contexts', 'notification_runs', 'feedback'):
                 conn.execute(f'DELETE FROM {table}')
             conn.commit()
         main.ALLOWED_USERS = set()
         main.ADMIN_USERS = {'972501234567'}
+
+    def test_user_feedback_is_saved_and_admin_can_list_and_resolve(self):
+        reply = main._try_fast_shortcut('באג: התזכורת לא הגיעה', '972521234567')
+        self.assertIn('רשמתי', reply)
+
+        listing = main._try_admin_command('משובים', '972501234567')
+        self.assertIn('התזכורת לא הגיעה', listing)
+        self.assertIsNone(main._try_admin_command('משובים', '972521234567'))
+
+        with main._connect() as conn:
+            fid = conn.execute('SELECT id FROM feedback').fetchone()[0]
+        self.assertIn('טופל', main._try_admin_command(f'טופל {fid}', '972501234567'))
+        self.assertIn('אין משובים', main._try_admin_command('משובים', '972501234567'))
+
+    def test_feedback_daily_limit(self):
+        for i in range(main._FEEDBACK_DAILY_LIMIT):
+            main._save_feedback(f'הצעה: רעיון {i}', '972521234567')
+        self.assertIn('מחר', main._save_feedback('הצעה: עוד אחת', '972521234567'))
 
     def test_admin_can_approve_and_revoke_normalized_phone(self):
         approved = main._try_admin_command(

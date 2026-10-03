@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-03-r34'
+BUILD_VERSION = '2026-10-03-r35'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -596,6 +596,16 @@ def init_db() -> None:
                 run_date   TEXT PRIMARY KEY,
                 claimed_at TEXT NOT NULL,
                 sent_at    TEXT
+            );
+
+            -- user feedback / bug reports, reviewed by admins ("משובים").
+            CREATE TABLE IF NOT EXISTS feedback (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved   INTEGER NOT NULL DEFAULT 0
             );
         ''')
 
@@ -3650,11 +3660,70 @@ _APPROVE_USER_RE = re.compile(r'^אשר\s+משתמש\s+(\+?[\d\s\-()]{6,})(?:\s+
 _REVOKE_USER_RE  = re.compile(r'^הסר\s+משתמש\s+(\+?[\d\s\-()]{6,})\s*$')
 
 
+_FEEDBACK_RE = re.compile(
+    r'^(דווח על באג|באג|דיווח|משוב|הצעה לשיפור|הצעה)\s*[:\-]?\s*(.+)$', re.DOTALL)
+_FEEDBACK_MAX_CHARS = 1000
+_FEEDBACK_DAILY_LIMIT = 10
+
+
+def _save_feedback(text: str, user_id: str) -> str | None:
+    """Store a bug report / suggestion. Returns a reply, or None if `text`
+    isn't feedback."""
+    m = _FEEDBACK_RE.match(text.strip())
+    if not m:
+        return None
+    label, body = m.group(1), m.group(2).strip()
+    kind = 'bug' if 'באג' in label or label == 'דיווח' else 'feedback'
+    today = now_local().strftime('%Y-%m-%d')
+    with _connect() as conn:
+        sent_today = conn.execute(
+            'SELECT COUNT(*) FROM feedback WHERE user_id = ? AND created_at LIKE ?',
+            (user_id, f'{today}%')).fetchone()[0]
+        if sent_today >= _FEEDBACK_DAILY_LIMIT:
+            return 'קיבלתי הרבה דיווחים ממך היום 🙏 אשמח להמשך מחר.'
+        conn.execute(
+            'INSERT INTO feedback (user_id, kind, text, created_at) VALUES (?, ?, ?, ?)',
+            (user_id, kind, body[:_FEEDBACK_MAX_CHARS], now_local().isoformat()))
+        conn.commit()
+    return ('תודה! 🐞 רשמתי את הדיווח, ואבדוק אותו.' if kind == 'bug'
+            else 'תודה על ההצעה! 💡 רשמתי אותה.')
+
+
+def _admin_list_feedback() -> str:
+    with _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, user_id, kind, text, created_at FROM feedback '
+            'WHERE resolved = 0 ORDER BY id DESC LIMIT 10').fetchall()
+    if not rows:
+        return 'אין משובים פתוחים ✅'
+    lines = ['*משובים פתוחים:*']
+    for fid, uid, kind, body, created in rows:
+        icon = '🐞' if kind == 'bug' else '💡'
+        lines.append(f'{icon} #{fid} · {uid} · {created[:16]}\n{body}')
+    lines.append('לסימון כטופל: "טופל 12"')
+    return '\n\n'.join(lines)
+
+
+_RESOLVE_FEEDBACK_RE = re.compile(r'^טופל\s+#?(\d+)\s*$')
+
+
 def _try_admin_command(text: str, user_id: str) -> str | None:
     """Handle admin-only commands. Returns a reply if handled, else None."""
     if _normalize_phone(user_id) not in ADMIN_USERS:
         return None
     t = text.strip()
+
+    if t in ('משובים', 'דיווחים', 'באגים'):
+        return _admin_list_feedback()
+
+    m = _RESOLVE_FEEDBACK_RE.match(t)
+    if m:
+        with _connect() as conn:
+            changed = conn.execute(
+                'UPDATE feedback SET resolved = 1 WHERE id = ?',
+                (int(m.group(1)),)).rowcount
+            conn.commit()
+        return f'✅ סימנתי כטופל: #{m.group(1)}' if changed else 'לא מצאתי משוב עם המספר הזה.'
 
     # [r6] Full system diagnostic
     if t in ('אבחון', 'סטטוס מערכת', 'diag', 'debug'):
@@ -3833,6 +3902,10 @@ def _try_fast_shortcut(text: str, user_id: str) -> str | None:
 
     if low in ('תפריט', 'עזרה', 'help', 'menu', 'פקודות', '?'):
         return get_help_menu()
+
+    feedback_reply = _save_feedback(t, user_id)
+    if feedback_reply is not None:
+        return feedback_reply
 
     if low in _GREETINGS:
         return get_welcome_message()
@@ -4511,7 +4584,8 @@ def get_help_menu() -> str:
         '• "סטטוס כלכלי" / "מאזן"\n'
         '• "תנועות אחרונות"\n'
         '• "הגדר תקציב אוכל 3000"\n'
-        '• "מחק משימה ..." · "ביטול"\n\n'
+        '• "מחק משימה ..." · "ביטול"\n'
+        '• "באג: ..." או "הצעה: ..." לדיווח ולשיפור 🐞\n\n'
         '*קטגוריות תקציב:*\n'
         + '  '.join(f'{e} {c}' for c, e in BUDGET_CATEGORIES_HE.items()) +
         '\n\nאפשר גם הקלטה קולית 🎤, תמונה 📷 או PDF 📄\n'
