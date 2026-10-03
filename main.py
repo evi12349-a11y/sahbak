@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-03-r32'
+BUILD_VERSION = '2026-10-03-r33'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -4682,10 +4682,52 @@ def index():
     return jsonify({'service': 'sahbak', 'status': 'running', 'version': BUILD_VERSION}), 200
 
 
+_WA_LIVE_CACHE: dict = {'at': 0.0, 'value': None}
+_WA_LIVE_TTL = 600  # seconds; keeps monitors from hammering the Graph API
+
+
+def _whatsapp_live_check() -> dict:
+    """Ask Meta whether the token + phone number really work right now.
+
+    Env vars merely existing proves nothing: an expired token or a disabled
+    account still leaves them set. Result is cached for _WA_LIVE_TTL.
+    """
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        return {'whatsapp_live': False, 'whatsapp_error': 'missing_credentials'}
+    now = time.time()
+    cached = _WA_LIVE_CACHE['value']
+    if cached is not None and now - _WA_LIVE_CACHE['at'] < _WA_LIVE_TTL:
+        return cached
+    try:
+        resp = http_requests.get(
+            f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}',
+            params={'fields': 'display_phone_number,quality_rating'},
+            headers={'Authorization': f'Bearer {WHATSAPP_TOKEN}'},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            result = {'whatsapp_live': True, 'whatsapp_error': None}
+        else:
+            try:
+                err = (resp.json().get('error') or {})
+            except ValueError:
+                err = {}
+            result = {
+                'whatsapp_live': False,
+                'whatsapp_error': f'http_{resp.status_code}_code_{err.get("code")}',
+            }
+    except http_requests.RequestException as exc:
+        # Network trouble on our side: do not cache, so the next probe retries.
+        return {'whatsapp_live': None, 'whatsapp_error': type(exc).__name__}
+    _WA_LIVE_CACHE.update(at=now, value=result)
+    return result
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Simple health-check endpoint for Railway / uptime monitors."""
     return jsonify({
+        **_whatsapp_live_check(),
         'status':         'ok',
         'version':        BUILD_VERSION,
         'timestamp':      now_local().isoformat(),

@@ -1,0 +1,42 @@
+name: Sahbak health check
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe /health
+        run: |
+          set -euo pipefail
+          body=$(curl -sS --max-time 15 --retry 2 --retry-delay 10 \
+            -w '\n%{http_code}' https://sahbak-production.up.railway.app/health)
+          code=$(echo "$body" | tail -n1)
+          json=$(echo "$body" | sed '$d')
+          echo "HTTP $code"
+          echo "$json"
+          python3 - "$code" "$json" <<'PY'
+          import json, sys
+          code, raw = sys.argv[1], sys.argv[2]
+          problems = []
+          if code != "200":
+              problems.append(f"HTTP status {code}")
+          try:
+              d = json.loads(raw)
+          except Exception:
+              d = {}
+              problems.append("response is not valid JSON")
+          for key in ("gemini", "whatsapp", "db_persistent"):
+              if d.get(key) is not True:
+                  problems.append(f"{key} is not true")
+          if d.get("whatsapp_live") is not True:
+              problems.append(f"whatsapp_live is not true ({d.get('whatsapp_error')})")
+          if problems:
+              print("CRITICAL: " + "; ".join(problems))
+              sys.exit(1)
+          print("OK: all systems operational")
+          PY
