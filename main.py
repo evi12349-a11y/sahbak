@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-09-25-r31'
+BUILD_VERSION = '2026-10-03-r32'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -2000,7 +2000,7 @@ def _get_agent_prompt(agent_name: str) -> str:
             '- finance: כספים, קניות, הוצאות, תקציב.\n'
             '- schedule: קביעת פגישות, בלת"מים, שעות למידה, **וכל בקשה לשבץ משימות פתוחות ביומן**.\n'
             '- tasks: הוספה, מחיקה או הצגת סטטוס של משימות **אך ורק אם אין בקשה לשבץ אותן בזמן מסוים**.\n'
-            '- general: סמול-טוק פשוט.\n'
+            '- general: כל דבר שלא קשור להוצאות, משימות או יומן (שיחה חופשית, שאלות כלליות). אל תענה עליו, רק נתב.\n'
             'פשוט נתב את הבקשה. אל תענה בטקסט חופשי.'
         )
 
@@ -2540,25 +2540,13 @@ def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple
 
     logger.info("Router decided to route request to agent: %s", agent_name)
 
-    # 2. שיחה כללית
+    # 2. מחוץ לתחום: אין שיחה חופשית. הבוט ממוקד בהוצאות, משימות, יומן ותזכורות
+    # (מדיניות WhatsApp Business אוסרת על בוטים כלליים).
     if agent_name == 'general':
-        try:
-            gen_resp = _generate_with_fallback(
-                lambda mdl: client.models.generate_content(
-                    model=mdl, 
-                    contents=contents, 
-                    config=_build_generate_config(
-                        mdl,
-                        system_instruction=_get_agent_prompt('router'),
-                        temperature=0.4
-                    )
-                ),
-                what='Gemini (General Chat)'
-            )
-            _, final_text = _extract_calls_and_text(gen_resp)
-            return [], final_text or router_text
-        except Exception:
-            return [], router_text or 'אני כאן! שלח פקודה ואבצע.'
+        return [], (
+            'אני עוזר ממוקד: הוצאות, משימות, יומן ותזכורות בלבד 🙂\n'
+            'למשל: "קניתי קפה ב-15", "תוסיף משימה להתקשר לרופא", "מה יש לי מחר ביומן".'
+        )
 
     # 3. הפעלת הסוכן המומחה - עם הזרקת נתונים!
     expert_system_prompt = _get_agent_prompt(agent_name)
