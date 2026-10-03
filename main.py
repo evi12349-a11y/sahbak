@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-03-r35'
+BUILD_VERSION = '2026-10-03-r36'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -607,6 +607,23 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 resolved   INTEGER NOT NULL DEFAULT 0
             );
+
+            -- proof that a person asked to join, who approved them, and
+            -- whether they opted out of proactive messages ("הפסק").
+            CREATE TABLE IF NOT EXISTS user_consent (
+                user_id      TEXT PRIMARY KEY,
+                approved_by  TEXT,
+                consented_at TEXT NOT NULL,
+                opted_out_at TEXT
+            );
+
+            -- who already received a given proactive broadcast, so a retry
+            -- never re-sends to people who got it.
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                run_date TEXT NOT NULL,
+                user_id  TEXT NOT NULL,
+                PRIMARY KEY (run_date, user_id)
+            );
         ''')
 
         # 2) Per-user budget limits (handles migration from old global table).
@@ -793,6 +810,69 @@ def is_user_allowed(phone: str) -> bool:
         return True
     norm = _normalize_phone(phone)
     return norm in ALLOWED_USERS or norm in db_allowed
+
+
+# ── Consent / opt-out ──
+
+def record_consent(phone: str, approved_by: str | None = None) -> None:
+    """Remember that this person asked to join (first approval wins; a later
+    re-approval keeps the original timestamp)."""
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR IGNORE INTO user_consent (user_id, approved_by, consented_at) '
+            'VALUES (?, ?, ?)',
+            (_normalize_phone(phone), _normalize_phone(approved_by or '') or None,
+             now_local().isoformat()))
+        conn.commit()
+
+
+def set_opted_out(phone: str, opted_out: bool) -> None:
+    """Stop (or resume) proactive messages. Creates the row if the user was
+    added through the env allowlist and never went through approval."""
+    norm = _normalize_phone(phone)
+    stamp = now_local().isoformat()
+    with _connect() as conn:
+        conn.execute(
+            'INSERT OR IGNORE INTO user_consent (user_id, consented_at) VALUES (?, ?)',
+            (norm, stamp))
+        conn.execute('UPDATE user_consent SET opted_out_at = ? WHERE user_id = ?',
+                     (stamp if opted_out else None, norm))
+        conn.commit()
+
+
+def is_opted_out(phone: str) -> bool:
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT opted_out_at FROM user_consent WHERE user_id = ?',
+                (_normalize_phone(phone),)).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        logger.exception('is_opted_out failed for %s', phone)
+        return False
+
+
+def list_users_summary() -> str:
+    with _connect() as conn:
+        consent = {r[0]: r[1:] for r in conn.execute(
+            'SELECT user_id, consented_at, opted_out_at FROM user_consent')}
+        labels = {r[0]: r[1] for r in conn.execute(
+            'SELECT user_id, label FROM allowed_users')}
+    everyone = sorted(ALLOWED_USERS | set(labels) | set(consent))
+    if not everyone:
+        return 'אין משתמשים רשומים.'
+    lines = [f'*משתמשים ({len(everyone)}):*']
+    for uid in everyone:
+        consented, opted_out = consent.get(uid, (None, None))
+        name = f' ({labels[uid]})' if labels.get(uid) else ''
+        if opted_out:
+            status = '🔕 הפסיק הודעות יזומות'
+        elif consented:
+            status = f'✅ אושר {consented[:10]}'
+        else:
+            status = '⚠️ אין תיעוד הסכמה'
+        lines.append(f'• {uid}{name} — {status}')
+    return '\n'.join(lines)
 
 
 # ── [MULTI] Household sharing (account aliases) ──
@@ -3543,16 +3623,34 @@ def _send_shabbat_notification() -> None:
         # when no allowlist is configured anywhere (fully open bot).
         allowed = ALLOWED_USERS | get_allowed_users_db()
         users = sorted(allowed) if allowed else known
+        users = [u for u in users if not is_opted_out(u)]
+        with _connect() as conn:
+            already = {row[0] for row in conn.execute(
+                'SELECT user_id FROM notification_deliveries WHERE run_date = ?',
+                (run_date,))}
+        pending = [u for u in users if u not in already]
         if SHABBAT_TEMPLATE_NAME:
             template_body = message.removeprefix('🕯️ זמני שבת מעודכנים').strip()
             sender = lambda user: send_whatsapp_template_message(
                 user, SHABBAT_TEMPLATE_NAME, SHABBAT_TEMPLATE_LANGUAGE, template_body)
         else:
             sender = lambda user: send_whatsapp_message(user, message)
-        failures = [user for user in users if not sender(user)]
+        failures = []
+        for user in pending:
+            if sender(user):
+                with _connect() as conn:
+                    conn.execute(
+                        'INSERT OR IGNORE INTO notification_deliveries (run_date, user_id) '
+                        'VALUES (?, ?)', (run_date, user))
+                    conn.commit()
+            else:
+                failures.append(user)
         if failures:
             logger.error('Shabbat notification failed for %d users: %s',
                          len(failures), failures)
+        # Retrying is only useful if nobody got the message (e.g. an outage).
+        # A partial failure must NOT re-run: it would re-send to everyone else.
+        if failures and len(failures) == len(pending) and not already:
             _release_notification_run(run_date)
         else:
             _mark_notification_sent(run_date)
@@ -3705,6 +3803,8 @@ def _admin_list_feedback() -> str:
 
 
 _RESOLVE_FEEDBACK_RE = re.compile(r'^טופל\s+#?(\d+)\s*$')
+_OPT_OUT_WORDS = {'הפסק', 'עצור', 'stop', 'הסר אותי'}
+_OPT_IN_WORDS = {'חזור', 'התחל', 'start'}
 
 
 def _try_admin_command(text: str, user_id: str) -> str | None:
@@ -3715,6 +3815,9 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
 
     if t in ('משובים', 'דיווחים', 'באגים'):
         return _admin_list_feedback()
+
+    if t in ('משתמשים', 'רשימת משתמשים'):
+        return list_users_summary()
 
     m = _RESOLVE_FEEDBACK_RE.match(t)
     if m:
@@ -3808,6 +3911,7 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         if not target:
             return 'מספר לא תקין. נסה: אשר משתמש 972501234567 דני'
         add_allowed_user(target, label)
+        record_consent(target, approved_by=user_id)
         who = f' ({label})' if label else ''
         return (f'✅ אישרתי גישה מיידית ל-{target}{who} — בלי דיפלוי, נכנס לתוקף '
                 'כבר עכשיו. הוא יכול לדבר עם הבוט מיד.')
@@ -4303,6 +4407,17 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
     if text in ('ביטול', 'בטל'):
         return 'אין פעולה פתוחה לביטול.'
 
+    # Opt-out of proactive messages (Shabbat times, payment confirmations).
+    # Keyed on the REAL phone: consent belongs to a person, not a shared account.
+    real_phone = admin_phone or user_id
+    if text.strip().lower() in _OPT_OUT_WORDS:
+        set_opted_out(real_phone, True)
+        return ('🔕 הפסקתי לשלוח לך הודעות יזומות (זמני שבת ואישורי תשלום).\n'
+                'אפשר עדיין לכתוב לי ואענה. להחזרה שלח "חזור".')
+    if text.strip().lower() in _OPT_IN_WORDS:
+        set_opted_out(real_phone, False)
+        return '🔔 מעולה, חזרתי לשלוח לך הודעות יזומות. להפסקה שלח "הפסק".'
+
     # ── Self-ID diagnostic (available to ANY user) ──
     # The #1 tool for "I'm connected but the bot says I'm not": shows EXACTLY
     # the phone number the bot sees + the calendar mapped to it. If the number
@@ -4545,7 +4660,9 @@ def get_onboarding_message(user_id: str) -> str:
         'אני העוזר האישי שלך לניהול *משימות*, *תקציב* ו*יומן*.\n\n'
         'אפשר להתחיל מיד — כתוב לי בחופשי:\n'
         '✅ "תוסיף משימה לקנות חלב"\n'
-        '💵 "שילמתי 50 שקל על אוכל"\n'
+        '💵 "שילמתי 50 שקל על אוכל"\n\n'
+        'ביקשת להצטרף, ולכן אשלח לפעמים הודעות יזומות (זמני שבת ואישורי תשלום). '
+        'להפסקה שלח "הפסק" בכל זמן.\n'
     )
     if not calendar_id_for(user_id):
         sa = _service_account_email()
@@ -4585,7 +4702,8 @@ def get_help_menu() -> str:
         '• "תנועות אחרונות"\n'
         '• "הגדר תקציב אוכל 3000"\n'
         '• "מחק משימה ..." · "ביטול"\n'
-        '• "באג: ..." או "הצעה: ..." לדיווח ולשיפור 🐞\n\n'
+        '• "באג: ..." או "הצעה: ..." לדיווח ולשיפור 🐞\n'
+        '• "הפסק" / "חזור" — עצירה והחזרה של הודעות יזומות\n\n'
         '*קטגוריות תקציב:*\n'
         + '  '.join(f'{e} {c}' for c, e in BUDGET_CATEGORIES_HE.items()) +
         '\n\nאפשר גם הקלטה קולית 🎤, תמונה 📷 או PDF 📄\n'
@@ -5071,7 +5189,8 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
         }, account_id)
 
         msg = f"🍏 *Apple Pay (אוטומ):*\n\n{reply}"
-        send_whatsapp_message(user_id_raw, msg)
+        if not is_opted_out(user_id_raw):
+            send_whatsapp_message(user_id_raw, msg)
         
     except Exception:
         logger.exception('Critical error in background Apple Pay processing for %s', user_id_raw)
@@ -5218,7 +5337,8 @@ def api_android_pay():
                 }, aid)
 
                 msg = f"🤖 *אנדרואיד (אוטומ):*\n\n{reply}"
-                send_whatsapp_message(uid, msg)
+                if not is_opted_out(uid):
+                    send_whatsapp_message(uid, msg)
 
         except Exception:
             logger.exception('Critical error in Android Pay processing for %s', uid)

@@ -17,7 +17,8 @@ class RegressionTests(unittest.TestCase):
     def setUp(self):
         with main._connect() as conn:
             for table in ('budget', 'budget_limits', 'allowed_users', 'known_users',
-                          'contexts', 'notification_runs', 'feedback'):
+                          'contexts', 'notification_runs', 'feedback',
+                          'user_consent', 'notification_deliveries'):
                 conn.execute(f'DELETE FROM {table}')
             conn.commit()
         main.ALLOWED_USERS = set()
@@ -40,6 +41,48 @@ class RegressionTests(unittest.TestCase):
         for i in range(main._FEEDBACK_DAILY_LIMIT):
             main._save_feedback(f'הצעה: רעיון {i}', '972521234567')
         self.assertIn('מחר', main._save_feedback('הצעה: עוד אחת', '972521234567'))
+
+    def test_approval_records_consent_and_opt_out_roundtrip(self):
+        main._try_admin_command('אשר משתמש 052-123-4567 דני', '972501234567')
+        listing = main._try_admin_command('משתמשים', '972501234567')
+        self.assertIn('972521234567', listing)
+        self.assertIn('אושר', listing)
+        self.assertFalse(main.is_opted_out('972521234567'))
+
+        reply = main.process_message('הפסק', '972521234567')
+        self.assertIn('הפסקתי', reply)
+        self.assertTrue(main.is_opted_out('+972 52-123-4567'))
+        self.assertIn('הפסיק', main._try_admin_command('משתמשים', '972501234567'))
+
+        main.process_message('חזור', '972521234567')
+        self.assertFalse(main.is_opted_out('972521234567'))
+
+    def test_shabbat_partial_failure_does_not_resend_to_successes(self):
+        main.ALLOWED_USERS = {'972521111111', '972522222222'}
+        sent = []
+
+        def fake_send(user, _message):
+            sent.append(user)
+            return user == '972521111111'
+
+        with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
+             patch.object(main, 'send_whatsapp_message', side_effect=fake_send), \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', ''):
+            main._send_shabbat_notification()
+            main._send_shabbat_notification()
+
+        self.assertEqual(sent.count('972521111111'), 1)
+
+    def test_shabbat_skips_opted_out_users(self):
+        main.ALLOWED_USERS = {'972521111111', '972522222222'}
+        main.set_opted_out('972522222222', True)
+        sent = []
+        with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
+             patch.object(main, 'send_whatsapp_message',
+                          side_effect=lambda u, m: sent.append(u) or True), \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', ''):
+            main._send_shabbat_notification()
+        self.assertEqual(sent, ['972521111111'])
 
     def test_admin_can_approve_and_revoke_normalized_phone(self):
         approved = main._try_admin_command(
