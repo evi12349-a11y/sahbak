@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-03-r36'
+BUILD_VERSION = '2026-10-06-r37'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -167,7 +167,9 @@ SHABBAT_TEMPLATE_NAME = os.getenv('SHABBAT_TEMPLATE_NAME', '').strip()
 SHABBAT_TEMPLATE_LANGUAGE = os.getenv('SHABBAT_TEMPLATE_LANGUAGE', 'he')
 # Railway often sets TZ rather than TIMEZONE — accept both.
 TIMEZONE_NAME         = os.getenv('TIMEZONE') or os.getenv('TZ') or 'Asia/Jerusalem'
-SHABBAT_NOTIFICATIONS = os.getenv('SHABBAT_NOTIFICATIONS', 'true').lower() in ('1', 'true', 'yes')
+# Off by default while the WhatsApp appeal is pending. To restore: set env
+# SHABBAT_NOTIFICATIONS=true (or change the default below to 'true').
+SHABBAT_NOTIFICATIONS = os.getenv('SHABBAT_NOTIFICATIONS', 'false').lower() in ('1', 'true', 'yes')
 SHABBAT_NOTIFICATION_HOUR = int(os.getenv('SHABBAT_NOTIFICATION_HOUR', '12'))
 
 # ── [MULTI] Multi-user access control & calendar mapping ──────────────────
