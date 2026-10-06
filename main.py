@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-06-r37'
+BUILD_VERSION = '2026-10-06-r38'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -4871,9 +4871,35 @@ def webhook():
         return jsonify({'status': 'error'}), 200
 
 
+SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'site')
+
+
+def _serve_site_page(name: str):
+    try:
+        with open(os.path.join(SITE_DIR, name + '.html'), encoding='utf-8') as f:
+            return Response(f.read(), mimetype='text/html; charset=utf-8')
+    except FileNotFoundError:
+        return 'Not found', 404
+
+
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({'service': 'sahbak', 'status': 'running', 'version': BUILD_VERSION}), 200
+    return _serve_site_page('index')
+
+
+@app.route('/privacy', methods=['GET'])
+def privacy_page():
+    return _serve_site_page('privacy')
+
+
+@app.route('/terms', methods=['GET'])
+def terms_page():
+    return _serve_site_page('terms')
+
+
+@app.route('/data-deletion', methods=['GET'])
+def data_deletion_page():
+    return _serve_site_page('data-deletion')
 
 
 _WA_LIVE_CACHE: dict = {'at': 0.0, 'value': None}
