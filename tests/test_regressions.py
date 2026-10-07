@@ -59,15 +59,17 @@ class RegressionTests(unittest.TestCase):
 
     def test_shabbat_partial_failure_does_not_resend_to_successes(self):
         main.ALLOWED_USERS = {'972521111111', '972522222222'}
+        main.record_consent('972521111111')
+        main.record_consent('972522222222')
         sent = []
 
-        def fake_send(user, _message):
+        def fake_send(user, *_args):
             sent.append(user)
             return user == '972521111111'
 
         with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
-             patch.object(main, 'send_whatsapp_message', side_effect=fake_send), \
-             patch.object(main, 'SHABBAT_TEMPLATE_NAME', ''):
+             patch.object(main, 'send_whatsapp_template_message', side_effect=fake_send), \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', 'approved_shabbat'):
             main._send_shabbat_notification()
             main._send_shabbat_notification()
 
@@ -75,14 +77,47 @@ class RegressionTests(unittest.TestCase):
 
     def test_shabbat_skips_opted_out_users(self):
         main.ALLOWED_USERS = {'972521111111', '972522222222'}
+        main.record_consent('972521111111')
+        main.record_consent('972522222222')
         main.set_opted_out('972522222222', True)
         sent = []
         with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
-             patch.object(main, 'send_whatsapp_message',
-                          side_effect=lambda u, m: sent.append(u) or True), \
-             patch.object(main, 'SHABBAT_TEMPLATE_NAME', ''):
+             patch.object(main, 'send_whatsapp_template_message',
+                          side_effect=lambda u, *args: sent.append(u) or True), \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', 'approved_shabbat'):
             main._send_shabbat_notification()
         self.assertEqual(sent, ['972521111111'])
+
+    def test_shabbat_requires_an_approved_template(self):
+        main.ALLOWED_USERS = {'972521111111'}
+        main.record_consent('972521111111')
+        with patch.object(main, '_claim_notification_run') as claim, \
+             patch.object(main, 'send_whatsapp_message') as text_send, \
+             patch.object(main, 'send_whatsapp_template_message') as template_send, \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', ''):
+            main._send_shabbat_notification()
+
+        claim.assert_not_called()
+        text_send.assert_not_called()
+        template_send.assert_not_called()
+
+    def test_shabbat_requires_recorded_consent_and_uses_template(self):
+        main.ALLOWED_USERS = {
+            '972521111111', '972522222222', '972523333333'
+        }
+        main.record_consent('972521111111')
+        main.record_consent('972522222222')
+        main.set_opted_out('972522222222', True)
+        sent = []
+        with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
+             patch.object(main, 'send_whatsapp_template_message',
+                          side_effect=lambda user, *args: sent.append(user) or True), \
+             patch.object(main, 'send_whatsapp_message') as text_send, \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', 'approved_shabbat'):
+            main._send_shabbat_notification()
+
+        self.assertEqual(sent, ['972521111111'])
+        text_send.assert_not_called()
 
     def test_admin_can_approve_and_revoke_normalized_phone(self):
         approved = main._try_admin_command(
@@ -174,6 +209,8 @@ class RegressionTests(unittest.TestCase):
     def test_shabbat_notification_includes_allowed_people_not_in_known_users(self):
         main.ALLOWED_USERS = {'972501234567'}
         main.add_allowed_user('972585231231')
+        main.record_consent('972501234567')
+        main.record_consent('972585231231')
         with main._connect() as conn:
             conn.execute(
                 'INSERT INTO known_users (user_id, first_seen) VALUES (?, ?)',
@@ -184,7 +221,8 @@ class RegressionTests(unittest.TestCase):
         with patch.object(main, '_claim_notification_run', return_value=True), \
              patch.object(main, '_shabbat_notification_for_date', return_value='Shabbat'), \
              patch.object(main, '_mark_notification_sent') as mark_sent, \
-             patch.object(main, 'send_whatsapp_message', return_value=True) as send:
+             patch.object(main, 'send_whatsapp_template_message', return_value=True) as send, \
+             patch.object(main, 'SHABBAT_TEMPLATE_NAME', 'approved_shabbat'):
             main._send_shabbat_notification()
 
         self.assertEqual({call.args[0] for call in send.call_args_list},

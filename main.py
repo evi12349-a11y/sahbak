@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-07-r39'
+BUILD_VERSION = '2026-10-07-r40'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -837,8 +837,9 @@ def set_opted_out(phone: str, opted_out: bool) -> None:
         conn.execute(
             'INSERT OR IGNORE INTO user_consent (user_id, consented_at) VALUES (?, ?)',
             (norm, stamp))
-        conn.execute('UPDATE user_consent SET opted_out_at = ? WHERE user_id = ?',
-                     (stamp if opted_out else None, norm))
+        conn.execute(
+            'UPDATE user_consent SET consented_at = ?, opted_out_at = ? WHERE user_id = ?',
+            (stamp, stamp if opted_out else None, norm))
         conn.commit()
 
 
@@ -851,6 +852,19 @@ def is_opted_out(phone: str) -> bool:
         return bool(row and row[0])
     except Exception:
         logger.exception('is_opted_out failed for %s', phone)
+        return False
+
+
+def has_active_proactive_consent(phone: str) -> bool:
+    """Require recorded opt-in and no active opt-out before proactive sends."""
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT consented_at, opted_out_at FROM user_consent WHERE user_id = ?',
+                (_normalize_phone(phone),)).fetchone()
+        return bool(row and row[0] and not row[1])
+    except Exception:
+        logger.exception('Could not verify proactive consent for %s', phone)
         return False
 
 
@@ -3601,6 +3615,10 @@ def _mark_notification_sent(run_date: str) -> None:
 
 
 def _send_shabbat_notification() -> None:
+    if not SHABBAT_TEMPLATE_NAME:
+        logger.error('Skipping Shabbat notification: no approved WhatsApp template configured')
+        return
+
     today = now_local()
     run_date = today.date().isoformat()
     if not _claim_notification_run(run_date):
@@ -3625,21 +3643,17 @@ def _send_shabbat_notification() -> None:
         # when no allowlist is configured anywhere (fully open bot).
         allowed = ALLOWED_USERS | get_allowed_users_db()
         users = sorted(allowed) if allowed else known
-        users = [u for u in users if not is_opted_out(u)]
+        users = [u for u in users if has_active_proactive_consent(u)]
         with _connect() as conn:
             already = {row[0] for row in conn.execute(
                 'SELECT user_id FROM notification_deliveries WHERE run_date = ?',
                 (run_date,))}
         pending = [u for u in users if u not in already]
-        if SHABBAT_TEMPLATE_NAME:
-            template_body = message.removeprefix('🕯️ זמני שבת מעודכנים').strip()
-            sender = lambda user: send_whatsapp_template_message(
-                user, SHABBAT_TEMPLATE_NAME, SHABBAT_TEMPLATE_LANGUAGE, template_body)
-        else:
-            sender = lambda user: send_whatsapp_message(user, message)
+        template_body = message.removeprefix('🕯️ זמני שבת מעודכנים').strip()
         failures = []
         for user in pending:
-            if sender(user):
+            if send_whatsapp_template_message(
+                    user, SHABBAT_TEMPLATE_NAME, SHABBAT_TEMPLATE_LANGUAGE, template_body):
                 with _connect() as conn:
                     conn.execute(
                         'INSERT OR IGNORE INTO notification_deliveries (run_date, user_id) '
@@ -3676,6 +3690,9 @@ def _notification_scheduler_loop() -> None:
 
 def _start_notification_scheduler() -> None:
     if SHABBAT_NOTIFICATIONS:
+        if not SHABBAT_TEMPLATE_NAME:
+            logger.error('Shabbat notifications enabled without SHABBAT_TEMPLATE_NAME; scheduler not started')
+            return
         threading.Thread(target=_notification_scheduler_loop,
                          name='sahbak-notifications', daemon=True).start()
 
