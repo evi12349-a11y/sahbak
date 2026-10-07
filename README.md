@@ -54,7 +54,7 @@
 | `WHATSAPP_API_VERSION` | לא | ברירת מחדל `v21.0`. |
 | `DB_PATH` | לא | נתיב למסד הנתונים. **לשמירת מידע בין פריסות — חבר Volume ב-Railway והצבע לכאן** (למשל `/app/data/sahbak.db`). |
 | `MAX_WORKERS` | לא | מספר הודעות שמעובדות במקביל (ברירת מחדל `8`). |
-| `SHABBAT_NOTIFICATIONS` | לא | התראות שבת וחגים אוטומטיות ב-12:00 לפי Hebcal (ברירת מחדל `true`). |
+| `SHABBAT_NOTIFICATIONS` | לא | התראות שבת וחגים אוטומטיות לפי Hebcal; כבויות כברירת מחדל (`false`). להפעלה, הגדר `true`. |
 | `SHABBAT_NOTIFICATION_HOUR` | לא | שעת שליחת ההתראה לפי `TIMEZONE` (ברירת מחדל `12`). |
 
 > ⚠️ **שמירת נתונים:** SQLite נשמר על דיסק. בלי **Volume** ב-Railway, המידע (הוצאות/משימות) יימחק בכל פריסה מחדש. כדי לשמור: צור Volume, חבר אותו (למשל ל-`/app/data`), והגדר `DB_PATH=/app/data/sahbak.db`.
@@ -65,6 +65,7 @@
    - **Callback URL:** `https://your-app.up.railway.app/webhook`
    - **Verify Token:** הערך שהגדרת ב-`VERIFY_TOKEN`.
 3. הירשם (Subscribe) לשדה **messages**.
+4. כדי לקבל גם אירועי מדיניות/השבתה מ-Meta, הירשם לאובייקט **WhatsApp Business Account** ולשדה **account_update**. השרת רושם את סוג האירוע ומידע ההפרה המצומצם ללוגים; ההרשמה עצמה חייבת להתבצע בלוח Meta.
 
 ### 5. בדיקה
 - היכנס ל-`https://your-app.up.railway.app/health` — אמור להחזיר JSON עם `"status": "ok"` ולציין אילו שירותים מחוברים.
