@@ -1,29 +1,22 @@
-# Sahbak – project notes for AI assistants
+# Sahbak – compact project guidance
 
-## What it is
-Hebrew WhatsApp personal assistant (expenses, tasks, calendar, reminders) for ~15–30 invited friends/family. One Flask file: `main.py`. No free chat: the `general` route returns a fixed refusal (Meta policy bans general-purpose AI bots).
+Before investigating Sahbak or Meta status, read [`.github/sahbak-context.md`](sahbak-context.md). Treat its timestamped observations as the starting point; do not repeat broad research or reread large files unless the task requires it.
 
-## Run / test / deploy
-- Tests (from `sahbak/`): `../.venv/bin/python -m unittest discover -s tests` (pytest is not installed).
-- Deploy: push to `main` -> Railway auto-deploys in ~1-2 min. Bump `BUILD_VERSION` in `main.py` and poll `https://sahbak-production.up.railway.app/health` for `version`.
-- `/health` fields: `whatsapp_live`, `whatsapp_status` (BANNED = Meta disabled the account), `whatsapp_error`.
-- `.github/workflows/health-check.yml` runs every ~6h and emails on failure; the reason is only in the job log.
-- Public pages (served from `site/`): `/`, `/privacy`, `/terms`, `/data-deletion`, plus `/guide`.
+## Project
+- Hebrew WhatsApp assistant: expenses, tasks, calendar, reminders; Flask app mainly in `main.py`.
+- User's goal: keep Sahbak on official WhatsApp if feasible, with up to about $5/month. User does not want Telegram, unofficial WhatsApp libraries, or a new Meta business unless they explicitly change their mind.
+- Never imply a policy workaround or promise reinstatement. Distinguish observed facts from hypotheses; ask Meta for the exact policy clause.
+- User logs in and submits forms themselves. Never handle credentials or submit legal/business declarations for them.
+- Reply in Hebrew simply. Always put a line break whenever switching between Hebrew and English.
 
-## Meta state (update when it changes)
-- App `3794466687361607`, business `1334060028677417`, WABA `3019343455075493`, number +972 55-318-1335.
-- Account disabled 30.9 -> appeal accepted 4.10 -> disabled again 5.10 (generic "Acceptable Use Policy", no specific reason).
-- Second appeal submitted 6.10 (in review, ~24h). Max ~3 appeals. Do not submit duplicates.
-- Business is unverified. Verification needs a registered business (user has none; opening an osek patur was discussed but NOT decided).
-- Shabbat notifications are OFF by default (`SHABBAT_NOTIFICATIONS=false`); set env to `true` to restore.
+## Commands and deployment
+- Tests from `sahbak/`: `../.venv/bin/python -m unittest discover -s tests`.
+- Push to `main` deploys to Railway. Bump `BUILD_VERSION` for application changes and verify `https://sahbak-production.up.railway.app/health`.
+- Health fields: `whatsapp_live`, `whatsapp_status`, `whatsapp_error`. `BANNED` means Meta disabled the WhatsApp account, not that Railway is down.
+- `.github/workflows/health-check.yml` checks about every six hours and emails on failure; use its run log for the reason.
+- No secrets in instructions or context files.
 
-## Rules
-- Never type or store user credentials; the user logs in to Meta/Railway/Google themselves and clicks final "submit" buttons.
-- User chose: no Telegram for now, no unofficial WhatsApp libraries, no new Meta business. Ask before changing this.
-- Budget: at most ~$5/month. Do not add a payment method to Meta without asking.
-- Explain simply in Hebrew; put a line break whenever switching between Hebrew and English.
-
-## Saving tokens
-- Read only line ranges of `main.py` (~5,300 lines); use grep first.
-- Meta pages are huge; read specific elements, not full page text.
-- Check this file instead of re-deriving the Meta state.
+## Token-efficient workflow
+- Start from the compact context file; refresh only volatile facts (Meta review status, `/health`, latest workflow run) as needed.
+- Search `main.py` with `rg`, then read narrow ranges. Avoid full-page dumps from Meta and full-file reads.
+- For a new conversation, use the starter prompt at the end of `.github/sahbak-context.md`.
