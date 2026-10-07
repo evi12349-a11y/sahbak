@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-06-r38'
+BUILD_VERSION = '2026-10-07-r39'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -4831,8 +4831,26 @@ def webhook():
         return jsonify({'status': 'ignored'}), 200
 
     try:
-        changes  = data.get('entry', [{}])[0].get('changes', [{}])[0]
+        entry    = data.get('entry', [{}])[0]
+        changes  = entry.get('changes', [{}])[0]
         value    = changes.get('value', {})
+        if changes.get('field') == 'account_update':
+            violation = value.get('violation_info', {})
+            ban = value.get('ban_info', {})
+            if not isinstance(violation, dict):
+                violation = {}
+            if not isinstance(ban, dict):
+                ban = {}
+            logger.warning(
+                'Meta WhatsApp account update: waba_id=%s event=%s '
+                'violation_type=%s ban_state=%s ban_date=%s',
+                str(entry.get('id', '')).replace('\n', ' ')[:80],
+                str(value.get('event', '')).replace('\n', ' ')[:80],
+                str(violation.get('violation_type', '')).replace('\n', ' ')[:80],
+                str(ban.get('waba_ban_state', '')).replace('\n', ' ')[:80],
+                str(ban.get('waba_ban_date', '')).replace('\n', ' ')[:80],
+            )
+            return jsonify({'status': 'ok', 'account_updates': 1}), 200
         messages = value.get('messages')
         if not messages:
             return jsonify({'status': 'ignored'}), 200

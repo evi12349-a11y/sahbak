@@ -110,6 +110,32 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(queued, ['972585231231'])
 
+    def test_account_update_webhook_logs_meta_violation_details(self):
+        payload = {
+            'entry': [{
+                'id': '123456789',
+                'changes': [{
+                    'field': 'account_update',
+                    'value': {
+                        'event': 'ACCOUNT_VIOLATION',
+                        'violation_info': {'violation_type': 'POLICY'},
+                        'ban_info': {
+                            'waba_ban_state': 'DISABLED',
+                            'waba_ban_date': '2026-10-06',
+                        },
+                    },
+                }],
+            }],
+        }
+
+        with self.assertLogs(main.logger, level='WARNING') as logs:
+            response = main.app.test_client().post('/webhook', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {'status': 'ok', 'account_updates': 1})
+        self.assertIn('violation_type=POLICY', logs.output[0])
+        self.assertIn('ban_state=DISABLED', logs.output[0])
+
     def test_category_migration_preserves_expenses_and_combines_limits(self):
         with main._connect() as conn:
             conn.executemany(
