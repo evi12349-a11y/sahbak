@@ -1,6 +1,6 @@
 # Sahbak — current project context
 
-**Purpose:** compact handoff for future sessions. Read this before re-investigating; last service and Meta check was **2026-10-08 01:36 Israel time**. Refresh only time-sensitive status.
+**Purpose:** compact handoff for future sessions. Read this before re-investigating; last service and Meta check was **2026-10-08 19:23 Israel time**. Refresh only time-sensitive status.
 
 ## Goal and constraints
 - Sahbak is a Hebrew personal assistant for a closed group of about 15 users, with a goal near 30. Features: expenses, tasks, Google Calendar, reminders.
@@ -25,9 +25,9 @@
 - **Persistence and messaging reliability:** SQLite must be on Railway persistent Volume (`DB_PATH=/app/data/sahbak.db`); `/health` includes `db_persistent`. Message processing is queued with bounded worker threads, per-account FIFO ordering and webhook deduplication. Keep these properties in mind when modifying webhook or notification flow.
 
 ## Current live status — verify again when acting
-- `/health` checked **2026-10-08 01:36 Israel time**: app `2026-10-07-r40`, Railway `status=ok`, persistent DB, WhatsApp configured but `whatsapp_status=BANNED`, `whatsapp_live=false`; `shabbat_notifications=false`.
-- Meta Business Support rechecked **2026-10-08 01:36 Israel time**: WABA is disabled, UI says disabled on **2026-10-07**, with the same generic reason “Acceptable Use Policy” (Hebrew UI: “הפרת תנאי השימוש המקובל”). No specific policy clause or review decision is visible. The page offers “Request review”; no acceptance/rejection response is shown.
-- The latest available GitHub health workflow run **#10** started 2026-10-07 13:23Z (16:23 Israel) and failed at its `/health` probe. Monitoring continues to detect Meta's disablement.
+- `/health` checked **2026-10-08 19:23 Israel time**: app `2026-10-07-r40`, Railway `status=ok`, persistent DB, WhatsApp configured but `whatsapp_status=BANNED`, `whatsapp_live=false`; `shabbat_notifications=false`.
+- Meta Business Support rechecked **2026-10-08 19:23 Israel time**: WABA is disabled, UI says disabled on **2026-10-07**, with the same generic reason “Acceptable Use Policy” (Hebrew UI: “הפרת תנאי השימוש המקובל”). No specific policy clause or review decision is visible. The page offers “Request review”; no acceptance/rejection response is shown.
+- Latest GitHub health workflow run **#13** started 2026-10-08 13:29Z (16:29 Israel) and failed at its `/health` probe. Runs #11–#13 failed; monitoring continues to detect Meta's disablement.
 - A later appeal draft had been composed but not intentionally submitted. The current page does not show a clear pending/completed review outcome; **do not submit another appeal until the owner decides after seeing this status**.
 - Do not assume that account reinstatement means the use case is approved permanently. Before restarting messages after reinstatement, establish policy fit with Meta and check current status.
 
@@ -53,7 +53,7 @@
 - `/health`: https://sahbak-production.up.railway.app/health
 - Public pages: `/`, `/privacy`, `/terms`, `/data-deletion`, `/guide`.
 - `SHABBAT_NOTIFICATIONS` defaults to false. Do not restore by setting it true until an approved template and explicit-consent gate are confirmed. Once policy-safe and user-approved, set Railway variable `SHABBAT_NOTIFICATIONS=true` and verify in `/health`. This only toggles scheduled Shabbat notices, not transaction-triggered confirmations.
-- `.github/workflows/health-check.yml` checks every ~6 hours and emails on failure. Recent known sequence: run #7 passed Oct 6 09:20 Israel; runs #8, #9, and #10 failed. Check latest run rather than relying on this history.
+- `.github/workflows/health-check.yml` checks every ~6 hours and emails on failure. Recent known sequence: run #7 passed Oct 6 09:20 Israel; runs #8–#13 failed. Check latest run rather than relying on this history.
 - Version `r39` added logging for Meta `account_update` webhook events with WABA ID, event, violation type, and ban state/date, without logging message text or user phone numbers. **The webhook subscription still needs to be enabled in Meta App Dashboard** (Webhooks → WhatsApp Business Account → `account_update`). Logging will only help for future events and does not recover old events.
 - Version `r40` is deployed and verified. Scheduled Shabbat sends fail closed unless `SHABBAT_TEMPLATE_NAME` is configured and active recorded consent exists; there is no plain-text fallback. Scheduler does not start without the template name. Tests cover template-only sends and consent filtering. Global Shabbat flag remains false; never turn it on as part of deployment.
 
