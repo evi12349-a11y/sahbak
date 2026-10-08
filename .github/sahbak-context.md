@@ -1,6 +1,6 @@
 # Sahbak — current project context
 
-**Purpose:** compact handoff for future sessions. Read this before re-investigating; last service and Meta check was **2026-10-08 19:23 Israel time**. Refresh only time-sensitive status.
+**Purpose:** compact handoff for future sessions. Read this before re-investigating; last status check was **2026-10-08 19:26 Israel time**. Refresh only time-sensitive status.
 
 ## Goal and constraints
 - Sahbak is a Hebrew personal assistant for a closed group of about 15 users, with a goal near 30. Features: expenses, tasks, Google Calendar, reminders.
@@ -27,6 +27,8 @@
 ## Current live status — verify again when acting
 - `/health` checked **2026-10-08 19:23 Israel time**: app `2026-10-07-r40`, Railway `status=ok`, persistent DB, WhatsApp configured but `whatsapp_status=BANNED`, `whatsapp_live=false`; `shabbat_notifications=false`.
 - Meta Business Support rechecked **2026-10-08 19:23 Israel time**: WABA is disabled, UI says disabled on **2026-10-07**, with the same generic reason “Acceptable Use Policy” (Hebrew UI: “הפרת תנאי השימוש המקובל”). No specific policy clause or review decision is visible. The page offers “Request review”; no acceptance/rejection response is shown.
+- Rechecked Meta Business Support and notifications **2026-10-08 19:26 Israel time**: account still says disabled on Oct 7; generic reason unchanged; "Request review" remains, no decision/outcome visible. Business notifications drawer says “אין התראות עדיין” (no notifications). This does not rule out an email to business admins.
+- Tried the official Meta for Developers support portal at https://developers.facebook.com/support/. It requires a separate Facebook login in the shared browser and redirected to the login screen. No credentials entered. Next step: owner logs in himself; then inspect available support issue types, prepare a factual ticket asking for existing review status, exact policy clause/violation ID, decision, and eligibility of this declared use case. Do not submit a duplicate Business Support review while status is unclear; do not submit the support ticket without owner review/approval.
 - Latest GitHub health workflow run **#13** started 2026-10-08 13:29Z (16:29 Israel) and failed at its `/health` probe. Runs #11–#13 failed; monitoring continues to detect Meta's disablement.
 - A later appeal draft had been composed but not intentionally submitted. The current page does not show a clear pending/completed review outcome; **do not submit another appeal until the owner decides after seeing this status**.
 - Do not assume that account reinstatement means the use case is approved permanently. Before restarting messages after reinstatement, establish policy fit with Meta and check current status.
