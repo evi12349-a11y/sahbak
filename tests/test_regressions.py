@@ -1,4 +1,5 @@
 import os
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -58,8 +59,90 @@ class RegressionTests(unittest.TestCase):
             }, headers={'X-Dash-Token': token})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {'reply': 'הנה התשובה'})
+        self.assertEqual(response.get_json(), {'reply': 'הנה התשובה', 'actions': []})
         process.assert_called_once_with('שלום', user_id, admin_phone='web-dashboard')
+
+    def test_dashboard_chat_accepts_admin_image_upload(self):
+        user_id = '972501234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, 'process_image_message', return_value='זיהיתי אירוע') as process:
+            token = main._dash_token(user_id)
+            response = client.post(
+                f'/api/chat?user_id={user_id}',
+                data={
+                    'message': 'תוסיף את האירוע ליומן',
+                    'image': (BytesIO(b'png bytes'), 'event.png', 'image/png'),
+                },
+                headers={'X-Dash-Token': token},
+                content_type='multipart/form-data',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {'reply': 'זיהיתי אירוע', 'actions': []})
+        process.assert_called_once_with(
+            b'png bytes', 'image/png', 'תוסיף את האירוע ליומן', user_id)
+
+    def test_dashboard_chat_rejects_unsupported_image_type(self):
+        user_id = '972501234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'):
+            token = main._dash_token(user_id)
+            response = client.post(
+                f'/api/chat?user_id={user_id}',
+                data={'image': (BytesIO(b'gif bytes'), 'event.gif', 'image/gif')},
+                headers={'X-Dash-Token': token},
+                content_type='multipart/form-data',
+            )
+
+        self.assertEqual(response.status_code, 415)
+
+    def test_dashboard_chat_admin_can_connect_only_their_own_calendar(self):
+        user_id = '972501234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, '_service_account_email',
+                          return_value='bot@example.iam.gserviceaccount.com'):
+            token = main._dash_token(user_id)
+            connected = client.post('/api/chat', json={
+                'user_id': user_id,
+                'message': 'חבר יומן owner@gmail.com',
+            }, headers={'X-Dash-Token': token})
+            denied = client.post('/api/chat', json={
+                'user_id': user_id,
+                'message': 'חבר יומן 972521234567 friend@gmail.com',
+            }, headers={'X-Dash-Token': token})
+
+        self.assertEqual(connected.status_code, 200)
+        self.assertIn('bot@example.iam.gserviceaccount.com',
+                      connected.get_json()['reply'])
+        self.assertEqual(main.calendar_id_for(user_id), 'owner@gmail.com')
+        self.assertEqual(denied.status_code, 403)
+
+    def test_dashboard_chat_event_image_requires_confirmation_and_keeps_location(self):
+        user_id = '972501234567'
+        with patch.object(main, 'get_genai_client', return_value=object()), \
+             patch.object(main, '_extract_image_structured', return_value={
+                 'kind': 'event',
+                 'event': {
+                     'title': 'הרצאה',
+                     'start_time': '2026-10-12T18:00:00+03:00',
+                     'duration_minutes': 90,
+                     'location': 'אולם א',
+                 },
+             }), \
+             patch.object(main, 'process_calendar_ai', return_value='נוצר') as create:
+            reply = main.process_image_message(
+                b'image', 'image/png', 'הוסף ליומן', user_id)
+            self.assertIn('בדוק שהם נכונים', reply)
+            self.assertEqual(main.get_user_context(user_id)['location'], 'אולם א')
+            create.assert_not_called()
+
+            approved = main.process_message('כן', user_id)
+
+        self.assertEqual(approved, 'נוצר')
+        create.assert_called_once_with(
+            'הרצאה', '2026-10-12T18:00:00+03:00', 'אולם א', user_id, 90)
 
     def test_dashboard_chat_rejects_non_admin_and_invalid_message(self):
         user_id = '972521234567'

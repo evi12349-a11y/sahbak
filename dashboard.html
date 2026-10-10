@@ -153,6 +153,14 @@ input,select{font:inherit;color:var(--text)}
 .chat-form{display:flex;align-items:flex-end;gap:.5rem;padding:.75rem;border-top:1px solid var(--border)}
 .chat-form textarea{flex:1;resize:vertical;min-height:44px;max-height:130px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);padding:.6rem .7rem;color:var(--text);font:inherit;font-size:.9rem}
 .chat-form textarea:focus{outline:2px solid var(--primary-hl);border-color:var(--primary)}
+.chat-image-button{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:.62rem;color:var(--text);cursor:pointer}
+.chat-image-preview{display:none;align-items:center;gap:.5rem;padding:.4rem .75rem;border-top:1px solid var(--border);font-size:.8rem;color:var(--muted)}
+.chat-image-preview.show{display:flex}
+.chat-image-preview img{width:44px;height:44px;object-fit:cover;border-radius:6px}
+.chat-image-preview button{color:var(--error);font-weight:700}
+.chat-bubble img{display:block;max-width:100%;max-height:220px;object-fit:contain;border-radius:8px;margin-bottom:.35rem}
+.chat-actions{display:flex;flex-wrap:wrap;gap:.4rem;align-self:flex-end}
+.chat-actions button{background:var(--surface-2);border:1px solid var(--primary);color:var(--primary);border-radius:999px;padding:.4rem .7rem;font:inherit;font-size:.82rem;cursor:pointer}
 .chat-send{background:var(--primary);color:#fff;border-radius:8px;padding:.62rem .8rem;font-weight:700}
 .chat-send:disabled,.chat-form textarea:disabled{opacity:.55;cursor:wait}
 </style>
@@ -283,12 +291,20 @@ input,select{font:inherit;color:var(--text)}
     <span>💬 שיחה עם סחבק</span>
     <button type="button" aria-label="סגירת השיחה" onclick="toggleChat(false)">✕</button>
   </header>
-  <div class="chat-notice">ממשק חלופי בזמן שוואטסאפ מושבת. הודעות ותזכורות שנשלחות דרך וואטסאפ לא יגיעו כרגע.</div>
+  <div class="chat-notice">ממשק חלופי בזמן שוואטסאפ מושבת. הודעות ותזכורות שנשלחות דרך וואטסאפ לא יגיעו כרגע. תמונה מצורפת נשלחת ל-Google Gemini לפענוח; בדוק את פרטי האירוע ואשר לפני יצירה ביומן.</div>
   <div class="chat-messages" id="chatMessages" aria-live="polite">
     <div class="chat-bubble assistant">היי! אפשר לבקש ממני לנהל הוצאות ומשימות, לשאול על הנתונים שלך ולתכנן ביומן.</div>
   </div>
+  <div class="chat-image-preview" id="chatImagePreview">
+    <img id="chatImageThumb" alt="תצוגה מקדימה של התמונה">
+    <span id="chatImageName"></span>
+    <button type="button" onclick="clearChatImage()" aria-label="הסרת התמונה">הסר</button>
+  </div>
   <form class="chat-form" onsubmit="event.preventDefault();sendChatMessage()">
-    <textarea id="chatInput" maxlength="4000" rows="2" placeholder="כתוב לסחבק…" aria-label="הודעה לסחבק"></textarea>
+    <label class="chat-image-button" title="צירוף תמונה" aria-label="צירוף תמונה">📷
+      <input id="chatImage" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" hidden onchange="previewChatImage()">
+    </label>
+    <textarea id="chatInput" maxlength="4000" rows="2" placeholder="כתוב לסחבק או צרף תמונת אירוע…" aria-label="הודעה לסחבק"></textarea>
     <button class="chat-send" id="chatSend" type="submit">שלח</button>
   </form>
 </section>
@@ -304,6 +320,7 @@ let C = Object.assign({ url:'', key:'', userId:'', token:'' }, JSON.parse(localS
 const EMO = {'אוכל':'🍔','ביגוד וקוסמטיקה':'👗','תחבורה':'🚌','לימודים והתפתחות':'📚','פינוקים':'🍫','רפואה':'💊','הוצאות בית':'🏠','חשבונות':'🧾','צדקה':'🤝','מסגרות ילדים':'🧸','רכב + דלק':'🚗','שונות':'📦','חיסכון':'🐷','ביטוחים':'🛡️','אירועים ומתנות':'🎁','הכנסה':'💰'};
 const QC = {'חשוב דחוף':'q1','חשוב לא דחוף':'q2','דחוף לא חשוב':'q3','לא דחוף לא חשוב':'q4'};
 let pieChart = null;
+let chatPreviewUrl = null;
 
 function toggleTheme(){const h=document.documentElement;h.setAttribute('data-theme',h.getAttribute('data-theme')==='dark'?'light':'dark');}
 
@@ -328,22 +345,73 @@ function appendChatMessage(text,role){
   const messages=document.getElementById('chatMessages');
   messages.appendChild(bubble);
   messages.scrollTop=messages.scrollHeight;
+  return bubble;
 }
 
-async function sendChatMessage(){
+function previewChatImage(){
+  const file=document.getElementById('chatImage').files[0];
+  const preview=document.getElementById('chatImagePreview');
+  if(!file){preview.classList.remove('show');return;}
+  if(chatPreviewUrl)URL.revokeObjectURL(chatPreviewUrl);
+  chatPreviewUrl=URL.createObjectURL(file);
+  document.getElementById('chatImageThumb').src=chatPreviewUrl;
+  document.getElementById('chatImageName').textContent=file.name;
+  preview.classList.add('show');
+}
+
+function clearChatImage(){
+  document.getElementById('chatImage').value='';
+  document.getElementById('chatImagePreview').classList.remove('show');
+  document.getElementById('chatImageThumb').removeAttribute('src');
+  if(chatPreviewUrl)URL.revokeObjectURL(chatPreviewUrl);
+  chatPreviewUrl=null;
+}
+
+function appendChatActions(actions){
+  if(!actions||!actions.length)return;
+  const row=document.createElement('div');row.className='chat-actions';
+  actions.forEach(action=>{
+    const button=document.createElement('button');button.type='button';button.textContent=action;
+    button.onclick=()=>{row.remove();document.getElementById('chatInput').value=action;sendChatMessage();};
+    row.appendChild(button);
+  });
+  const messages=document.getElementById('chatMessages');messages.appendChild(row);messages.scrollTop=messages.scrollHeight;
+}
+
+async function sendChatMessage(textOverride){
   const input=document.getElementById('chatInput');
   const button=document.getElementById('chatSend');
-  const text=input.value.trim();
-  if(!text)return;
-  input.value='';
-  appendChatMessage(text,'user');
+  const file=document.getElementById('chatImage').files[0];
+  const text=(textOverride===undefined?input.value:textOverride).trim();
+  if(!text&&!file)return;
+  if(file&&file.size>5*1024*1024){appendChatMessage('התמונה גדולה מדי. אפשר לצרף תמונה עד 5 MB.','error');return;}
+  const userBubble=appendChatMessage(text||'עזור לי להוסיף ליומן את האירוע שבתמונה.','user');
+  if(file){
+    const img=document.createElement('img');img.alt='התמונה שצורפה';img.src=URL.createObjectURL(file);
+    img.onload=()=>URL.revokeObjectURL(img.src);userBubble.prepend(img);
+  }
   input.disabled=true;button.disabled=true;button.textContent='…';
   try{
-    const result=await api('/api/chat','POST',{user_id:C.userId,message:text});
+    let result;
+    if(file){
+      const form=new FormData();form.append('message',text);form.append('image',file);
+      const url=C.url+'/api/chat?user_id='+encodeURIComponent(C.userId);
+      const response=await fetch(url,{method:'POST',headers:{'X-Dashboard-Key':C.key||'','X-Dash-Token':C.token||''},body:form});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(payload.error||response.status);
+      result=payload;
+    }else{
+      result=await api('/api/chat','POST',{user_id:C.userId,message:text});
+    }
+    input.value='';clearChatImage();
     appendChatMessage(result.reply||'לא התקבלה תשובה מסחבק.','assistant');
+    appendChatActions(result.actions);
     await load();
   }catch(e){
-    appendChatMessage('לא הצלחתי להשלים את הבקשה: '+e.message,'error');
+    const networkError=e instanceof TypeError;
+    appendChatMessage(networkError
+      ?'החיבור נקטע לפני שהגיעה תשובה ('+e.message+'). ייתכן שהבקשה כבר עובדה; בדוק ביומן לפני שליחה חוזרת.'
+      :'לא הצלחתי להשלים את הבקשה: '+e.message,'error');
   }finally{
     input.disabled=false;button.disabled=false;button.textContent='שלח';input.focus();
   }

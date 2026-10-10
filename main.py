@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-10-r41'
+BUILD_VERSION = '2026-10-10-r42'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -2557,7 +2557,9 @@ def _format_schedule_proposal(proposal: dict, index: int,
         f'📌 *{proposal["title"]}*\n'
         f'📅 {start.strftime("%d/%m/%Y")} בשעה '
         f'{start.strftime("%H:%M")}–{end.strftime("%H:%M")} '
-        f'(משך {proposal["duration_minutes"]} דק׳)\n\n'
+        f'(משך {proposal["duration_minutes"]} דק׳)'
+        + (f'\n📍 {proposal["location"]}' if proposal.get('location') else '')
+        + '\n\n'
         'בחר פעולה מהתפריט: אישור, שינוי מועד, דילוג או עצירה.'
         f'{skipped_note}'
     )
@@ -2856,7 +2858,8 @@ def _tool_propose_event(args: dict, user_id: str) -> str:
         'ui': 'proposal',
         'title': title,
         'start_time': start.isoformat(),
-        'duration_minutes': duration
+        'duration_minutes': duration,
+        'location': (args.get('location') or '').strip() or None,
     }
     set_user_context(user_id, context_data)
     end = start + timedelta(minutes=duration)
@@ -2865,7 +2868,9 @@ def _tool_propose_event(args: dict, user_id: str) -> str:
         f'📌 *{title}*\n'
         f'📅 {start.strftime("%d/%m/%Y")} בשעה '
         f'{start.strftime("%H:%M")}–{end.strftime("%H:%M")} '
-        f'(משך {duration} דק׳)\n\n'
+        f'(משך {duration} דק׳)'
+        + (f'\n📍 {context_data["location"]}' if context_data['location'] else '')
+        + '\n\n'
         'בחר פעולה מהתפריט: אישור, שינוי מועד או ביטול.'
     )
 
@@ -3121,7 +3126,8 @@ def _extract_image_structured(image_data: bytes, mime_type: str, caption: str) -
         'אם זו קבלה או דף עסקאות (בנק/אשראי) — kind="expenses", וחלץ את *כל* '
         'השורות: כל עסקה בנפרד עם הסכום בשקלים (מספר חיובי), קטגוריה מתאימה לפי '
         'שם בית העסק, ותיאור קצר (שם העסק). אל תכלול שורות סיכום/יתרה/כותרת.\n'
-        'אם זו הזמנה/אירוע עם תאריך ושעה — kind="event".\n'
+        'אם זו הזמנה/מודעה לאירוע — kind="event". אם תאריך או שעה אינם ברורים '
+        'או אינם מופיעים, השאר start_time ריק וכתוב זאת ב-text; אל תנחש.\n'
         'אחרת — kind="other" עם text קצר.\n'
         f'התאריך הנוכחי: {now_local().strftime("%Y-%m-%d")}.'
         + (f'\nהערת המשתמש: "{caption}".' if caption else '')
@@ -3212,7 +3218,7 @@ def process_image_message(image_data: bytes | None, mime_type: str,
     """[r14] Smart image handling via ONE structured multimodal call:
       • receipt OR full bank/credit statement → extract EVERY transaction →
         CONFIRM, then add them all (each to its category).
-      • event/invitation → create the calendar event.
+      • event/invitation → propose the calendar event and wait for approval.
       • anything else → a short description.
     Money is NEVER auto-written from an image — it always waits for the user's
     'כן' (the confirm_expenses context in process_message). Safe by construction."""
@@ -3244,9 +3250,24 @@ def process_image_message(image_data: bytes | None, mime_type: str,
                 dur = int(ev.get('duration_minutes') or 60)
             except (TypeError, ValueError):
                 dur = 60
-            reply = process_calendar_ai((ev.get('title') or 'אירוע').strip(), start,
-                                        (ev.get('location') or '').strip() or None,
-                                        user_id, dur if dur > 0 else 60)
+            reply = _tool_propose_event({
+                'title': (ev.get('title') or 'אירוע').strip(),
+                'start_time': start,
+                'duration_minutes': dur if dur > 0 else 60,
+                'location': (ev.get('location') or '').strip() or None,
+                'explanation': 'זיהיתי את פרטי האירוע מהתמונה. בדוק שהם נכונים.',
+            }, user_id)
+            append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
+            append_conversation(user_id, 'model', reply)
+            return reply
+        title = (ev.get('title') or '').strip() if isinstance(ev, dict) else ''
+        details = (data.get('text') or '').strip()
+        if title or details:
+            reply = (
+                f'📷 זיהיתי בתמונה את {title or details}. '
+                'לא הצלחתי לוודא ממנה תאריך ושעה. כתוב לי אותם כדי שאציע אירוע '
+                'ליומן; לא אוסיף אותו בלי אישורך.'
+            )
             append_conversation(user_id, 'user', f'[המשתמש שלח תמונה] {cap}'.strip())
             append_conversation(user_id, 'model', reply)
             return reply
@@ -3756,6 +3777,7 @@ _SET_BUDGET_RE = re.compile(
 # [MULTI] Admin-only calendar linking (no redeploy):
 #   "חבר יומן 972501234567 friend@gmail.com"   /   "נתק יומן 972501234567"
 _LINK_CAL_RE   = re.compile(r'^(?:חבר|קשר)\s+יומן\s+(\+?[\d\s\-()]{6,})\s+(\S+@\S+)\s*$')
+_LINK_OWN_CAL_RE = re.compile(r'^(?:חבר|קשר)\s+יומן\s+(\S+@\S+)\s*$')
 _UNLINK_CAL_RE = re.compile(r'^נתק\s+יומן\s+(\+?[\d\s\-()]{6,})\s*$')
 
 # [r6] Admin-only live calendar diagnostic:
@@ -4359,7 +4381,8 @@ def process_message(text: str, user_id: str, admin_phone: str | None = None) -> 
                     return _advance_sequential_schedule(user_id, context, result)
                 delete_user_context(user_id)
                 # המשתמש אישר! עכשיו באמת קובעים ביומן דרך הפונקציה הרגילה
-                return process_calendar_ai(title, start_time, None, user_id, duration)
+                return process_calendar_ai(
+                    title, start_time, context.get('location'), user_id, duration)
             if no:
                 if context.get('mode') == 'sequential_plan':
                     if int(context.get('no_count') or 0) == 0 and context.get('alternatives'):
@@ -5204,37 +5227,95 @@ def api_dashboard():
 
 @app.route('/api/chat', methods=['POST'])
 def api_dashboard_chat():
-    """Process a text request from the authenticated admin dashboard."""
+    """Process an authenticated admin dashboard text or image request."""
     err = _require_dashboard_key()
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
+    max_image_bytes = 5 * 1024 * 1024
+    if request.content_length and request.content_length > max_image_bytes + 65536:
+        return jsonify({'error': 'image must be 5 MB or smaller'}), 413
+
+    is_multipart = request.mimetype == 'multipart/form-data'
+    data = request.form if is_multipart else (request.get_json(silent=True) or {})
     user_id = str(data.get('user_id') or _get_user_id() or '').strip()
     message = data.get('message')
+    image_file = request.files.get('image') if is_multipart else None
     if not user_id:
         return jsonify({'error': 'user_id required'}), 400
     if _normalize_phone(user_id) not in ADMIN_USERS:
         return jsonify({'error': 'web chat is currently limited to admins'}), 403
-    if not isinstance(message, str) or not message.strip():
-        return jsonify({'error': 'message required'}), 400
+    if not isinstance(message, str):
+        message = ''
     message = message.strip()
+    if not message and not image_file:
+        return jsonify({'error': 'message required'}), 400
     if len(message) > 4000:
         return jsonify({'error': 'message must be 4000 characters or fewer'}), 413
-    if _LINK_CAL_RE.match(message):
-        return jsonify({
-            'error': 'calendar linking currently requires the WhatsApp setup flow'
-        }), 400
-
     account_id = resolve_account(user_id)
     try:
         with _account_lock(account_id):
+            own_calendar = _LINK_OWN_CAL_RE.fullmatch(message)
+            linked_calendar = _LINK_CAL_RE.fullmatch(message)
+            if own_calendar or linked_calendar:
+                if linked_calendar and _normalize_phone(linked_calendar.group(1)) != \
+                        _normalize_phone(user_id):
+                    return jsonify({
+                        'error': 'the web dashboard can only connect your own calendar'
+                    }), 403
+                calendar_email = (own_calendar or linked_calendar).group(
+                    1 if own_calendar else 2).strip()
+                set_user_calendar(account_id, calendar_email)
+                service_account_email = _service_account_email()
+                reply = (
+                    f'✅ שמרתי את היומן שלך: {calendar_email}\n'
+                    'כדי לאפשר יצירת אירועים, שתף את היומן ב-Google Calendar '
+                    'עם כתובת חשבון השירות שמופיעה למטה, בהרשאת '
+                    '"ביצוע שינויים באירועים". לאחר השיתוף נסה ליצור אירוע ביומן.\n'
+                    f'כתובת חשבון השירות: {service_account_email}'
+                    if service_account_email else
+                    f'✅ שמרתי את היומן שלך: {calendar_email}\n'
+                    'לא הוגדר חשבון שירות של Google ביומן בשרת, ולכן כרגע '
+                    'לא ניתן ליצור בו אירועים. יש לפנות למנהל הבוט.'
+                )
+                return jsonify({'reply': reply, 'actions': []}), 200
+
             # Keep WhatsApp-only admin commands unavailable in the web client.
-            reply = process_message(message, account_id, admin_phone='web-dashboard')
+            if image_file:
+                if not image_file.filename:
+                    return jsonify({'error': 'choose an image to upload'}), 400
+                mime_type = (image_file.mimetype or '').lower()
+                if mime_type not in {
+                        'image/jpeg', 'image/png', 'image/webp',
+                        'image/heic', 'image/heif'}:
+                    return jsonify({
+                        'error': 'supported image types are JPEG, PNG, WebP, and HEIC'
+                    }), 415
+                image_data = image_file.stream.read(max_image_bytes + 1)
+                if len(image_data) > max_image_bytes:
+                    return jsonify({'error': 'image must be 5 MB or smaller'}), 413
+                caption = message or 'עזור לי להוסיף ליומן את האירוע שבתמונה.'
+                reply = process_image_message(
+                    image_data, mime_type, caption, account_id)
+            else:
+                reply = process_message(message, account_id, admin_phone='web-dashboard')
     except Exception:
         logger.exception('Failed to process dashboard chat message')
         return jsonify({'error': 'chat processing failed; please try again'}), 500
-    return jsonify({'reply': reply}), 200
+    context = get_user_context(account_id) or {}
+    actions = []
+    if context.get('type') == 'pending_schedule_approval':
+        if context.get('awaiting_custom_time'):
+            actions = ['ביטול']
+        elif context.get('ui') == 'alternatives':
+            actions = ['1', '2', 'תאריך אחר', 'עצור']
+        elif context.get('mode') == 'sequential_plan':
+            actions = ['כן', 'שנה מועד', 'דלג', 'עצור']
+        else:
+            actions = ['כן', 'שנה מועד', 'ביטול']
+    elif context.get('type') in ('confirm_expense', 'confirm_expenses'):
+        actions = ['כן', 'לא']
+    return jsonify({'reply': reply, 'actions': actions}), 200
 
 
 # ─── פונקציית רקע לעיבוד Apple Pay ───────────────────────────────────────────
