@@ -131,7 +131,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-07-r40'
+BUILD_VERSION = '2026-10-10-r41'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -5200,6 +5200,43 @@ def api_dashboard():
         'transactions':    transactions,
         'timestamp':       now_local().isoformat(),
     }), 200
+
+
+@app.route('/api/chat', methods=['POST'])
+def api_dashboard_chat():
+    """Process a text request from the authenticated admin dashboard."""
+    err = _require_dashboard_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get('user_id') or _get_user_id() or '').strip()
+    message = data.get('message')
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+    if _normalize_phone(user_id) not in ADMIN_USERS:
+        return jsonify({'error': 'web chat is currently limited to admins'}), 403
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({'error': 'message required'}), 400
+    message = message.strip()
+    if len(message) > 4000:
+        return jsonify({'error': 'message must be 4000 characters or fewer'}), 413
+    if _LINK_CAL_RE.match(message):
+        return jsonify({
+            'error': 'calendar linking currently requires the WhatsApp setup flow'
+        }), 400
+
+    account_id = resolve_account(user_id)
+    try:
+        with _account_lock(account_id):
+            # Keep WhatsApp-only admin commands unavailable in the web client.
+            reply = process_message(message, account_id, admin_phone='web-dashboard')
+    except Exception:
+        logger.exception('Failed to process dashboard chat message')
+        return jsonify({'error': 'chat processing failed; please try again'}), 500
+    return jsonify({'reply': reply}), 200
+
+
 # ─── פונקציית רקע לעיבוד Apple Pay ───────────────────────────────────────────
 def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: float, merchant: str, currency: str = 'ILS', original_amount: float | None = None) -> None:
     try:

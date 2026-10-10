@@ -42,6 +42,41 @@ class RegressionTests(unittest.TestCase):
             main._save_feedback(f'הצעה: רעיון {i}', '972521234567')
         self.assertIn('מחר', main._save_feedback('הצעה: עוד אחת', '972521234567'))
 
+    def test_dashboard_chat_requires_admin_scoped_token_and_returns_reply(self):
+        user_id = '972501234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, 'process_message', return_value='הנה התשובה') as process:
+            token = main._dash_token(user_id)
+            denied = client.post('/api/chat', json={
+                'user_id': user_id, 'message': 'שלום',
+            })
+            self.assertEqual(denied.status_code, 401)
+
+            response = client.post('/api/chat', json={
+                'user_id': user_id, 'message': 'שלום',
+            }, headers={'X-Dash-Token': token})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {'reply': 'הנה התשובה'})
+        process.assert_called_once_with('שלום', user_id, admin_phone='web-dashboard')
+
+    def test_dashboard_chat_rejects_non_admin_and_invalid_message(self):
+        user_id = '972521234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'):
+            token = main._dash_token(user_id)
+            admin_token = main._dash_token('972501234567')
+            forbidden = client.post('/api/chat', json={
+                'user_id': user_id, 'message': 'שלום',
+            }, headers={'X-Dash-Token': token})
+            missing = client.post('/api/chat', json={
+                'user_id': '972501234567', 'message': '   ',
+            }, headers={'X-Dash-Token': admin_token})
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(missing.status_code, 400)
+
     def test_approval_records_consent_and_opt_out_roundtrip(self):
         main._try_admin_command('אשר משתמש 052-123-4567 דני', '972501234567')
         listing = main._try_admin_command('משתמשים', '972501234567')
