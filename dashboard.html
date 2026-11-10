@@ -2,119 +2,156 @@
 <html lang="he" dir="rtl" data-theme="light">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>סחבק — לוח בקרה</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Assistant:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root,[data-theme="light"]{
-  --bg:#f7f6f2;--surface:#ffffff;--surface-2:#f9f8f5;--surface-off:#f0ede8;--surface-dyn:#e6e3de;
-  --border:rgba(40,37,29,.12);--divider:rgba(40,37,29,.07);
-  --text:#28251d;--muted:#7a7974;--faint:#bab9b4;
-  --primary:#01696f;--primary-h:#0c4e54;--primary-hl:rgba(1,105,111,.12);
-  --success:#437a22;--success-hl:rgba(67,122,34,.12);
-  --error:#a12c7b;--error-hl:rgba(161,44,123,.12);
-  --warn:#964219;--warn-hl:rgba(150,66,25,.12);
-  --gold:#d19900;
-  --sh-sm:0 1px 3px rgba(40,37,29,.07);--sh-md:0 4px 16px rgba(40,37,29,.1);--sh-lg:0 12px 36px rgba(40,37,29,.14);
+  --bg:#f4f1e9;--surface:#fffdf8;--surface-2:#f8f6f0;--surface-off:#ebe7dc;--surface-dyn:#dfdacd;
+  --border:rgba(31,53,43,.13);--divider:rgba(31,53,43,.09);
+  --text:#1b3027;--muted:#68736b;--faint:#a3aaa1;
+  --primary:#24594c;--primary-h:#19483d;--primary-hl:rgba(205,220,171,.25);
+  --success:#477451;--success-hl:rgba(71,116,81,.12);
+  --error:#bd654f;--error-hl:rgba(189,101,79,.12);
+  --warn:#986d3c;--warn-hl:rgba(152,109,60,.12);
+  --gold:#aa813d;
+  --hero-bg:#24594c;--hero-text:#fffdf8;--hero-muted:rgba(255,253,248,.76);--hero-accent:#dce7a4;
+  --sh-sm:0 1px 3px rgba(27,48,39,.04);--sh-md:0 8px 28px rgba(27,48,39,.08);--sh-lg:0 16px 42px rgba(27,48,39,.15);
 }
 [data-theme="dark"]{
-  --bg:#111110;--surface:#1a1917;--surface-2:#1f1e1c;--surface-off:#252422;--surface-dyn:#2d2b28;
-  --border:rgba(255,255,255,.09);--divider:rgba(255,255,255,.05);
-  --text:#d4d3d0;--muted:#787775;--faint:#4e4d4b;
-  --primary:#4f98a3;--primary-h:#227f8b;--primary-hl:rgba(79,152,163,.15);
-  --success:#6daa45;--success-hl:rgba(109,170,69,.12);
-  --error:#d163a7;--error-hl:rgba(209,99,167,.12);
-  --warn:#bb653b;--warn-hl:rgba(187,101,59,.12);
-  --gold:#e8af34;
-  --sh-sm:0 1px 3px rgba(0,0,0,.25);--sh-md:0 4px 16px rgba(0,0,0,.35);--sh-lg:0 12px 36px rgba(0,0,0,.45);
+  --bg:#121a15;--surface:#1a251e;--surface-2:#202c24;--surface-off:#29362d;--surface-dyn:#334137;
+  --border:rgba(235,240,226,.11);--divider:rgba(235,240,226,.07);
+  --text:#edf0e7;--muted:#aab3a7;--faint:#68766b;
+  --primary:#a8c28c;--primary-h:#c0d49e;--primary-hl:rgba(168,194,140,.13);
+  --success:#91bd8e;--success-hl:rgba(145,189,142,.13);
+  --error:#e28b73;--error-hl:rgba(226,139,115,.14);
+  --warn:#d2a56d;--warn-hl:rgba(210,165,109,.14);
+  --gold:#d8b66d;
+  --hero-bg:#203d31;--hero-text:#edf0e7;--hero-muted:rgba(237,240,231,.73);--hero-accent:#d1df9d;
+  --sh-sm:0 1px 3px rgba(0,0,0,.18);--sh-md:0 8px 28px rgba(0,0,0,.24);--sh-lg:0 16px 42px rgba(0,0,0,.35);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
-body{font-family:'Heebo',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;font-size:1rem;line-height:1.6;padding-bottom:80px}
+html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth;-webkit-tap-highlight-color:transparent}
+body{font-family:'Assistant','Heebo',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;font-size:1rem;line-height:1.6;padding-bottom:calc(80px + env(safe-area-inset-bottom))}
 button{cursor:pointer;border:none;background:none;font:inherit;color:inherit}
 input,select{font:inherit;color:var(--text)}
+button,input,select,textarea{touch-action:manipulation}
+:focus-visible{outline:3px solid var(--primary);outline-offset:3px}
 
-.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:.75rem 1.5rem;display:flex;align-items:center;gap:.875rem;position:sticky;top:0;z-index:100;box-shadow:var(--sh-sm);}
-.logo{display:flex;align-items:center;gap:.5rem;font-size:1.1rem;font-weight:800;letter-spacing:-.02em}
-.logo-icon{width:32px;height:32px;background:var(--primary);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1rem}
+.hdr{height:74px;background:var(--surface);border-bottom:1px solid var(--border);padding:.65rem max(1.5rem,calc((100vw - 1160px)/2));display:flex;align-items:center;gap:.65rem;position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:.65rem;font-size:1.08rem;font-weight:800;letter-spacing:-.02em}
+.logo-icon{width:40px;height:40px;background:var(--primary);border-radius:13px 13px 13px 5px;display:flex;align-items:center;justify-content:center;color:var(--bg);font-size:1.15rem;font-weight:800}
 .spacer{flex:1}
-.badge{display:flex;align-items:center;gap:.375rem;font-size:.78rem;color:var(--muted);background:var(--surface-off);padding:.3rem .7rem;border-radius:999px;border:1px solid var(--border);}
+.badge{display:flex;align-items:center;gap:.45rem;font-size:.78rem;color:var(--muted);background:transparent;padding:.38rem .65rem;border-radius:8px;border:1px solid var(--border)}
 .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex-shrink:0;transition:background .3s}
 .badge.ok .dot{background:var(--success);box-shadow:0 0 0 2px var(--success-hl)}
 .badge.err .dot{background:var(--error)}
 .badge.loading .dot{background:var(--gold);animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.icon-btn{width:34px;height:34px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:background .15s,color .15s;flex-shrink:0;}
-.icon-btn:hover{background:var(--surface-off);color:var(--text)}
-#btnRefresh.spin svg{transform:rotate(360deg);transition:transform .6s ease}
+.icon-btn{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:background .16s,color .16s;flex-shrink:0}
+#btnRefresh.spin svg{transform:rotate(360deg);transition:transform .5s cubic-bezier(.23,1,.32,1)}
 
 /* Modals */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:flex;align-items:center;justify-content:center;padding:1rem;backdrop-filter:blur(6px)}
 .overlay.hide{display:none}
-.modal{background:var(--surface);border-radius:14px;padding:1.75rem;width:100%;max-width:440px;box-shadow:var(--sh-lg);border:1px solid var(--border);position:relative}
-.modal-close{position:absolute;top:15px;left:15px;color:var(--muted);background:var(--surface-off);border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.2s}
-.modal-close:hover{color:var(--text);background:var(--divider)}
+.modal{background:var(--surface);border-radius:18px;padding:1.75rem;width:100%;max-width:460px;box-shadow:var(--sh-lg);border:1px solid var(--border);position:relative}
+.modal-close{position:absolute;top:16px;left:16px;color:var(--muted);background:var(--surface-off);border-radius:10px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .16s,color .16s}
 .modal h2{font-size:1.2rem;font-weight:700;margin-bottom:.25rem}
 .modal .sub{color:var(--muted);font-size:.875rem;margin-bottom:1.5rem}
 
-.tabs{display:flex;gap:6px;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:10px;overflow-x:auto}
-.tab-btn{flex:1;padding:8px 4px;font-size:.85rem;font-weight:600;color:var(--muted);text-align:center;border-radius:8px;transition:.2s;white-space:nowrap}
+.tabs{display:flex;gap:6px;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding:0 0 10px;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab-btn{flex:1;min-height:44px;padding:8px 10px;font-size:.85rem;font-weight:700;color:var(--muted);text-align:center;border-radius:12px;transition:background .16s,color .16s;white-space:nowrap}
 .tab-btn.active{background:var(--primary-hl);color:var(--primary)}
 .tab-content{display:none}
 .tab-content.active{display:block}
 
 .f-group{margin-bottom:.875rem}
-.f-group label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase;letter-spacing:.04em}
-.f-group input, .f-group select{width:100%;padding:.7rem .875rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);font-size:.95rem;transition:border-color .15s,box-shadow .15s;}
+.f-group label{display:block;font-size:.84rem;font-weight:700;color:var(--muted);margin-bottom:.35rem}
+.f-group input, .f-group select{width:100%;min-height:48px;padding:.7rem .875rem;border:1px solid var(--border);border-radius:10px;background:var(--surface-2);font-size:1rem;transition:border-color .15s,box-shadow .15s}
 .f-group input:focus, .f-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-hl)}
-.btn-cta{width:100%;margin-top:1rem;padding:.8rem;background:var(--primary);color:#fff;border-radius:8px;font-size:1rem;font-weight:700;transition:background .15s,transform .1s;}
-.btn-cta:hover{background:var(--primary-h)}
+.btn-cta{width:100%;min-height:50px;margin-top:1rem;padding:.8rem;background:var(--primary);color:var(--bg);border-radius:10px;font-size:1rem;font-weight:800;transition:background .16s,transform .12s}
 .btn-cta:active{transform:scale(.98)}
 
-.main{padding:1.75rem 1.5rem 5rem;max-width:1160px;margin:0 auto;width:100%}
-@media(max-width:600px){.main{padding:1rem .875rem}}
-.page-intro{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;margin:0 0 1.5rem}
-.page-intro h1{font-size:1.45rem;line-height:1.2;margin-bottom:.2rem}
-.page-intro p{color:var(--muted);font-size:.86rem}
-.page-intro .period{font-size:.8rem;color:var(--muted);background:var(--surface);border:1px solid var(--border);padding:.45rem .7rem;border-radius:8px;white-space:nowrap}
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin-bottom:1.5rem}
-.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;box-shadow:var(--sh-sm);transition:box-shadow .15s}
-.kpi-lbl{font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.375rem}
-.kpi-val{font-size:1.65rem;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
-.kpi-sub{font-size:.75rem;color:var(--muted);margin-top:.3rem}
+.main{padding:2rem 1.5rem 5rem;max-width:1160px;margin:0 auto;width:100%}
+.page-intro{position:relative;isolation:isolate;display:flex;align-items:center;justify-content:space-between;gap:1.5rem;min-height:188px;margin:0 0 1.4rem;padding:2rem 2.2rem;border:0;border-radius:18px;background:var(--hero-bg);color:var(--hero-text);overflow:hidden}
+.page-intro::after{content:"";position:absolute;z-index:-1;width:270px;height:270px;border-radius:50%;inset-inline-start:-105px;top:-155px;background:rgba(222,232,181,.12);box-shadow:0 0 0 28px rgba(222,232,181,.045)}
+.intro-copy{min-width:0}
+.intro-eyebrow{display:inline-flex;align-items:center;gap:.45rem;color:var(--hero-accent);font-size:.86rem;font-weight:700;margin-bottom:.55rem}
+.intro-eyebrow::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--hero-accent)}
+.page-intro h1{font-size:clamp(1.8rem,3.4vw,2.65rem);line-height:1.12;letter-spacing:-.035em;margin-bottom:.5rem;font-weight:800}
+.page-intro p{color:var(--hero-muted);font-size:1.05rem}
+.intro-tools{display:flex;align-items:center;gap:.65rem;flex-shrink:0}
+.page-intro .period{display:flex;flex-direction:column;gap:.08rem;font-size:.78rem;color:var(--hero-muted);background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);padding:.65rem .9rem;border-radius:10px;white-space:nowrap}
+.page-intro .period span{font-size:.72rem}
+.page-intro .period strong{color:var(--hero-text);font-size:1rem}
+.hero-action{display:inline-flex;align-items:center;justify-content:center;gap:.45rem;min-height:46px;padding:.65rem 1rem;border:0;border-radius:10px;background:var(--hero-accent);color:#203a2e;font-weight:800;transition:background .16s,transform .12s}
+.hero-action-secondary{background:transparent;color:var(--hero-text);border:1px solid rgba(255,255,255,.28)}
+.hero-action-secondary:hover{background:rgba(255,255,255,.1)}
+.payment-modal{max-height:calc(100dvh - 2rem);overflow-y:auto}
+.payment-platforms{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.5rem;margin-bottom:1rem}
+.payment-platform{min-height:44px;padding:.55rem .7rem;border:1px solid var(--border);border-radius:10px;color:var(--muted);font-weight:700}
+.payment-platform.active{border-color:var(--primary);background:var(--primary-hl);color:var(--primary)}
+.payment-status{padding:.65rem .8rem;border-radius:10px;background:var(--surface-2);color:var(--muted);font-size:.88rem;margin:.75rem 0}
+.payment-status.connected{background:var(--success-hl);color:var(--success)}
+.payment-instructions{margin:.85rem 0;padding:.85rem;background:var(--surface-2);border:1px solid var(--border);border-radius:12px;font-size:.88rem}
+.payment-instructions h3{margin:0 0 .45rem;font-size:.95rem}
+.payment-instructions ol{padding-inline-start:1.25rem}
+.payment-instructions li{margin:.35rem 0}
+.payment-instructions code{direction:ltr;unicode-bidi:isolate;overflow-wrap:anywhere}
+.payment-token{margin:.75rem 0}
+.payment-token input{direction:ltr;unicode-bidi:isolate;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+.payment-modal .btn-test{width:100%;margin-top:.65rem}
+.auth-screen{position:fixed;z-index:90;inset:72px 0 0;overflow:auto;display:grid;place-items:center;padding:1.25rem;background:var(--bg)}
+.auth-screen[hidden],[hidden]{display:none!important}
+.auth-card{width:min(100%,440px);padding:clamp(1.4rem,5vw,2.2rem);background:var(--surface);border:1px solid var(--border);border-radius:18px;box-shadow:none}
+.auth-mark{width:48px;height:48px;display:grid;place-items:center;margin-bottom:1rem;border-radius:13px 13px 13px 5px;background:var(--primary);color:var(--bg);font-size:1.3rem;font-weight:800}
+.auth-card h1{font-size:1.65rem;line-height:1.2;margin-bottom:.35rem}
+.auth-sub{color:var(--muted);font-size:.9rem;margin:.25rem 0 1.1rem}
+.auth-error{display:none;margin:.6rem 0;color:var(--error);font-size:.88rem}
+.auth-error.show{display:block}
+.invite-result{margin-top:1.15rem;padding-top:1rem;border-top:1px solid var(--border)}
+.invite-result label{display:block;margin-bottom:.35rem;color:var(--muted);font-size:.82rem}
+.invite-result input{width:100%;min-height:46px;padding:.65rem;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin-bottom:1.4rem;background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.kpi{position:relative;overflow:hidden;background:transparent;border:0;border-inline-start:1px solid var(--divider);border-radius:0;padding:1.1rem 1.35rem;box-shadow:none;transition:background .18s}
+.kpi:first-child{border-inline-start:0}
+.kpi::before{display:none}
+.kpi-lbl{font-size:.85rem;font-weight:700;color:var(--muted);margin-bottom:.55rem}
+.kpi-val{font-size:clamp(1.55rem,2.3vw,2rem);font-weight:800;font-variant-numeric:tabular-nums;line-height:1.05;letter-spacing:-.025em}
+.kpi-sub{font-size:.77rem;color:var(--muted);margin-top:.3rem}
 .c-pos{color:var(--success)}.c-neg{color:var(--error)}.c-pri{color:var(--primary)}.c-gold{color:var(--gold)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem}
-@media(max-width:860px){.grid2{grid-template-columns:1fr}}
-@media(max-width:680px){.kpis{grid-template-columns:repeat(2,1fr)}.page-intro{display:block}.page-intro .period{display:inline-block;margin-top:.75rem}}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;margin-bottom:1.15rem}
 
-.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.15rem;box-shadow:var(--sh-sm)}
-.card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
-.card-title{font-size:.9rem;font-weight:700}
+.card{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1.25rem;box-shadow:none}
+.card-hdr{display:flex;align-items:center;justify-content:space-between;gap:.6rem;margin-bottom:1rem}
+.card-title{font-size:1rem;font-weight:800;letter-spacing:-.01em}
 .card-meta{font-size:.75rem;color:var(--muted)}
 
-.b-list{display:flex;flex-direction:column;gap:.7rem}
+.b-list{display:flex;flex-direction:column;gap:.85rem}
 .b-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.25rem}
 .b-cat{font-size:.85rem;font-weight:600;display:flex;align-items:center;gap:6px}
-.budget-action{display:inline-flex;align-items:center;gap:.35rem;padding:.38rem .62rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-2);color:var(--primary);font-size:.76rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
-.budget-action:hover{background:var(--primary-hl);color:var(--primary-h)}
-.b-edit-btn{color:var(--muted);background:var(--surface-off);border-radius:4px;padding:2px 5px;font-size:.7rem;cursor:pointer;transition:.2s}
-.b-edit-btn:hover{color:var(--text);background:var(--divider)}
+.budget-action{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;min-height:38px;padding:.36rem .7rem;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--primary);font-size:.8rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
+.b-edit-btn{color:var(--muted);background:transparent;border:1px solid var(--border);border-radius:7px;padding:3px 7px;font-size:.72rem;cursor:pointer;transition:background .16s,color .16s}
 .b-amounts{font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
-.b-track{height:6px;background:var(--surface-off);border-radius:3px;overflow:hidden}
+.b-track{height:6px;background:var(--surface-off);border-radius:999px;overflow:hidden}
 .b-fill{height:100%;border-radius:3px;transition:width .7s cubic-bezier(.16,1,.3,1)}
+.btn-test{display:flex;align-items:center;justify-content:center;gap:.45rem;min-height:44px;margin-top:.25rem;padding:.55rem .8rem;border:1px dashed var(--border);border-radius:9px;background:transparent;color:var(--primary);font-size:.88rem;font-weight:700;transition:background .16s,border-color .16s}
+.btn-test:hover{background:var(--primary-hl);border-color:var(--primary)}
 
-.chart-wrap{height:210px;position:relative;margin-top:.25rem}
+.chart-wrap{height:230px;position:relative;margin-top:.25rem}
+.chart-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.8rem;color:var(--muted);font-size:.9rem;text-align:center}
+.chart-empty-mark{width:58px;height:58px;border:7px solid var(--surface-off);border-inline-start-color:var(--primary);border-radius:50%;transform:rotate(-35deg)}
 
 .list-cont{display:flex;flex-direction:column;gap:.4rem;max-height:320px;overflow-y:auto;padding-right:2px}
 .list-cont::-webkit-scrollbar{width:3px}
 .list-cont::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.l-item{display:flex;align-items:center;gap:.625rem;padding:.55rem .7rem;border-radius:8px;border:1px solid var(--divider);background:var(--surface-2);transition:background .12s;}
-.l-item:hover{background:var(--surface-off)}
-.t-cb{width:17px;height:17px;border:1.5px solid var(--border);border-radius:4px;cursor:pointer;transition:.12s}
-.t-cb:hover{border-color:var(--primary);background:var(--primary-hl)}
+.l-item{display:flex;align-items:center;gap:.625rem;min-height:52px;padding:.6rem .25rem;border-radius:0;border:0;border-bottom:1px solid var(--divider);background:transparent;transition:background .16s,border-color .16s}
+.l-item:last-child{border-bottom:0}
+.t-cb{width:21px;height:21px;border:1.5px solid var(--faint);border-radius:50%;cursor:pointer;transition:background .16s,border-color .16s;flex-shrink:0}
 .t-txt{flex:1;font-size:.85rem;line-height:1.45}
 .t-q{font-size:.68rem;padding:.12rem .4rem;border-radius:999px;font-weight:600;white-space:nowrap}
 .tx-em{font-size:1rem;flex-shrink:0;width:24px;text-align:center}
@@ -123,63 +160,162 @@ input,select{font:inherit;color:var(--text)}
 .tx-meta{font-size:.72rem;color:var(--muted)}
 .tx-amt{font-size:.875rem;font-weight:700;font-variant-numeric:tabular-nums}
 .tx-amt.p{color:var(--success)}.tx-amt.n{color:var(--error)}
-.del-btn{opacity:0;color:var(--faint);transition:.12s;padding:2px}
-.l-item:hover .del-btn{opacity:1}
-.del-btn:hover{color:var(--error)}
+.del-btn{opacity:.75;color:var(--faint);transition:color .16s,opacity .16s;padding:8px;border-radius:9px}
 
-.fab{position:fixed;bottom:2rem;left:2rem;width:56px;height:56px;border-radius:50%;background:var(--primary);color:#fff;font-size:1.8rem;display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-lg);cursor:pointer;transition:transform .2s,background .2s;z-index:90;}
-.fab:hover{transform:scale(1.05);background:var(--primary-h)}
-
-.empty{display:flex;flex-direction:column;align-items:center;padding:1.75rem 1rem;color:var(--muted);gap:.5rem;text-align:center}
+.empty{display:flex;flex-direction:column;align-items:center;padding:1.75rem 1rem;color:var(--muted);gap:.5rem;text-align:center;font-size:.9rem}
 .empty svg{opacity:.3}
 @keyframes sh{0%{background-position:-200% 0}100%{background-position:200% 0}}
 .sk{background:linear-gradient(90deg,var(--surface-off) 25%,var(--surface-dyn) 50%,var(--surface-off) 75%);background-size:200% 100%;animation:sh 1.4s ease-in-out infinite;border-radius:6px}
-.toasts{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:.5rem;pointer-events:none;align-items:center}
-.toast{background:var(--text);color:var(--bg);padding:.55rem 1.1rem;border-radius:999px;font-size:.83rem;font-weight:600;box-shadow:var(--sh-md);animation:tin .25s ease;pointer-events:auto}
+.toasts{position:fixed;bottom:calc(1.25rem + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:.5rem;pointer-events:none;align-items:center}
+.toast{background:var(--text);color:var(--bg);padding:.65rem 1.1rem;border-radius:14px;font-size:.83rem;font-weight:600;box-shadow:var(--sh-md);animation:tin .18s cubic-bezier(.23,1,.32,1);pointer-events:auto}
 @keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.err-banner{background:var(--error-hl);border:1px solid var(--error);border-radius:10px;padding:.875rem 1rem;margin-bottom:1.25rem;font-size:.875rem;display:none;align-items:flex-start;gap:.625rem}
+.err-banner{background:var(--error-hl);border:1px solid color-mix(in srgb,var(--error) 35%,transparent);border-radius:12px;padding:.85rem 1rem;margin-bottom:1.25rem;font-size:.9rem;display:none;align-items:flex-start;gap:.625rem}
 .err-banner.show{display:flex}
 .err-banner strong{color:var(--error)}
-.chat-launch{position:fixed;right:1rem;bottom:1.5rem;z-index:150;background:var(--primary);color:#fff;border-radius:999px;padding:.7rem 1rem;font-weight:700;box-shadow:var(--sh-lg)}
-.chat-panel{position:fixed;right:1rem;bottom:5.5rem;z-index:150;width:min(420px,calc(100vw - 2rem));height:min(620px,calc(100dvh - 7rem));background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--sh-lg);display:none;flex-direction:column;overflow:hidden}
+.err-mark{width:22px;height:22px;display:grid;place-items:center;flex-shrink:0;border-radius:50%;background:var(--error);color:var(--surface);font-size:.8rem;font-weight:800}
+.chat-launch{position:fixed;right:1.25rem;bottom:calc(1.5rem + env(safe-area-inset-bottom));z-index:150;display:flex;align-items:center;gap:.55rem;min-height:48px;background:var(--primary);color:var(--bg);border-radius:11px;padding:.65rem .95rem;font-weight:800;box-shadow:var(--sh-md);transition:transform .16s,background .16s}
+.chat-launch svg{width:18px;height:18px}
+.chat-panel{position:fixed;right:1.25rem;bottom:calc(5.75rem + env(safe-area-inset-bottom));z-index:150;width:min(440px,calc(100vw - 2.5rem));height:min(680px,calc(100dvh - 7.5rem));background:var(--surface);border:1px solid var(--border);border-radius:22px;box-shadow:var(--sh-lg);display:none;flex-direction:column;overflow:hidden}
 .chat-panel.open{display:flex}
-.chat-head{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1rem;border-bottom:1px solid var(--border);font-weight:700}
+body.chat-open{overflow:hidden;overscroll-behavior:none}
+.chat-head{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:.65rem 1rem;border-bottom:1px solid var(--border);font-weight:700}
+.chat-head button{width:42px;height:42px;border-radius:12px;color:var(--muted)}
 .chat-notice{padding:.6rem .85rem;background:var(--warn-hl);color:var(--warn);font-size:.78rem}
-.chat-messages{display:flex;flex:1;flex-direction:column;gap:.65rem;overflow-y:auto;padding:.85rem}
+.chat-messages{display:flex;flex:1;min-height:0;flex-direction:column;gap:.65rem;overflow-y:auto;padding:.85rem;overscroll-behavior:contain}
 .chat-bubble{max-width:88%;padding:.6rem .8rem;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.9rem}
-.chat-bubble.user{align-self:flex-start;background:var(--primary);color:#fff;border-bottom-left-radius:4px}
+.chat-bubble.user{align-self:flex-start;background:var(--primary);color:var(--bg);border-bottom-left-radius:4px}
 .chat-bubble.assistant{align-self:flex-end;background:var(--surface-off);border-bottom-right-radius:4px}
 .chat-bubble.error{align-self:stretch;background:var(--error-hl);color:var(--error);font-size:.8rem}
-.chat-form{display:flex;align-items:flex-end;gap:.5rem;padding:.75rem;border-top:1px solid var(--border)}
-.chat-form textarea{flex:1;resize:vertical;min-height:44px;max-height:130px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);padding:.6rem .7rem;color:var(--text);font:inherit;font-size:.9rem}
+.chat-form{display:flex;align-items:flex-end;gap:.5rem;padding:.75rem;border-top:1px solid var(--border);padding-bottom:calc(.75rem + env(safe-area-inset-bottom))}
+.chat-form textarea{flex:1;resize:vertical;min-height:48px;max-height:130px;border:1px solid var(--border);border-radius:13px;background:var(--surface-2);padding:.65rem .75rem;color:var(--text);font:inherit;font-size:1rem}
 .chat-form textarea:focus{outline:2px solid var(--primary-hl);border-color:var(--primary)}
-.chat-image-button{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:.62rem;color:var(--text);cursor:pointer}
+.chat-image-button{display:grid;place-items:center;width:48px;height:48px;background:var(--surface-2);border:1px solid var(--border);border-radius:13px;padding:.62rem;color:var(--text);cursor:pointer;flex-shrink:0}
 .chat-image-preview{display:none;align-items:center;gap:.5rem;padding:.4rem .75rem;border-top:1px solid var(--border);font-size:.8rem;color:var(--muted)}
 .chat-image-preview.show{display:flex}
 .chat-image-preview img{width:44px;height:44px;object-fit:cover;border-radius:6px}
 .chat-image-preview button{color:var(--error);font-weight:700}
 .chat-bubble img{display:block;max-width:100%;max-height:220px;object-fit:contain;border-radius:8px;margin-bottom:.35rem}
 .chat-actions{display:flex;flex-wrap:wrap;gap:.4rem;align-self:flex-end}
-.chat-actions button{background:var(--surface-2);border:1px solid var(--primary);color:var(--primary);border-radius:999px;padding:.4rem .7rem;font:inherit;font-size:.82rem;cursor:pointer}
-.chat-send{background:var(--primary);color:#fff;border-radius:8px;padding:.62rem .8rem;font-weight:700}
+.chat-actions button{min-height:42px;background:var(--surface-2);border:1px solid var(--primary);color:var(--primary);border-radius:999px;padding:.4rem .7rem;font:inherit;font-size:.82rem;cursor:pointer}
+.chat-send{min-height:48px;background:var(--primary);color:#fff;border-radius:13px;padding:.62rem .95rem;font-weight:700}
 .chat-send:disabled,.chat-form textarea:disabled{opacity:.55;cursor:wait}
+
+@media (hover:hover) and (pointer:fine){
+  .icon-btn:hover,.modal-close:hover{background:var(--surface-off);color:var(--text)}
+  .btn-cta:hover,.chat-launch:hover{background:var(--primary-h)}
+  .hero-action:hover{background:#e8efc1;transform:translateY(-1px)}
+  .budget-action:hover{background:var(--primary-hl);color:var(--primary-h)}
+  .b-edit-btn:hover{color:var(--text);background:var(--divider)}
+  .l-item:hover{background:var(--surface-off);border-color:var(--border)}
+  .t-cb:hover{border-color:var(--primary);background:var(--primary-hl)}
+  .l-item:hover .del-btn{opacity:1}
+  .del-btn:hover{color:var(--error)}
+  .chat-head button:hover{background:var(--surface-off);color:var(--text)}
+}
+
+button:active,.budget-action:active,.chat-image-button:active{transform:scale(.97)}
+.icon-btn svg,.chat-head button,.del-btn{transition:color .16s,background .16s,opacity .16s}
+
+@media(max-width:860px){
+  .grid2{grid-template-columns:1fr}
+}
+@media(max-width:680px){
+  .hdr{padding:.6rem .85rem;gap:.4rem}
+  .hdr #btnRefresh,.hdr #btnSettings{display:none}
+  .logo{gap:.5rem}
+  .logo-icon{width:38px;height:38px;border-radius:13px}
+  .icon-btn{width:36px;height:36px}
+  .icon-btn{width:42px;height:42px}
+  .badge{font-size:.72rem;padding:.38rem .55rem}
+  .main{padding:1rem .85rem 5rem}
+  .page-intro{display:block;min-height:unset;padding:1.45rem 1.25rem;margin-bottom:.9rem;border-radius:16px}
+  .page-intro p{font-size:.84rem}
+  .intro-tools{justify-content:space-between;flex-wrap:wrap;margin-top:1rem}
+  .page-intro .period{padding:.45rem .7rem}
+  .hero-action{min-height:46px;padding:.6rem .8rem;font-size:.9rem}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:.6rem;margin-bottom:.85rem}
+  .kpis{gap:0}
+  .kpi{padding:.9rem .95rem;border-radius:0}
+  .kpi:nth-child(3){border-inline-start:0;border-top:1px solid var(--divider)}
+  .kpi:nth-child(4){border-top:1px solid var(--divider)}
+  .kpi-val{font-size:1.45rem}
+  .kpi-lbl{font-size:.74rem}
+  .grid2{gap:.8rem;margin-bottom:.8rem}
+  .card{padding:1rem;border-radius:14px}
+  .card-hdr{flex-wrap:wrap}
+  .chart-wrap{height:220px}
+  .list-cont{max-height:unset}
+  .chat-launch{right:.85rem;bottom:calc(1rem + env(safe-area-inset-bottom));min-height:48px;border-radius:15px}
+  .chat-panel{inset:env(safe-area-inset-top) 0 0;width:auto;height:auto;max-height:none;border-radius:0;border:0}
+  .chat-head{padding-inline:.9rem}
+  .chat-notice{font-size:.76rem}
+  .chat-form{padding:.65rem .75rem calc(.65rem + env(safe-area-inset-bottom))}
+  .overlay{align-items:flex-end;padding:0}
+  .modal{max-width:none;max-height:calc(100dvh - env(safe-area-inset-top));overflow-y:auto;border-radius:24px 24px 0 0;padding:1.4rem 1.1rem calc(1.2rem + env(safe-area-inset-bottom))}
+  .modal-close{top:12px;left:12px}
+  .toasts{bottom:calc(5.4rem + env(safe-area-inset-bottom));width:calc(100% - 2rem)}
+  .toast{max-width:100%;text-align:center}
+}
+@media(max-width:380px){
+  .hdr{padding-inline:.6rem;gap:.22rem}
+  .hdr .icon-btn{width:34px;height:34px}
+  .hdr #btnRefresh,.hdr #btnSettings{display:none}
+  .logo{font-size:1rem}
+  .badge{max-width:82px;padding-inline:.4rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .main{padding-inline:.65rem}
+  .page-intro{padding:1rem}
+  .kpi{padding:.78rem}
+  .kpi-val{font-size:1.28rem}
+}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
 </style>
 </head>
 <body>
 <header class="hdr">
-  <div class="logo"><div class="logo-icon">🤖</div>סחבק</div>
+  <div class="logo"><div class="logo-icon" aria-hidden="true">ס</div>סחבק</div>
   <div class="spacer"></div>
   <div class="badge" id="badge"><span class="dot"></span><span id="badgeTxt">לא מחובר</span></div>
-  <button class="icon-btn" id="btnRefresh" title="רענן" onclick="load()">
+  <button class="icon-btn" id="btnInvites" title="ניהול כניסת לקוחות" aria-label="ניהול כניסת לקוחות" onclick="openInviteModal()" hidden>👥</button>
+  <button class="icon-btn" id="btnLogout" title="יציאה מהחשבון" aria-label="יציאה מהחשבון" onclick="logoutDashboard()" hidden>↪</button>
+  <button class="icon-btn" id="btnRefresh" title="רענן" aria-label="רענון הנתונים" onclick="load()">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
   </button>
-  <button class="icon-btn" title="הגדרות" onclick="openCfgModal()">
+  <button class="icon-btn" id="btnSettings" title="הגדרות" aria-label="הגדרות חיבור" onclick="openCfgModal()">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
   </button>
-  <button class="icon-btn" title="מצב צבע" onclick="toggleTheme()">
+  <button class="icon-btn" title="מצב צבע" aria-label="החלפת מצב צבע" onclick="toggleTheme()">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" id="themeIcon"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
   </button>
 </header>
+
+<section class="auth-screen" id="authScreen" hidden>
+  <div class="auth-card">
+    <div id="loginView">
+      <div class="auth-mark">ס</div>
+      <h1>כניסה ללוח האישי</h1>
+      <p class="auth-sub">מזינים את מספר הטלפון והסיסמה האישית.</p>
+      <form onsubmit="event.preventDefault();loginDashboard()">
+        <div class="f-group"><label for="loginPhone">מספר טלפון</label><input id="loginPhone" type="tel" inputmode="tel" autocomplete="username" placeholder="9725XXXXXXXX" required dir="ltr"></div>
+        <div class="f-group"><label for="loginPassword">סיסמה</label><input id="loginPassword" type="password" autocomplete="current-password" required></div>
+        <p class="auth-error" id="loginError" role="alert"></p>
+        <button class="btn-cta" id="loginButton" type="submit">כניסה ללוח</button>
+      </form>
+    </div>
+    <div id="activateView" hidden>
+      <div class="auth-mark">ס</div>
+      <h1>הפעלת הלוח האישי</h1>
+      <p class="auth-sub">בחרו סיסמה אישית באורך 12 תווים לפחות. לאחר ההפעלה נכנסים דרך אותה כתובת לכולם.</p>
+      <form onsubmit="event.preventDefault();activateDashboard()">
+        <div class="f-group"><label for="activatePassword">סיסמה חדשה</label><input id="activatePassword" type="password" autocomplete="new-password" minlength="12" required></div>
+        <div class="f-group"><label for="activatePasswordConfirm">אימות הסיסמה</label><input id="activatePasswordConfirm" type="password" autocomplete="new-password" minlength="12" required></div>
+        <p class="auth-error" id="activateError" role="alert"></p>
+        <button class="btn-cta" id="activateButton" type="submit">הפעלת החשבון</button>
+      </form>
+    </div>
+  </div>
+</section>
 
 <div class="overlay hide" id="cfgModal">
   <div class="modal">
@@ -193,14 +329,57 @@ input,select{font:inherit;color:var(--text)}
   </div>
 </div>
 
+<div class="overlay hide" id="inviteModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeInviteModal()" aria-label="סגירה">✕</button>
+    <h2>הזמנת לקוח ללוח</h2>
+    <p class="sub">הכניסו את מספר הטלפון ושלחו ללקוח את הקישור האישי להפעלה. הקישור חד־פעמי ותוקפו 7 ימים. לאחר ההפעלה, כל הלקוחות נכנסים מאותה כתובת.</p>
+    <div class="f-group"><label for="invitePhone">מספר טלפון של הלקוח</label><input id="invitePhone" type="tel" inputmode="tel" placeholder="9725XXXXXXXX" dir="ltr"></div>
+    <button class="btn-cta" id="inviteButton" type="button" onclick="createDashboardInvite()">צור קישור הפעלה</button>
+    <div class="invite-result" id="inviteResult" hidden>
+      <label for="inviteLink">קישור להפעלה — שלחו אותו בפרטי ללקוח</label>
+      <input id="inviteLink" type="url" readonly dir="ltr">
+      <button class="btn-cta" type="button" onclick="copyInviteLink()">העתק קישור</button>
+      <p class="auth-sub">אם הלקוח כבר הפעיל חשבון, קישור חדש מאפשר לו לבחור סיסמה חדשה לאחר ההפעלה.</p>
+    </div>
+    <p class="auth-error" id="inviteError" role="alert"></p>
+  </div>
+</div>
+
+<div class="overlay hide" id="paymentModal">
+  <div class="modal payment-modal" role="dialog" aria-modal="true" aria-labelledby="paymentModalTitle">
+    <button class="modal-close" onclick="closePaymentModal()" aria-label="סגירה">✕</button>
+    <h2 id="paymentModalTitle">חיבור רכישות לתקציב</h2>
+    <p class="sub">החיבור שולח לסחבק את פרטי העסקה שהטלפון מקבל. צריך להגדיר ולאשר את האוטומציה במכשיר — היא לא מותקנת אוטומטית. באנדרואיד הקליטה נעשית מהתראות, ולא מקריאה ישירה של Google Wallet.</p>
+    <div class="payment-platforms" role="group" aria-label="בחירת סוג מכשיר">
+      <button class="payment-platform" id="paymentPlatformIos" type="button" onclick="selectPaymentPlatform('ios')">iPhone ו-Apple Pay</button>
+      <button class="payment-platform" id="paymentPlatformAndroid" type="button" onclick="selectPaymentPlatform('android')">Android וארנק דיגיטלי</button>
+    </div>
+    <p class="auth-sub" id="paymentDeviceHint"></p>
+    <div class="payment-status" id="paymentStatus" role="status"></div>
+    <div class="payment-token" id="paymentTokenPanel" hidden>
+      <div class="f-group">
+        <label for="paymentToken">קוד החיבור האישי — לא לשתף</label>
+        <input id="paymentToken" type="text" readonly autocomplete="off" dir="ltr">
+      </div>
+      <button class="budget-action" type="button" onclick="copyPaymentToken()">העתקת קוד החיבור</button>
+      <p class="auth-sub">הקוד מוצג רק אחרי יצירה. אם תאבדו אותו, צרו קוד חדש — הקודם יפסיק לעבוד.</p>
+    </div>
+    <div class="payment-instructions" id="paymentInstructions"></div>
+    <p class="auth-error" id="paymentError" role="alert"></p>
+    <button class="btn-cta" id="paymentConnectButton" type="button" onclick="issuePaymentToken()">יצירת קוד חיבור אישי</button>
+    <button class="btn-test" id="paymentRevokeButton" type="button" onclick="revokePaymentToken()" hidden>ביטול החיבור במכשיר זה</button>
+  </div>
+</div>
+
 <!-- Modal הפלוס המרכזי עם טאב התקציב החדש -->
 <div class="overlay hide" id="addModal">
   <div class="modal">
     <button class="modal-close" onclick="closeAddModal()">✕</button>
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">💸 תנועה</button>
-      <button class="tab-btn" onclick="switchTab('bud')" id="tab-btn-bud">📊 תקציב</button>
-      <button class="tab-btn" onclick="switchTab('tsk')" id="tab-btn-tsk">✅ משימה</button>
+      <button class="tab-btn active" onclick="switchTab('exp')" id="tab-btn-exp">תנועה</button>
+      <button class="tab-btn" onclick="switchTab('bud')" id="tab-btn-bud">תקציב</button>
+      <button class="tab-btn" onclick="switchTab('tsk')" id="tab-btn-tsk">משימה</button>
     </div>
     
     <div class="tab-content active" id="tab-exp">
@@ -249,10 +428,18 @@ input,select{font:inherit;color:var(--text)}
 </div>
 
 <main class="main" id="main" style="display:none">
-  <div class="err-banner" id="errBanner"><span>⚠️</span><div><strong>שגיאת חיבור</strong><br><span id="errMsg"></span></div></div>
+  <div class="err-banner" id="errBanner" role="status"><span class="err-mark" aria-hidden="true">!</span><div><strong>החיבור לסחבק לא זמין כרגע</strong><br><span id="errMsg"></span></div></div>
   <div class="page-intro">
-    <div><h1>שלום, זה הסדר שלך</h1><p>תמונת מצב קצרה של הכסף, המשימות והיום שלך.</p></div>
-    <div class="period">החודש: <span id="pageMonth">—</span></div>
+    <div class="intro-copy">
+      <span class="intro-eyebrow">טוב לראות אותך שוב</span>
+      <h1>בוא נעשה סדר.</h1>
+      <p>הכסף, המשימות והיומן שלך — במקום אחד.</p>
+    </div>
+    <div class="intro-tools">
+      <div class="period"><span>החודש</span><strong id="pageMonth">—</strong></div>
+      <button class="hero-action" type="button" onclick="openAddModal()"><span aria-hidden="true">＋</span> הוספה מהירה</button>
+      <button class="hero-action hero-action-secondary" id="btnPayments" type="button" onclick="openPaymentModal()" hidden>חיבור תשלומים</button>
+    </div>
   </div>
   <div class="kpis">
     <div class="kpi"><div class="kpi-lbl">מאזן פנוי</div><div class="kpi-val c-pri" id="kBalance">—</div><div class="kpi-sub" id="kMonth"></div></div>
@@ -263,35 +450,37 @@ input,select{font:inherit;color:var(--text)}
 
   <div class="grid2">
     <div class="card">
-      <div class="card-hdr"><div class="card-title">📊 תקציב לפי קטגוריה</div><button class="budget-action" onclick="editBudget('')" title="הגדרת תקציב">✏️ עריכת תקציב</button><div class="card-meta" id="bMonth"></div></div>
+      <div class="card-hdr"><div class="card-title">תקציב לפי קטגוריה</div><button class="budget-action" onclick="editBudget('')" title="הגדרת תקציב">עריכת יעדים</button><div class="card-meta" id="bMonth"></div></div>
       <div class="b-list" id="bList"><div class="sk" style="height:36px;margin-bottom:.5rem"></div></div>
     </div>
     <div class="card">
-      <div class="card-hdr"><div class="card-title">🥧 חלוקת הוצאות</div></div>
-      <div class="chart-wrap"><canvas id="pie"></canvas></div>
+      <div class="card-hdr"><div class="card-title">הוצאות לפי קטגוריה</div></div>
+      <div class="chart-wrap"><canvas id="pie"></canvas><div class="chart-empty" id="pieEmpty" hidden><span class="chart-empty-mark" aria-hidden="true"></span><p>כאן תופיע תמונת ההוצאות שלך</p></div></div>
     </div>
   </div>
 
   <div class="grid2">
     <div class="card">
-      <div class="card-hdr"><div class="card-title">✅ משימות</div><div class="card-meta" id="tCount"></div></div>
+      <div class="card-hdr"><div class="card-title">מה נשאר לעשות</div><div class="card-meta" id="tCount"></div></div>
       <div class="list-cont" id="tList"><div class="sk" style="height:42px;margin-bottom:.4rem"></div></div>
     </div>
     <div class="card">
-      <div class="card-hdr"><div class="card-title">💸 תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
+      <div class="card-hdr"><div class="card-title">תנועות אחרונות</div><div class="card-meta" id="txCount"></div></div>
       <div class="list-cont" id="txList"><div class="sk" style="height:46px;margin-bottom:.35rem"></div></div>
     </div>
   </div>
 </main>
 
-<button class="fab" onclick="openAddModal()">+</button>
-<button class="chat-launch" type="button" onclick="toggleChat()">💬 דבר עם סחבק</button>
+<button class="chat-launch" type="button" aria-controls="chatPanel" aria-expanded="false" onclick="toggleChat()">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11h8M8 14h5"/></svg>
+  <span>שיחה עם סחבק</span>
+</button>
 <section class="chat-panel" id="chatPanel" aria-label="שיחה עם סחבק" aria-hidden="true">
   <header class="chat-head">
-    <span>💬 שיחה עם סחבק</span>
+    <span>שיחה עם סחבק</span>
     <button type="button" aria-label="סגירת השיחה" onclick="toggleChat(false)">✕</button>
   </header>
-  <div class="chat-notice">ממשק חלופי בזמן שוואטסאפ מושבת. הודעות ותזכורות שנשלחות דרך וואטסאפ לא יגיעו כרגע. תמונה מצורפת נשלחת ל-Google Gemini לפענוח; בדוק את פרטי האירוע ואשר לפני יצירה ביומן.</div>
+  <div class="chat-notice">אפשר לכתוב כאן בקשות ולנהל את המידע שלך. הודעות ותזכורות בוואטסאפ עדיין מושהות. אירוע מתמונה יתווסף ליומן רק אחרי שתאשר את הפרטים.</div>
   <div class="chat-messages" id="chatMessages" aria-live="polite">
     <div class="chat-bubble assistant">היי! אפשר לבקש ממני לנהל הוצאות ומשימות, לשאול על הנתונים שלך ולתכנן ביומן.</div>
   </div>
@@ -314,13 +503,30 @@ input,select{font:inherit;color:var(--text)}
 const _inj = window.__SAHBAK_CFG__ || {};
 const _injClean = {};
 for (const k in _inj) if (_inj[k] !== '' && _inj[k] != null) _injClean[k] = _inj[k];
+const activationToken = _inj.activationToken || new URLSearchParams(location.hash.slice(1)).get('token') || '';
+const queryParams = new URLSearchParams(location.search);
+const hasLegacyLink = Boolean(
+  (_inj.userId && _inj.token) ||
+  ((queryParams.get('user_id') || queryParams.get('u')) &&
+   (queryParams.get('token') || queryParams.get('t')))
+);
 let C = Object.assign({ url:'', key:'', userId:'', token:'' }, JSON.parse(localStorage.getItem('sahbak_cfg') || '{}'), _injClean);
 (function(){const q = new URLSearchParams(location.search);const uid = q.get('user_id') || q.get('u');const tok = q.get('token') || q.get('t');if(uid) C.userId = uid;if(tok) C.token = tok;})();
+if(!hasLegacyLink){C.url='';C.userId='';C.token='';C.key='';}
 
 const EMO = {'אוכל':'🍔','ביגוד וקוסמטיקה':'👗','תחבורה':'🚌','לימודים והתפתחות':'📚','פינוקים':'🍫','רפואה':'💊','הוצאות בית':'🏠','חשבונות':'🧾','צדקה':'🤝','מסגרות ילדים':'🧸','רכב + דלק':'🚗','שונות':'📦','חיסכון':'🐷','ביטוחים':'🛡️','אירועים ומתנות':'🎁','הכנסה':'💰'};
 const QC = {'חשוב דחוף':'q1','חשוב לא דחוף':'q2','דחוף לא חשוב':'q3','לא דחוף לא חשוב':'q4'};
 let pieChart = null;
 let chatPreviewUrl = null;
+let isDashboardAdmin = false;
+let hasDashboardSession = false;
+let detectedPaymentPlatform = '';
+let paymentPlatform = 'ios';
+let paymentAutomationStatus = {
+  ios: { connected: false },
+  android: { connected: false }
+};
+let paymentIssuedTokens = { ios: '', android: '' };
 
 function toggleTheme(){const h=document.documentElement;h.setAttribute('data-theme',h.getAttribute('data-theme')==='dark'?'light':'dark');}
 
@@ -333,9 +539,17 @@ document.querySelectorAll('.overlay').forEach(el=>el.addEventListener('click',e=
 function toggleChat(open){
   const panel=document.getElementById('chatPanel');
   const shouldOpen=open===undefined?!panel.classList.contains('open'):open;
+  const launcher=document.querySelector('.chat-launch');
   panel.classList.toggle('open',shouldOpen);
   panel.setAttribute('aria-hidden',String(!shouldOpen));
-  if(shouldOpen)document.getElementById('chatInput').focus();
+  launcher.setAttribute('aria-expanded',String(shouldOpen));
+  document.body.classList.toggle('chat-open',shouldOpen);
+  if(shouldOpen){
+    document.getElementById('chatInput').focus();
+  }else{
+    if(panel.contains(document.activeElement))launcher.focus();
+    document.getElementById('chatInput').blur();
+  }
 }
 
 function appendChatMessage(text,role){
@@ -436,23 +650,318 @@ async function api(path,method='GET',body=null){
   const sep=path.includes('?')?'&':'?';
   // התיקון: תמיד מצרפים את מספר הטלפון כדי לעבור את חומת האבטחה של השרת
   const url=C.url+path+`${sep}user_id=${encodeURIComponent(C.userId)}`;
-  const opts={method,headers:{'X-Dashboard-Key':C.key||'','X-Dash-Token':C.token||'','Content-Type':'application/json'}};
+  const opts={method,credentials:'same-origin',headers:{'X-Dashboard-Key':C.key||'','X-Dash-Token':C.token||'','Content-Type':'application/json'}};
   if(body)opts.body=JSON.stringify(body);
   const r=await fetch(url,opts);
-  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
+  if(!r.ok){const j=await r.json().catch(()=>({}));const error=new Error(j.error||r.status);error.status=r.status;throw error;}
   return r.json();
 }
 
+async function authRequest(path,body=null){
+  const response=await fetch(path,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body||{})
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){const error=new Error(payload.error||response.status);error.status=response.status;throw error;}
+  return payload;
+}
+
+async function paymentAutomationRequest(method='GET',body=null){
+  const response=await fetch('/api/dashboard/payment-automation',{
+    method,
+    credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body:body?JSON.stringify(body):undefined
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){const error=new Error(payload.error||response.status);error.status=response.status;throw error;}
+  return payload;
+}
+
+function detectPaymentPlatform(){
+  const ua=navigator.userAgent||'';
+  if(/iPad|iPhone|iPod/i.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1))return 'ios';
+  if(/Android/i.test(ua))return 'android';
+  return '';
+}
+
+function openPaymentModal(){
+  if(!hasDashboardSession)return;
+  detectedPaymentPlatform=detectPaymentPlatform();
+  paymentIssuedTokens={ios:'',android:''};
+  document.getElementById('paymentToken').value='';
+  document.getElementById('paymentTokenPanel').hidden=true;
+  document.getElementById('paymentError').classList.remove('show');
+  document.getElementById('paymentModal').classList.remove('hide');
+  selectPaymentPlatform(detectedPaymentPlatform||'ios');
+  loadPaymentAutomation();
+}
+
+function closePaymentModal(){
+  paymentIssuedTokens={ios:'',android:''};
+  document.getElementById('paymentToken').value='';
+  document.getElementById('paymentTokenPanel').hidden=true;
+  document.getElementById('paymentModal').classList.add('hide');
+}
+
+function selectPaymentPlatform(platform){
+  if(platform!=='ios'&&platform!=='android')return;
+  paymentPlatform=platform;
+  document.getElementById('paymentPlatformIos').classList.toggle('active',platform==='ios');
+  document.getElementById('paymentPlatformAndroid').classList.toggle('active',platform==='android');
+  document.getElementById('paymentPlatformIos').setAttribute('aria-pressed',String(platform==='ios'));
+  document.getElementById('paymentPlatformAndroid').setAttribute('aria-pressed',String(platform==='android'));
+  const labels={ios:'iPhone',android:'Android'};
+  document.getElementById('paymentDeviceHint').textContent=detectedPaymentPlatform
+    ?`זיהיתי מכשיר ${labels[detectedPaymentPlatform]}. אפשר לבחור כאן סוג מכשיר אחר.`
+    :'לא זיהיתי את סוג המכשיר. בחרו אותו ידנית.';
+  const isIos=platform==='ios';
+  document.getElementById('paymentInstructions').innerHTML=isIos
+    ?'<h3>הגדרה באייפון</h3><p>כתובת בקשת HTTP: <code id="paymentEndpoint"></code></p><ol><li>פתחו את אפליקציית ״קיצורים״ וצרו אוטומציה אישית של Wallet בעת הקשה בכרטיס שבחרתם.</li><li>הוסיפו פעולה ״קבל תוכן של כתובת״ והגדירו אותה כבקשת POST לכתובת שמופיעה למעלה.</li><li>בגוף הבקשה בחרו JSON עם השדות <code>secret</code> (קוד החיבור), <code>amount</code> (המשתנה Amount של העסקה) ו-<code>merchant</code> (המשתנה Merchant).</li><li>שמרו ואשרו את אפשרויות ההפעלה שהמכשיר מציג. בדקו תחילה עם רכישה קטנה.</li></ol><p>השרת מזהה את החשבון לפי הקוד האישי; אין צורך לשלוח מספר טלפון.</p>'
+    :'<h3>הגדרה באנדרואיד</h3><p>כתובת בקשת HTTP: <code id="paymentEndpoint"></code></p><ol><li>באפליקציית אוטומציה כגון MacroDroid, צרו טריגר של קבלת התראה ובחרו רק את Google Wallet או את אפליקציית הבנק הרלוונטית.</li><li>הוסיפו פעולת בקשת HTTP מסוג POST לכתובת שמופיעה למעלה.</li><li>שלחו גוף JSON עם <code>secret</code> (קוד החיבור) ו-<code>raw_text</code> (טקסט ההתראה שהתקבלה).</li><li>הפעילו הרשאת גישה להתראות רק אם אתם מסכימים לכך, ובדקו שההתראה אכן כוללת סכום ושם בית עסק.</li></ol><p>השרת מזהה את החשבון לפי הקוד האישי; אין צורך לשלוח מספר טלפון.</p>';
+  document.getElementById('paymentEndpoint').textContent=location.origin+(isIos?'/api/apple-pay':'/api/android-pay');
+  renderPaymentAutomation();
+}
+
+function renderPaymentAutomation(){
+  const status=paymentAutomationStatus[paymentPlatform]||{connected:false};
+  const connected=Boolean(status.connected);
+  const issuedToken=paymentIssuedTokens[paymentPlatform]||'';
+  const statusElement=document.getElementById('paymentStatus');
+  statusElement.textContent=connected
+    ?'נוצר קוד חיבור למכשיר זה. אפשר להחליף אותו או לבטל אותו בכל עת.'
+    :'עדיין לא נוצר קוד חיבור למכשיר זה.';
+  statusElement.classList.toggle('connected',connected);
+  document.getElementById('paymentToken').value=issuedToken;
+  document.getElementById('paymentTokenPanel').hidden=!issuedToken;
+  document.getElementById('paymentConnectButton').textContent=connected
+    ?'יצירת קוד חדש והחלפת הקודם'
+    :'יצירת קוד חיבור אישי';
+  document.getElementById('paymentRevokeButton').hidden=!connected;
+}
+
+async function loadPaymentAutomation(){
+  try{
+    paymentAutomationStatus=await paymentAutomationRequest();
+    renderPaymentAutomation();
+  }catch(error){
+    const element=document.getElementById('paymentError');
+    element.textContent=error.message;
+    element.classList.add('show');
+  }
+}
+
+async function issuePaymentToken(){
+  if(paymentAutomationStatus[paymentPlatform]?.connected&&
+     !window.confirm('יצירת קוד חדש תבטל את הקוד הקודם. להמשיך?'))return;
+  const button=document.getElementById('paymentConnectButton');
+  const error=document.getElementById('paymentError');
+  error.classList.remove('show');
+  button.disabled=true;
+  try{
+    const result=await paymentAutomationRequest('POST',{platform:paymentPlatform});
+    paymentAutomationStatus[paymentPlatform]={connected:true};
+    paymentIssuedTokens[paymentPlatform]=result.token;
+    renderPaymentAutomation();
+  }catch(exception){
+    error.textContent=exception.message;
+    error.classList.add('show');
+  }finally{button.disabled=false;}
+}
+
+async function revokePaymentToken(){
+  if(!window.confirm('האוטומציה במכשיר תפסיק לעבוד. לבטל את החיבור?'))return;
+  const button=document.getElementById('paymentRevokeButton');
+  const error=document.getElementById('paymentError');
+  error.classList.remove('show');
+  button.disabled=true;
+  try{
+    await paymentAutomationRequest('DELETE',{platform:paymentPlatform});
+    paymentAutomationStatus[paymentPlatform]={connected:false};
+    paymentIssuedTokens[paymentPlatform]='';
+    renderPaymentAutomation();
+  }catch(exception){
+    error.textContent=exception.message;
+    error.classList.add('show');
+  }finally{button.disabled=false;}
+}
+
+async function copyPaymentToken(){
+  const input=document.getElementById('paymentToken');
+  input.focus();input.select();
+  try{
+    await navigator.clipboard.writeText(input.value);
+    toast('קוד החיבור הועתק');
+  }catch(_error){
+    document.execCommand('copy');
+    toast('קוד החיבור הועתק');
+  }
+}
+
+function showAuth(view='login',message=''){
+  document.getElementById('main').style.display='none';
+  document.getElementById('authScreen').hidden=false;
+  document.getElementById('btnInvites').hidden=true;
+  document.getElementById('btnLogout').hidden=true;
+  document.getElementById('btnPayments').hidden=true;
+  hasDashboardSession=false;
+  document.querySelector('.chat-launch').hidden=true;
+  setBadge('', 'לא מחובר');
+  document.getElementById('loginView').hidden=view!=='login';
+  document.getElementById('activateView').hidden=view!=='activate';
+  document.getElementById('loginError').classList.remove('show');
+  document.getElementById('activateError').classList.remove('show');
+  if(message){
+    const error=document.getElementById(view==='activate'?'activateError':'loginError');
+    error.textContent=message;
+    error.classList.add('show');
+  }
+}
+
+function finishDashboardLogin(data){
+  C.userId=data.user_id;
+  C.token='';
+  C.key='';
+  isDashboardAdmin=Boolean(data.is_admin);
+  hasDashboardSession=true;
+  document.getElementById('btnPayments').hidden=false;
+  document.getElementById('authScreen').hidden=true;
+  document.getElementById('main').style.display='';
+  history.replaceState(null,'','/dashboard');
+  load();
+}
+
+async function loginDashboard(){
+  const button=document.getElementById('loginButton');
+  const phone=document.getElementById('loginPhone').value.trim();
+  const password=document.getElementById('loginPassword').value;
+  button.disabled=true;
+  try{
+    finishDashboardLogin(await authRequest('/api/dashboard/login',{user_id:phone,password}));
+    document.getElementById('loginPassword').value='';
+  }catch(error){
+    showAuth('login',error.message);
+  }finally{button.disabled=false;}
+}
+
+async function activateDashboard(){
+  const button=document.getElementById('activateButton');
+  const password=document.getElementById('activatePassword').value;
+  const confirm=document.getElementById('activatePasswordConfirm').value;
+  if(password!==confirm){showAuth('activate','הסיסמאות אינן זהות');return;}
+  if(password.length<12){showAuth('activate','יש לבחור סיסמה באורך 12 תווים לפחות');return;}
+  button.disabled=true;
+  try{
+    finishDashboardLogin(await authRequest('/api/dashboard/activate',{
+      token:activationToken,
+      password
+    }));
+    document.getElementById('activatePassword').value='';
+    document.getElementById('activatePasswordConfirm').value='';
+  }catch(error){
+    showAuth('activate',error.message);
+  }finally{button.disabled=false;}
+}
+
+async function logoutDashboard(){
+  try{await authRequest('/api/dashboard/logout');}catch(error){toast('לא הצלחתי לסיים את החיבור: '+error.message);return;}
+  C.userId='';C.token='';C.key='';
+  isDashboardAdmin=false;
+  hasDashboardSession=false;
+  document.getElementById('btnInvites').hidden=true;
+  document.getElementById('btnLogout').hidden=true;
+  document.getElementById('btnPayments').hidden=true;
+  document.querySelector('.chat-launch').hidden=true;
+  showAuth('login');
+  history.replaceState(null,'','/dashboard');
+}
+
+function openInviteModal(){
+  if(!isDashboardAdmin)return;
+  document.getElementById('invitePhone').value='';
+  document.getElementById('inviteResult').hidden=true;
+  document.getElementById('inviteError').classList.remove('show');
+  document.getElementById('inviteModal').classList.remove('hide');
+}
+
+function closeInviteModal(){document.getElementById('inviteModal').classList.add('hide');}
+
+async function createDashboardInvite(){
+  const button=document.getElementById('inviteButton');
+  const error=document.getElementById('inviteError');
+  const target=document.getElementById('invitePhone').value.trim();
+  error.classList.remove('show');
+  button.disabled=true;
+  try{
+    const result=await api('/api/dashboard/invites','POST',{
+      user_id:C.userId,
+      target_user_id:target
+    });
+    const link=document.getElementById('inviteLink');
+    link.value=result.activation_url;
+    document.getElementById('inviteResult').hidden=false;
+  }catch(exception){
+    error.textContent=exception.message;
+    error.classList.add('show');
+  }finally{button.disabled=false;}
+}
+
+async function copyInviteLink(){
+  const link=document.getElementById('inviteLink');
+  link.focus();link.select();
+  try{
+    await navigator.clipboard.writeText(link.value);
+    toast('הקישור הועתק');
+  }catch(_error){
+    document.execCommand('copy');
+    toast('הקישור הועתק');
+  }
+}
+
+async function initializeDashboard(){
+  if(_inj.activationPage || activationToken){
+    showAuth('activate');
+    return;
+  }
+  if(hasLegacyLink){
+    document.getElementById('authScreen').hidden=true;
+    document.getElementById('main').style.display='';
+    load();
+    return;
+  }
+  try{
+    const response=await fetch('/api/dashboard/session',{credentials:'same-origin'});
+    const data=await response.json();
+    if(!response.ok||!data.authenticated){showAuth('login');return;}
+    finishDashboardLogin(data);
+  }catch(_error){
+    showAuth('login');
+  }
+}
+
 async function load(){
+  if(!C.userId)return;
   setBadge('loading','מתחבר...');
   const btn=document.getElementById('btnRefresh');btn.classList.add('spin');
   document.getElementById('errBanner').classList.remove('show');
   try{
     const d=await api('/api/dashboard');
+    isDashboardAdmin=Boolean(d.is_admin);
+    document.getElementById('btnInvites').hidden=!isDashboardAdmin;
+    document.getElementById('btnPayments').hidden=!hasDashboardSession;
+    document.getElementById('btnLogout').hidden=false;
+    document.querySelector('.chat-launch').hidden=!isDashboardAdmin;
     renderKPIs(d); renderBudget(d); renderPie(d); renderTasks(d); renderTx(d);
-    setBadge('ok','מחובר ✓'); document.getElementById('main').style.display='';
+    setBadge('ok','מחובר'); document.getElementById('main').style.display='';
   }catch(e){
-    setBadge('err','שגיאה');document.getElementById('errBanner').classList.add('show');document.getElementById('errMsg').textContent=e.message;toast('❌ '+e.message);
+    if(e.status===401){showAuth('login');return;}
+    const message=e instanceof TypeError
+      ?'אין כרגע חיבור לשרת. בדוק את החיבור לאינטרנט ונסה לרענן.'
+      :e.message;
+    setBadge('err','לא זמין');document.getElementById('errBanner').classList.add('show');document.getElementById('errMsg').textContent=message;
   }finally{setTimeout(()=>btn.classList.remove('spin'),500);}
 }
 
@@ -462,11 +971,12 @@ function renderKPIs(d){
   const txs=d.transactions||[]; let inc=0,exp=0;
   txs.forEach(t=>{t.amount>0?inc+=t.amount:exp+=Math.abs(t.amount)});
   const bal=inc-exp;
+  const monthLabel=formatMonth(d.month);
   document.getElementById('kBalance').textContent=fmt(bal);
   document.getElementById('kBalance').className='kpi-val '+(bal>=0?'c-pos':'c-neg');
   document.getElementById('kExp').textContent=fmt(exp); document.getElementById('kInc').textContent=fmt(inc);
-  document.getElementById('kMonth').textContent=d.month||''; document.getElementById('bMonth').textContent=d.month||'';
-  document.getElementById('pageMonth').textContent=d.month||'—';
+  document.getElementById('kMonth').textContent=monthLabel; document.getElementById('bMonth').textContent=monthLabel;
+  document.getElementById('pageMonth').textContent=monthLabel||'—';
   document.getElementById('kTasks').textContent=(d.tasks||[]).length; document.getElementById('kTaskSub').textContent=`הושלמו ${d.tasks_completed||0}/${d.tasks_total||0}`;
   document.getElementById('tCount').textContent=(d.tasks||[]).length+' משימות'; document.getElementById('txCount').textContent=(d.transactions||[]).length+' תנועות';
 }
@@ -496,7 +1006,7 @@ function renderBudget(d){
   let html = '';
 
   if(!cats.length){
-    html = '<div class="empty"><p>לא הוגדרו יעדים ואין הוצאות</p></div>';
+    html = '<div class="empty"><p>עוד אין נתונים לתקציב. הם יופיעו כאן אחרי התנועה הראשונה.</p></div>';
   } else {
     cats.sort((a,b) => map[b].spent - map[a].spent); // מיון מהגבוה לנמוך
     html = cats.map(cat => {
@@ -516,32 +1026,40 @@ function renderBudget(d){
   }
 
   // 3. כפתור נוח וברור בתחתית הרשימה להוספת תקציב חדש
-  html += `<button class="btn-test" style="width:100%; margin-top:1rem; border-style:dashed; cursor:pointer;" onclick="switchTab('bud');openAddModal();">➕ הגדר יעד לקטגוריה נוספת</button>`;
+  html += `<button class="btn-test" type="button" onclick="switchTab('bud');openAddModal();"><span aria-hidden="true">＋</span> הוספת יעד תקציב</button>`;
   
   el.innerHTML = html;
 }
 
 function renderPie(d){
   const exps=(d.budget_summary||[]).filter(b=>b.category!=='הכנסה'&&b.total<0);
-  const ctx=document.getElementById('pie').getContext('2d');
-  if(pieChart)pieChart.destroy();
+  const canvas=document.getElementById('pie');
+  if(pieChart){pieChart.destroy();pieChart=null;}
+  if(!exps.length){
+    canvas.hidden=true;
+    document.getElementById('pieEmpty').hidden=false;
+    return;
+  }
+  canvas.hidden=false;
+  document.getElementById('pieEmpty').hidden=true;
+  const ctx=canvas.getContext('2d');
   const dk=document.documentElement.getAttribute('data-theme')==='dark';
   pieChart=new Chart(ctx,{
     type:'doughnut',
-    data:{labels:exps.map(b=>`${EMO[b.category]||''} ${b.category}`),datasets:[{data:exps.map(b=>Math.abs(b.total)),backgroundColor:['#4f98a3','#01696f','#6daa45','#e8af34','#bb653b','#d163a7','#5591c7','#a86fdf','#da7101'],borderWidth:2,borderColor:dk?'#1a1917':'#fff'}]},
-    options:{responsive:true,maintainAspectRatio:false,cutout:'58%',plugins:{legend:{position:'right',labels:{color:dk?'#d4d3d0':'#28251d',font:{family:'Heebo',size:10},boxWidth:9,usePointStyle:true}},tooltip:{callbacks:{label:c=>`₪${Math.round(c.raw).toLocaleString('he-IL')}`}}}}
+    data:{labels:exps.map(b=>b.category),datasets:[{data:exps.map(b=>Math.abs(b.total)),backgroundColor:['#24594c','#8d9f6c','#c17b5c','#d2ad60','#6c8790','#a67884','#9b895d','#6d9678','#657a65'],borderWidth:3,borderColor:dk?'#1a251e':'#fffdf8'}]},
+    options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'right',labels:{color:dk?'#edf0e7':'#1b3027',font:{family:'Assistant',size:12},boxWidth:8,usePointStyle:true}},tooltip:{callbacks:{label:c=>`₪${Math.round(c.raw).toLocaleString('he-IL')}`}}}}
   });
 }
 
 function renderTasks(d){
   const el=document.getElementById('tList'); const tasks=d.tasks||[];
-  if(!tasks.length){el.innerHTML='<div class="empty"><p>אין משימות פתוחות 🎉</p></div>';return;}
+  if(!tasks.length){el.innerHTML='<div class="empty"><p>אין משימות פתוחות כרגע. אפשר ליהנות מהרווח הזה.</p></div>';return;}
   el.innerHTML=tasks.map(t=>`<div class="l-item" id="ti${t.id}"><div class="t-cb" onclick="doneTask(${t.id})"></div><span class="t-txt">${esc(t.description)}</span><span class="t-q ${QC[t.quadrant]||'q2'}">${t.quadrant}</span><button class="del-btn" onclick="delTask(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/></svg></button></div>`).join('');
 }
 
 function renderTx(d){
   const el=document.getElementById('txList'); const txs=d.transactions||[];
-  if(!txs.length){el.innerHTML='<div class="empty"><p>אין תנועות החודש</p></div>';return;}
+  if(!txs.length){el.innerHTML='<div class="empty"><p>החודש עוד לא נרשמו תנועות.</p></div>';return;}
   el.innerHTML=txs.map(t=>`<div class="l-item" id="tx${t.id}"><span class="tx-em">${EMO[t.category]||'💵'}</span><div class="tx-info"><div class="tx-desc">${esc(t.description||t.category)}</div><div class="tx-meta">${t.category} · ${t.date}</div></div><span class="tx-amt ${t.amount>0?'p':'n'}">${t.amount>0?'+':''}${fmt(t.amount)}</span><button class="del-btn" onclick="delExp(${t.id})"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>`).join('');
 }
 
@@ -588,12 +1106,17 @@ async function saveBudgetLimit(){
   }
 }
 
+function formatMonth(month){
+  const match=/^(\d{4})-(\d{2})$/.exec(month||'');
+  if(!match)return month||'';
+  const date=new Date(Date.UTC(Number(match[1]),Number(match[2])-1,1));
+  return new Intl.DateTimeFormat('he-IL',{month:'long',year:'numeric',timeZone:'UTC'}).format(date);
+}
 function fmt(n){return(n<0?'-':'')+'₪'+Math.round(Math.abs(n)).toLocaleString('he-IL')}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function toast(msg){const c=document.getElementById('toasts'),t=document.createElement('div');t.className='toast';t.textContent=msg;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300)},3000);}
 setInterval(()=>load(),30000);
-document.getElementById('main').style.display='';
-if(!C.userId){openCfgModal();}else{load();}
+initializeDashboard();
 </script>
 </body>
 </html>

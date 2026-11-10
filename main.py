@@ -91,6 +91,7 @@ import time
 import random
 import hmac
 import hashlib
+import secrets
 import logging
 import math
 import sqlite3
@@ -102,7 +103,8 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Google Calendar (google-api-python-client + google-auth)
 from google.oauth2 import service_account
@@ -131,7 +133,7 @@ logging.basicConfig(
 logger = logging.getLogger('sahbak')
 
 # Bump this on every meaningful deploy so /health proves which build is live.
-BUILD_VERSION = '2026-10-10-r42'
+BUILD_VERSION = '2026-10-29-r44'
 
 # ─────────────────────────────────────────────
 # App & Config
@@ -148,7 +150,7 @@ def add_cors(response):
 def options_handler(p):
     return app.make_default_options_response()
 
-VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', 'sahbak-verify-2026')
+VERIFY_TOKEN         = os.getenv('VERIFY_TOKEN', '').strip()
 WHATSAPP_TOKEN       = os.getenv('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID      = os.getenv('PHONE_NUMBER_ID')
 GOOGLE_CREDENTIALS   = os.getenv('GOOGLE_CREDENTIALS')
@@ -165,6 +167,8 @@ GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
 WHATSAPP_API_VERSION  = os.getenv('WHATSAPP_API_VERSION', 'v21.0')
 SHABBAT_TEMPLATE_NAME = os.getenv('SHABBAT_TEMPLATE_NAME', '').strip()
 SHABBAT_TEMPLATE_LANGUAGE = os.getenv('SHABBAT_TEMPLATE_LANGUAGE', 'he')
+PAYMENT_TEMPLATE_NAME = os.getenv('PAYMENT_TEMPLATE_NAME', '').strip()
+PAYMENT_TEMPLATE_LANGUAGE = os.getenv('PAYMENT_TEMPLATE_LANGUAGE', 'he')
 # Railway often sets TZ rather than TIMEZONE — accept both.
 TIMEZONE_NAME         = os.getenv('TIMEZONE') or os.getenv('TZ') or 'Asia/Jerusalem'
 # Off by default while the WhatsApp appeal is pending. To restore: set env
@@ -174,7 +178,7 @@ SHABBAT_NOTIFICATION_HOUR = int(os.getenv('SHABBAT_NOTIFICATION_HOUR', '12'))
 
 # ── [MULTI] Multi-user access control & calendar mapping ──────────────────
 # ALLOWED_USERS: comma-separated phone numbers (in WhatsApp format, e.g.
-# 972501234567). If empty, EVERYONE who messages the bot is served.
+# 972501234567). If no env or DB allowlist is configured, inbound users are denied.
 ALLOWED_USERS = set(filter(None, (
     n.strip() for n in os.getenv('ALLOWED_USERS', '').split(',')
 )))
@@ -610,13 +614,14 @@ def init_db() -> None:
                 resolved   INTEGER NOT NULL DEFAULT 0
             );
 
-            -- proof that a person asked to join, who approved them, and
-            -- whether they opted out of proactive messages ("הפסק").
+            -- admin approval for bot access and separate recipient opt-in
+            -- tracking for proactive messages.
             CREATE TABLE IF NOT EXISTS user_consent (
-                user_id      TEXT PRIMARY KEY,
-                approved_by  TEXT,
-                consented_at TEXT NOT NULL,
-                opted_out_at TEXT
+                user_id            TEXT PRIMARY KEY,
+                approved_by        TEXT,
+                consented_at       TEXT NOT NULL,
+                opted_out_at       TEXT,
+                proactive_opt_in_at TEXT
             );
 
             -- who already received a given proactive broadcast, so a retry
@@ -626,7 +631,55 @@ def init_db() -> None:
                 user_id  TEXT NOT NULL,
                 PRIMARY KEY (run_date, user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS whatsapp_customer_service_windows (
+                user_id          TEXT PRIMARY KEY,
+                last_inbound_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dashboard_credentials (
+                user_id         TEXT PRIMARY KEY,
+                password_hash   TEXT NOT NULL,
+                session_version INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS dashboard_invites (
+                token_hash TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at    INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dashboard_invites_user
+                ON dashboard_invites (user_id);
+
+            CREATE TABLE IF NOT EXISTS dashboard_login_attempts (
+                scope_key       TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                failed_attempts INTEGER NOT NULL,
+                window_started  INTEGER NOT NULL,
+                locked_until    INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS payment_automation_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                platform   TEXT NOT NULL CHECK(platform IN ('ios', 'android')),
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_payment_automation_tokens_user
+                ON payment_automation_tokens (user_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_automation_tokens_active
+                ON payment_automation_tokens (user_id, platform)
+                WHERE revoked_at IS NULL;
         ''')
+
+        _ensure_column(conn, 'user_consent', 'proactive_opt_in_at', 'TEXT')
 
         # 2) Per-user budget limits (handles migration from old global table).
         _migrate_or_create_budget_limits(conn)
@@ -805,11 +858,10 @@ def remove_allowed_user(phone: str) -> bool:
 
 
 def is_user_allowed(phone: str) -> bool:
-    """True if this phone may talk to the bot: env ALLOWED_USERS, DB-approved,
-    or an open bot (no allowlist configured anywhere)."""
+    """True only for explicitly allowlisted phones."""
     db_allowed = get_allowed_users_db()
     if not ALLOWED_USERS and not db_allowed:
-        return True
+        return False
     norm = _normalize_phone(phone)
     return norm in ALLOWED_USERS or norm in db_allowed
 
@@ -817,8 +869,7 @@ def is_user_allowed(phone: str) -> bool:
 # ── Consent / opt-out ──
 
 def record_consent(phone: str, approved_by: str | None = None) -> None:
-    """Remember that this person asked to join (first approval wins; a later
-    re-approval keeps the original timestamp)."""
+    """Record bot-access approval; this is not proactive-message opt-in."""
     with _connect() as conn:
         conn.execute(
             'INSERT OR IGNORE INTO user_consent (user_id, approved_by, consented_at) '
@@ -829,8 +880,7 @@ def record_consent(phone: str, approved_by: str | None = None) -> None:
 
 
 def set_opted_out(phone: str, opted_out: bool) -> None:
-    """Stop (or resume) proactive messages. Creates the row if the user was
-    added through the env allowlist and never went through approval."""
+    """Record the recipient's explicit opt-out or opt-in for proactive messages."""
     norm = _normalize_phone(phone)
     stamp = now_local().isoformat()
     with _connect() as conn:
@@ -838,8 +888,10 @@ def set_opted_out(phone: str, opted_out: bool) -> None:
             'INSERT OR IGNORE INTO user_consent (user_id, consented_at) VALUES (?, ?)',
             (norm, stamp))
         conn.execute(
-            'UPDATE user_consent SET consented_at = ?, opted_out_at = ? WHERE user_id = ?',
-            (stamp, stamp if opted_out else None, norm))
+            'UPDATE user_consent SET consented_at = ?, opted_out_at = ?, '
+            'proactive_opt_in_at = ? WHERE user_id = ?',
+            (stamp, stamp if opted_out else None,
+             None if opted_out else stamp, norm))
         conn.commit()
 
 
@@ -856,11 +908,11 @@ def is_opted_out(phone: str) -> bool:
 
 
 def has_active_proactive_consent(phone: str) -> bool:
-    """Require recorded opt-in and no active opt-out before proactive sends."""
+    """Require direct recipient opt-in and no active opt-out."""
     try:
         with _connect() as conn:
             row = conn.execute(
-                'SELECT consented_at, opted_out_at FROM user_consent WHERE user_id = ?',
+                'SELECT proactive_opt_in_at, opted_out_at FROM user_consent WHERE user_id = ?',
                 (_normalize_phone(phone),)).fetchone()
         return bool(row and row[0] and not row[1])
     except Exception:
@@ -871,7 +923,8 @@ def has_active_proactive_consent(phone: str) -> bool:
 def list_users_summary() -> str:
     with _connect() as conn:
         consent = {r[0]: r[1:] for r in conn.execute(
-            'SELECT user_id, consented_at, opted_out_at FROM user_consent')}
+            'SELECT user_id, consented_at, opted_out_at, proactive_opt_in_at '
+            'FROM user_consent')}
         labels = {r[0]: r[1] for r in conn.execute(
             'SELECT user_id, label FROM allowed_users')}
     everyone = sorted(ALLOWED_USERS | set(labels) | set(consent))
@@ -879,16 +932,67 @@ def list_users_summary() -> str:
         return 'אין משתמשים רשומים.'
     lines = [f'*משתמשים ({len(everyone)}):*']
     for uid in everyone:
-        consented, opted_out = consent.get(uid, (None, None))
+        approved_at, opted_out_at, proactive_opt_in_at = consent.get(
+            uid, (None, None, None))
         name = f' ({labels[uid]})' if labels.get(uid) else ''
-        if opted_out:
+        if opted_out_at:
             status = '🔕 הפסיק הודעות יזומות'
-        elif consented:
-            status = f'✅ אושר {consented[:10]}'
+        elif proactive_opt_in_at:
+            status = f'✅ הסכים להודעות יזומות {proactive_opt_in_at[:10]}'
+        elif approved_at:
+            status = f'✅ אושר לבוט {approved_at[:10]} — אין הסכמה להודעות יזומות'
         else:
-            status = '⚠️ אין תיעוד הסכמה'
+            status = '⚠️ אין תיעוד אישור'
         lines.append(f'• {uid}{name} — {status}')
     return '\n'.join(lines)
+
+
+CUSTOMER_SERVICE_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def record_whatsapp_inbound(phone: str, timestamp: str | int | None) -> bool:
+    """Store a sender-initiated message timestamp for the 24-hour service window."""
+    norm = _normalize_phone(phone)
+    try:
+        inbound_at = int(timestamp) if timestamp is not None else 0
+    except (TypeError, ValueError):
+        inbound_at = 0
+    now_epoch = int(time.time())
+    if not norm or inbound_at <= 0 or inbound_at > now_epoch:
+        logger.warning('Ignoring WhatsApp inbound message with invalid timestamp')
+        return False
+    try:
+        with _connect() as conn:
+            conn.execute(
+                'INSERT INTO whatsapp_customer_service_windows (user_id, last_inbound_at) '
+                'VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET '
+                'last_inbound_at = MAX(last_inbound_at, excluded.last_inbound_at)',
+                (norm, inbound_at))
+            conn.commit()
+        return True
+    except Exception:
+        logger.exception('Could not record WhatsApp inbound timestamp')
+        return False
+
+
+def has_open_customer_service_window(phone: str, now_epoch: int | None = None) -> bool:
+    """Return whether this sender messaged the business within the last 24 hours."""
+    norm = _normalize_phone(phone)
+    if not norm:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT last_inbound_at FROM whatsapp_customer_service_windows '
+                'WHERE user_id = ?', (norm,)).fetchone()
+        if not row:
+            return False
+        now_value = int(time.time()) if now_epoch is None else now_epoch
+        age = now_value - int(row[0])
+        return 0 <= age < CUSTOMER_SERVICE_WINDOW_SECONDS
+    except Exception:
+        logger.exception('Could not verify WhatsApp customer service window')
+        return False
 
 
 # ── [MULTI] Household sharing (account aliases) ──
@@ -1748,11 +1852,14 @@ def _admin_system_diag() -> str:
         ('תבנית שבת מאושרת: ' + SHABBAT_TEMPLATE_NAME + ' (' + SHABBAT_TEMPLATE_LANGUAGE + ')'
          if SHABBAT_TEMPLATE_NAME else
          '⚠️ אין תבנית שבת מאושרת — מחוץ לחלון 24 השעות Meta עלולה לדחות הודעות יזומות.'),
+        ('תבנית עדכוני תשלום: ' + PAYMENT_TEMPLATE_NAME
+         if PAYMENT_TEMPLATE_NAME else
+         'אין תבנית עדכוני תשלום — התראות תשלום נשמרות בלי הודעת WhatsApp יזומה.'),
         f'חשבון שירות: {sa or "—"}',
         f'כתובת דשבורד: {PUBLIC_BASE_URL or "(נתיב יחסי — הגדר PUBLIC_URL)"}',
         f'WhatsApp: {"✅" if (WHATSAPP_TOKEN and PHONE_NUMBER_ID) else "❌"} | '
         f'Calendar creds: {"✅" if GOOGLE_CREDENTIALS else "❌"} | '
-        f'Webhook signature: {"✅" if APP_SECRET else "כבוי"}',
+        f'Webhook signature: {"✅" if APP_SECRET else "❌ חסר (בקשות נדחות)"}',
         'בדיקת יומן חיה: "בדוק יומן <מספר>"',
     ]
     # [FIX] Loudly flag a USER_CALENDARS env that is SET but did not parse —
@@ -2081,13 +2188,15 @@ def _get_agent_prompt(agent_name: str) -> str:
     elif agent_name == 'schedule':
         return base + (
             'אתה מנהל לו"ז אישי בכיר (Executive Assistant). תפקידך לקבוע, למחוק ולעדכן אירועים ביומן Google.\n'
-            'חוקי הברזל שלך:\n'
-            '1. משימות על (ליבת הלמידה): למשתמש יש יעד קריטי של למידה למבחני הלשכה - כ-9 שעות ביום, בימים א\'-ד\' (08:00-18:00).\n'
-            '2. התאוששות מבלת"מים: עזור למשתמש למצוא זמן חלופי ביומן ללמידה אם פספס.\n'
-            '3. בקרת אנוש (Human-in-the-Loop): אין לשבץ חלונות למידה או משימות ללא אישור! השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון שלך.\n'
-            '4. שיבוץ משימות אקטיבי: בתחתית פרומפט זה קיבלת את מצב היומן ואת בנק המשימות. כשמבקשים לשבץ משימות או למצוא חלונות זמן, נתח מיד את רשימת "חלונות פנויים מחושבים". לעולם אל תשאל "מתי נוח לך" ואל תבקש מהמשתמש לבחור שעה אם כבר קיימים חלונות ברשימה. בחר את החלון הראשון שמתאים למשימה, ואם מחר הוא שבת או שאין בו חלון, הצע את יום העבודה הבא שמופיע ברשימה. עבור כל משימה הפעל את הכלי "propose_calendar_event" כדי לשלוח הצעת שיבוץ מסודרת ביומן.\n'
-            '5. השתמש תמיד בפורמט ISO 8601 לזמנים.\n'
-            '6. אם המשתמש מציין העדפות אישית ברורה לשעות, ימי מנוחה או הפסקות, שמור אותה באמצעות set_schedule_preferences. אל תנחש העדפות.'
+            'הפרדה חשובה בין בקשת משתמש מפורשת לבין תכנון יזום:\n'
+            '1. כשמשתמש מבקש במפורש להוסיף אירוע מסוים ומציין יום או תאריך ושעה, צור את האירוע בדיוק בזמן שביקש באמצעות "create_calendar_event". אל תסרב ואל תשנה את הזמן בגלל שבת, שעות תכנון, או הנחת עבודה אחרת. מגבלות שבת ושעות העבודה שלהלן חלות רק על תכנון יזום של משימות או לימודים.\n'
+            '2. אם חסר פרט הכרחי ליצירת האירוע, שאל רק על הפרט החסר. אל תציג העדפה משוערת כאיסור.\n'
+            '3. בתכנון יזום של משימות או לימודים, התחשב ביעד הלמידה למבחני הלשכה: כ-9 שעות ביום, בימים א\'-ד\' (08:00-18:00).\n'
+            '4. עזור למשתמש למצוא זמן חלופי ביומן ללמידה אם פספס.\n'
+            '5. אין לשבץ חלונות למידה או משימות ללא אישור. השתמש תמיד בכלי "propose_calendar_event" כדי להציע את התכנון.\n'
+            '6. כשמבקשים לשבץ משימות או למצוא חלונות זמן, נתח מיד את רשימת "חלונות פנויים מחושבים". אל תשאל "מתי נוח לך" אם קיימים חלונות ברשימה. בחר חלון מתאים; אם מחר שבת או שאין בו חלון, הצע את יום העבודה הבא שמופיע ברשימה.\n'
+            '7. השתמש תמיד בפורמט ISO 8601 לזמנים.\n'
+            '8. אם המשתמש מציין העדפות אישיות לשעות, ימי מנוחה או הפסקות, שמור אותן באמצעות set_schedule_preferences. אל תנחש העדפות.'
         )
     
     elif agent_name == 'tasks':
@@ -2177,6 +2286,26 @@ def _is_proactive_schedule_request(text: str) -> bool:
         r'(?:יומן|משימה|משימות|למידה|שבץ|מחר|היום|השבוע|זמן)', normalized
     ))
     return has_slot_language and has_schedule_signal
+
+
+def _is_direct_calendar_event_request(text: str) -> bool:
+    """Recognize direct event-creation requests without relying on the AI router."""
+    normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    has_create_action = bool(re.search(
+        r'(?:^|[\s,])(?:קבע|תקבע|קבעי|תוסיף|הוסף|הוסיפי|הכניס|תכניס|'
+        r'צור|תיצור|צרי|רשום|תרשום|שבץ|תשבץ)(?=$|[\s,])',
+        normalized,
+    ))
+    has_event = bool(re.search(
+        r'(?:^|[\s,])(?:פגיש(?:ה|ת)|אירוע|תור|שיחה|ישיבה)(?=$|[\s,])',
+        normalized,
+    ))
+    has_calendar_target = bool(re.search(
+        r'(?:^|[\s,])(?:ליומן|ביומן|ללוח\s+השנה|ביומן\s+שלי)(?=$|[\s,])',
+        normalized,
+    ))
+    return has_create_action and (has_event or has_calendar_target)
+
 
 def _calendar_datetime(value: str | None) -> datetime | None:
     """Parse a Google Calendar dateTime and normalise it to the bot timezone."""
@@ -2642,7 +2771,10 @@ def get_ai_tool_calls(text: str, user_id: str, history=None) -> tuple[list[tuple
     # Do not let a probabilistic router turn an unambiguous slot request into
     # a generic reply. The schedule agent is the only agent that receives the
     # calendar state and calculated free windows.
-    if _is_proactive_schedule_request(text):
+    if _is_direct_calendar_event_request(text):
+        agent_name = 'schedule'
+        logger.info('Deterministic calendar-event routing: %s', text)
+    elif _is_proactive_schedule_request(text):
         agent_name = 'schedule'
         logger.info('Deterministic schedule routing for slot request: %s', text)
 
@@ -3356,6 +3488,13 @@ def _split_for_whatsapp(message: str, limit: int = WHATSAPP_TEXT_LIMIT) -> list[
 
 
 def _post_whatsapp(payload: dict) -> bool:
+    if payload.get('type') != 'template':
+        recipient = str(payload.get('to', '')).strip()
+        if not has_open_customer_service_window(recipient):
+            logger.warning(
+                'Blocked free-form WhatsApp message outside the customer service window')
+            return False
+
     url     = f'https://graph.facebook.com/{WHATSAPP_API_VERSION}/{PHONE_NUMBER_ID}/messages'
     headers = {
         'Authorization': f'Bearer {WHATSAPP_TOKEN}',
@@ -3427,6 +3566,17 @@ def send_whatsapp_template_message(to: str, template_name: str,
         },
     }
     return _post_whatsapp(payload)
+
+
+def send_whatsapp_proactive_template(to: str, template_name: str,
+                                    language: str, body_text: str) -> bool:
+    if not has_active_proactive_consent(to):
+        logger.info('Skipping proactive WhatsApp template: recipient has not opted in')
+        return False
+    if not template_name:
+        logger.warning('Skipping proactive WhatsApp message: no approved template configured')
+        return False
+    return send_whatsapp_template_message(to, template_name, language, body_text)
 
 
 def send_whatsapp_action_buttons(to: str, body: str,
@@ -3673,7 +3823,7 @@ def _send_shabbat_notification() -> None:
         template_body = message.removeprefix('🕯️ זמני שבת מעודכנים').strip()
         failures = []
         for user in pending:
-            if send_whatsapp_template_message(
+            if send_whatsapp_proactive_template(
                     user, SHABBAT_TEMPLATE_NAME, SHABBAT_TEMPLATE_LANGUAGE, template_body):
                 with _connect() as conn:
                     conn.execute(
@@ -3896,28 +4046,15 @@ def _try_admin_command(text: str, user_id: str) -> str | None:
         if not DB_PERSISTENT:
             reply += ('\n⚠️ אזהרה: DB_PATH לא מוגדר — החיבור הזה יימחק בדיפלוי '
                       'הבא! שלח "אבחון".')
-        # [NEW] Message the FRIEND directly with a button that opens their own
-        # calendar's sharing settings — Google can't pre-fill the invite email,
-        # so it's sent right after in its own copyable bubble.
         sa = _service_account_email()
         if sa:
             settings_url = ('https://calendar.google.com/calendar/u/0/r/settings/calendar/'
                             + quote(email, safe=''))
-            sent = send_whatsapp_cta_url(
-                target,
-                '📅 כדי שסחבק יוכל לקבוע לך אירועים ביומן, שתף את היומן שלך עם '
-                'חשבון השירות שלו:\n\n1️⃣ לחץ על הכפתור למטה\n'
-                '2️⃣ לחץ על "+ הוספת אנשים"\n'
-                '3️⃣ הדבק את הכתובת הבאה ותן הרשאת "ביצוע שינויים באירועים"',
-                'פתח הגדרות יומן', settings_url,
-            )
-            email_sent = send_whatsapp_message(target, BUBBLE_BREAK + sa)
-            if sent:
-                reply += f'\n📨 שלחתי ל-{target} כפתור ישיר לשיתוף היומן.'
-            if not sent or not email_sent:
-                reply += ('\n⚠️ לא הצלחתי לשלוח את הוראות החיבור ישירות למשתמש. '
-                          'העבר לו את הקישור ואת כתובת חשבון השירות שמופיעים בהודעות הבאות:'
-                          + BUBBLE_BREAK + settings_url + BUBBLE_BREAK + sa)
+            reply += (
+                '\nלא שלחתי הודעה יזומה למספר אחר. אם המשתמש ביקש להצטרף, '
+                'העבר לו את הקישור ואת כתובת חשבון השירות ובקש ממנו לשתף את '
+                'היומן בהרשאת "ביצוע שינויים באירועים":'
+                + BUBBLE_BREAK + settings_url + BUBBLE_BREAK + sa)
         return reply
 
     m = _UNLINK_CAL_RE.match(t)
@@ -4847,6 +4984,9 @@ def _handle_message_safely(message: dict, from_number: str) -> None:
 
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
+    if not VERIFY_TOKEN:
+        logger.error('Webhook verification is disabled: VERIFY_TOKEN is not configured')
+        return 'Webhook verification is not configured', 503
     mode      = request.args.get('hub.mode')
     token     = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
@@ -4862,7 +5002,10 @@ def webhook():
     raw_body  = request.get_data()
     signature = request.headers.get('X-Hub-Signature-256')
 
-    if APP_SECRET and not verify_meta_signature(raw_body, signature):
+    if not APP_SECRET:
+        logger.error('Webhook request rejected: APP_SECRET is not configured')
+        return jsonify({'error': 'webhook signature verification is not configured'}), 503
+    if not verify_meta_signature(raw_body, signature):
         logger.warning('Invalid webhook signature — request rejected')
         return jsonify({'error': 'invalid signature'}), 403
 
@@ -4906,8 +5049,8 @@ def webhook():
             if not from_number:
                 continue
 
-            # [MULTI] Allowlist: if configured, silently ignore anyone not on it.
-            # Protects your Gemini quota and your calendar from strangers.
+            # A missing allowlist is closed by default; only explicitly approved
+            # users may trigger AI processing or outbound replies.
             if not is_user_allowed(from_number):
                 logger.info('Ignoring message from non-allowed number %s', from_number)
                 continue
@@ -4916,6 +5059,7 @@ def webhook():
                 logger.info('Duplicate message %s ignored', message_id)
                 continue
 
+            record_whatsapp_inbound(from_number, message.get('timestamp'))
             _enqueue_account_message(message, from_number)
             queued += 1
 
@@ -5042,11 +5186,11 @@ def _log_startup_config() -> None:
         'WHATSAPP_TOKEN':  WHATSAPP_TOKEN,
         'PHONE_NUMBER_ID': PHONE_NUMBER_ID,
         'GEMINI_API_KEY':  GEMINI_API_KEY,
+        'VERIFY_TOKEN':    VERIFY_TOKEN,
+        'APP_SECRET':      APP_SECRET,
     }.items() if not val]
     if missing:
         logger.warning('Missing env vars (related features will be disabled): %s', ', '.join(missing))
-    if not APP_SECRET:
-        logger.warning('APP_SECRET not set — webhook signature verification is OFF')
 
     # [r6] THE critical warning. Without DB_PATH on the Volume, every deploy
     # wipes calendar links, tasks, budget history and conversation memory.
@@ -5062,7 +5206,7 @@ def _log_startup_config() -> None:
     if ALLOWED_USERS:
         logger.info('[MULTI] Allowlist active: %d number(s) permitted', len(ALLOWED_USERS))
     else:
-        logger.warning('[MULTI] ALLOWED_USERS not set — ANYONE who messages the bot will be served.')
+        logger.warning('[MULTI] No allowlist configured — inbound user messages are denied.')
     if ADMIN_USERS:
         logger.info('[MULTI] Admins: %d number(s)', len(ADMIN_USERS))
     else:
@@ -5078,6 +5222,19 @@ def _log_startup_config() -> None:
 # ██  Dashboard REST API  ██
 # ═══════════════════════════════════════════════════════════════════════
 DASHBOARD_API_KEY = os.getenv('DASHBOARD_API_KEY', '')
+DASHBOARD_SESSION_SECRET = (
+    os.getenv('DASHBOARD_SESSION_SECRET', '').strip()
+    or APP_SECRET
+    or DASHBOARD_API_KEY
+)
+if DASHBOARD_SESSION_SECRET:
+    app.secret_key = DASHBOARD_SESSION_SECRET
+app.config.update(
+    SESSION_COOKIE_NAME='sahbak_session',
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+)
 
 # Public base URL of THIS service — used to build shareable per-user dashboard
 # links. Railway injects RAILWAY_PUBLIC_DOMAIN automatically; PUBLIC_URL lets
@@ -5097,6 +5254,7 @@ PUBLIC_BASE_URL = _clean_base_url(
     os.getenv('PUBLIC_URL')
     or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}"
         if os.getenv('RAILWAY_PUBLIC_DOMAIN') else ''))
+app.config['SESSION_COOKIE_SECURE'] = bool(PUBLIC_BASE_URL)
 
 # The dashboard HTML lives next to this file in the repo and is served by Flask
 # (same origin as the API → zero CORS and a real, shareable URL).
@@ -5110,6 +5268,82 @@ def _get_user_id():
     """user_id מה-query string או מה-JSON body."""
     return (request.args.get('user_id') or
             (request.get_json(silent=True) or {}).get('user_id', ''))
+
+
+def _dashboard_user_id(raw_phone) -> str:
+    user_id = _normalize_phone(str(raw_phone or ''))
+    return user_id if re.fullmatch(r'\d{8,15}', user_id) else ''
+
+
+def _dashboard_session_user():
+    user_id = _dashboard_user_id(session.get('dashboard_user_id'))
+    version = session.get('dashboard_session_version')
+    if not user_id or not isinstance(version, int):
+        return ''
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT session_version FROM dashboard_credentials WHERE user_id = ?',
+                (user_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.exception('Dashboard session lookup failed')
+        return ''
+    if not row or row[0] != version:
+        session.clear()
+        return ''
+    return user_id
+
+
+def _set_dashboard_session(user_id: str, version: int) -> None:
+    session.clear()
+    session.permanent = True
+    session['dashboard_user_id'] = user_id
+    session['dashboard_session_version'] = version
+
+
+def _dashboard_login_scopes(user_id: str):
+    ip_address = request.remote_addr or 'unknown'
+    ip_hash = hashlib.sha256(ip_address.encode('utf-8')).hexdigest()
+    pair_hash = hashlib.sha256(
+        (user_id + '\0' + ip_address).encode('utf-8')).hexdigest()
+    return [(f'pair:{pair_hash}', 5), (f'ip:{ip_hash}', 30)]
+
+
+def _dashboard_login_lock_remaining(scopes, now: int) -> int:
+    scope_keys = [scope for scope, _limit in scopes]
+    placeholders = ','.join('?' for _ in scope_keys)
+    with _connect() as conn:
+        rows = conn.execute(
+            f'SELECT locked_until FROM dashboard_login_attempts '
+            f'WHERE scope_key IN ({placeholders})',
+            scope_keys,
+        ).fetchall()
+    return max((max(0, int(row[0]) - now) for row in rows), default=0)
+
+
+def _record_dashboard_login_failure(user_id: str, scopes, now: int) -> None:
+    window_seconds = 15 * 60
+    with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        for scope_key, max_attempts in scopes:
+            row = conn.execute(
+                'SELECT failed_attempts, window_started FROM dashboard_login_attempts '
+                'WHERE scope_key = ?',
+                (scope_key,),
+            ).fetchone()
+            if not row or now - row[1] >= window_seconds:
+                failures, window_started = 1, now
+            else:
+                failures, window_started = row[0] + 1, row[1]
+            locked_until = now + window_seconds if failures >= max_attempts else 0
+            conn.execute(
+                'INSERT OR REPLACE INTO dashboard_login_attempts '
+                '(scope_key, user_id, failed_attempts, window_started, locked_until) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (scope_key, user_id, failures, window_started, locked_until),
+            )
+        conn.commit()
 
 
 def _dash_token(user_id) -> str:
@@ -5138,18 +5372,270 @@ def _require_dashboard_key():
     if key and hmac.compare_digest(key, DASHBOARD_API_KEY):
         return None
     user_id = str(_get_user_id() or '')
+    session_user = _dashboard_session_user()
+    if session_user and _dashboard_user_id(user_id) == session_user:
+        return None
     token   = (request.args.get('token') or request.headers.get('X-Dash-Token', ''))
     if user_id and token and hmac.compare_digest(token, _dash_token(user_id)):
         return None
     return jsonify({'error': 'unauthorized'}), 401
 
 
+@app.route('/api/dashboard/session', methods=['GET'])
+def api_dashboard_session():
+    user_id = _dashboard_session_user()
+    if not user_id:
+        return jsonify({'authenticated': False}), 200
+    return jsonify({
+        'authenticated': True,
+        'user_id': user_id,
+        'is_admin': user_id in ADMIN_USERS,
+    }), 200
+
+
+@app.route('/api/dashboard/login', methods=['POST'])
+def api_dashboard_login():
+    if not DASHBOARD_API_KEY:
+        return jsonify({'error': 'dashboard authentication is not configured'}), 503
+    if not (DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY):
+        return jsonify({'error': 'dashboard session secret is not configured'}), 503
+    if not app.secret_key:
+        app.secret_key = DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY
+
+    data = request.get_json(silent=True) or {}
+    user_id = _dashboard_user_id(data.get('user_id'))
+    password = data.get('password')
+    if not user_id or not isinstance(password, str) or not password:
+        return jsonify({'error': 'מספר טלפון וסיסמה נדרשים'}), 400
+
+    now = int(time.time())
+    login_scopes = _dashboard_login_scopes(user_id)
+    locked_for = _dashboard_login_lock_remaining(login_scopes, now)
+    if locked_for:
+        return jsonify({'error': 'יותר מדי ניסיונות. נסו שוב בעוד 15 דקות.'}), 429
+
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT password_hash, session_version FROM dashboard_credentials '
+            'WHERE user_id = ?',
+            (user_id,),
+        ).fetchone()
+
+    if not row or not check_password_hash(row[0], password):
+        _record_dashboard_login_failure(user_id, login_scopes, now)
+        return jsonify({'error': 'מספר הטלפון או הסיסמה אינם נכונים'}), 401
+
+    with _connect() as conn:
+        conn.execute('DELETE FROM dashboard_login_attempts WHERE user_id = ?',
+                     (user_id,))
+        conn.commit()
+    _set_dashboard_session(user_id, row[1])
+    return jsonify({'user_id': user_id, 'is_admin': user_id in ADMIN_USERS}), 200
+
+
+@app.route('/api/dashboard/logout', methods=['POST'])
+def api_dashboard_logout():
+    if not (DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY):
+        return jsonify({'error': 'dashboard session secret is not configured'}), 503
+    if not app.secret_key:
+        app.secret_key = DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY
+    session.clear()
+    return jsonify({'ok': True}), 200
+
+
+@app.route('/api/dashboard/activate', methods=['POST'])
+def api_dashboard_activate():
+    if not DASHBOARD_API_KEY:
+        return jsonify({'error': 'dashboard authentication is not configured'}), 503
+    if not (DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY):
+        return jsonify({'error': 'dashboard session secret is not configured'}), 503
+    if not app.secret_key:
+        app.secret_key = DASHBOARD_SESSION_SECRET or APP_SECRET or DASHBOARD_API_KEY
+
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    password = data.get('password')
+    if not isinstance(token, str) or not token or not isinstance(password, str):
+        return jsonify({'error': 'קישור ההפעלה או הסיסמה אינם תקינים'}), 400
+    if len(password) < 12 or len(password) > 256:
+        return jsonify({'error': 'יש לבחור סיסמה באורך 12 עד 256 תווים'}), 400
+
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    now = int(time.time())
+    password_hash = generate_password_hash(
+        password, method='pbkdf2:sha256:600000')
+    try:
+        with _connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            invite = conn.execute(
+                'SELECT user_id, expires_at, used_at FROM dashboard_invites '
+                'WHERE token_hash = ?',
+                (token_hash,),
+            ).fetchone()
+            if not invite or invite[2] is not None or invite[1] <= now:
+                conn.rollback()
+                return jsonify({'error': 'קישור ההפעלה אינו תקף או שפג תוקפו'}), 400
+
+            user_id = invite[0]
+            updated = conn.execute(
+                'UPDATE dashboard_invites SET used_at = ? '
+                'WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?',
+                (now, token_hash, now),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return jsonify({'error': 'קישור ההפעלה כבר נוצל'}), 409
+
+            existing = conn.execute(
+                'SELECT session_version FROM dashboard_credentials WHERE user_id = ?',
+                (user_id,),
+            ).fetchone()
+            version = (existing[0] + 1) if existing else 1
+            conn.execute(
+                'INSERT OR REPLACE INTO dashboard_credentials '
+                '(user_id, password_hash, session_version) VALUES (?, ?, ?)',
+                (user_id, password_hash, version),
+            )
+            conn.execute('DELETE FROM dashboard_login_attempts WHERE user_id = ?',
+                         (user_id,))
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception('Dashboard account activation failed')
+        return jsonify({'error': 'לא ניתן להפעיל את החשבון כרגע'}), 500
+
+    _set_dashboard_session(user_id, version)
+    return jsonify({'user_id': user_id, 'is_admin': user_id in ADMIN_USERS}), 200
+
+
+@app.route('/api/dashboard/invites', methods=['POST'])
+def api_dashboard_create_invite():
+    err = _require_dashboard_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    creator = _dashboard_user_id(data.get('user_id'))
+    target = _dashboard_user_id(data.get('target_user_id'))
+    if not creator or creator not in ADMIN_USERS:
+        return jsonify({'error': 'רק מנהלים יכולים להנפיק הזמנות'}), 403
+    if not target:
+        return jsonify({'error': 'יש להזין מספר טלפון תקין'}), 400
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    now = int(time.time())
+    expires_at = now + 7 * 24 * 60 * 60
+    try:
+        with _connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute(
+                'DELETE FROM dashboard_invites WHERE user_id = ? AND used_at IS NULL',
+                (target,),
+            )
+            conn.execute(
+                'INSERT INTO dashboard_invites '
+                '(token_hash, user_id, created_by, created_at, expires_at) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (token_hash, target, creator, now, expires_at),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception('Dashboard invitation creation failed for %s', target)
+        return jsonify({'error': 'לא ניתן ליצור הזמנה כרגע'}), 500
+
+    path = '/dashboard/activate#token=' + urllib.parse.quote(token, safe='')
+    base_url = PUBLIC_BASE_URL or request.url_root.rstrip('/')
+    link = base_url + path
+    return jsonify({
+        'user_id': target,
+        'activation_url': link,
+        'expires_at': expires_at,
+    }), 201
+
+
+@app.route('/api/dashboard/payment-automation', methods=['GET', 'POST', 'DELETE'])
+def api_dashboard_payment_automation():
+    user_id = _dashboard_session_user()
+    if not user_id:
+        return jsonify({'error': 'יש להתחבר ללוח כדי לנהל את החיבור'}), 401
+
+    platforms = ('ios', 'android')
+    if request.method == 'GET':
+        status = {platform: {'connected': False} for platform in platforms}
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    'SELECT platform, created_at FROM payment_automation_tokens '
+                    'WHERE user_id = ? AND revoked_at IS NULL',
+                    (user_id,),
+                ).fetchall()
+        except sqlite3.Error:
+            logger.exception('Payment automation status lookup failed for %s', user_id)
+            return jsonify({'error': 'לא ניתן לטעון את מצב החיבור כרגע'}), 500
+        for platform, created_at in rows:
+            status[platform] = {'connected': True, 'created_at': created_at}
+        return jsonify(status), 200
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'יש לשלוח נתוני חיבור תקינים'}), 400
+    platform = str(data.get('platform', '')).strip().lower()
+    if platform not in platforms:
+        return jsonify({'error': 'יש לבחור מכשיר נתמך'}), 400
+
+    now = int(time.time())
+    if request.method == 'DELETE':
+        try:
+            with _connect() as conn:
+                conn.execute(
+                    'UPDATE payment_automation_tokens SET revoked_at = ? '
+                    'WHERE user_id = ? AND platform = ? AND revoked_at IS NULL',
+                    (now, user_id, platform),
+                )
+                conn.commit()
+        except sqlite3.Error:
+            logger.exception('Payment automation revocation failed for %s', user_id)
+            return jsonify({'error': 'לא ניתן לבטל את החיבור כרגע'}), 500
+        return jsonify({'connected': False}), 200
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    try:
+        with _connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute(
+                'UPDATE payment_automation_tokens SET revoked_at = ? '
+                'WHERE user_id = ? AND platform = ? AND revoked_at IS NULL',
+                (now, user_id, platform),
+            )
+            conn.execute(
+                'INSERT INTO payment_automation_tokens '
+                '(token_hash, user_id, platform, created_at) VALUES (?, ?, ?, ?)',
+                (token_hash, user_id, platform, now),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception('Payment automation token creation failed for %s', user_id)
+        return jsonify({'error': 'לא ניתן ליצור מפתח חיבור כרגע'}), 500
+
+    return jsonify({'connected': True, 'platform': platform, 'token': token}), 201
+
+
+def _payment_automation_user(secret: str, platform: str) -> str:
+    if not secret:
+        return ''
+    token_hash = hashlib.sha256(secret.encode('utf-8')).hexdigest()
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT user_id FROM payment_automation_tokens '
+            'WHERE token_hash = ? AND platform = ? AND revoked_at IS NULL',
+            (token_hash, platform),
+        ).fetchone()
+    return row[0] if row else ''
+
 @app.route('/dashboard', methods=['GET'])
 def dashboard_page():
-    """Serve the dashboard HTML from THIS service (same origin as the API → no
-    CORS, no stale-URL problems). Per-user link: ?user_id=<phone>&token=<token>
-    — generate it with the bot command "קישור". The master key is never put in
-    the page; only the scoped token is injected."""
+    """Serve the shared dashboard login and legacy per-user dashboard links."""
     user_id = (request.args.get('user_id') or request.args.get('u') or '').strip()
     token   = (request.args.get('token')   or request.args.get('t') or '').strip()
     try:
@@ -5157,10 +5643,24 @@ def dashboard_page():
             html = f.read()
     except FileNotFoundError:
         return ('dashboard.html חסר בפריסה — יש להעלות אותו לריפו ליד main.py.'), 404
-    cfg = {'url': '', 'key': '', 'userId': user_id, 'token': token}
+    cfg = {
+        'url': '',
+        'key': '',
+        'userId': user_id,
+        'token': token,
+        'activationPage': request.path == '/dashboard/activate',
+    }
     inject = '<script>window.__SAHBAK_CFG__=' + json.dumps(cfg) + ';</script>'
     html = html.replace('</head>', inject + '\n</head>', 1)
-    return Response(html, mimetype='text/html; charset=utf-8')
+    response = Response(html, mimetype='text/html; charset=utf-8')
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
+
+@app.route('/dashboard/activate', methods=['GET'])
+def dashboard_activation_page():
+    return dashboard_page()
 
 
 @app.route('/guide', methods=['GET'])
@@ -5214,6 +5714,7 @@ def api_dashboard():
 
     return jsonify({
         'user_id':         user_id,
+        'is_admin':        _dashboard_user_id(user_id) in ADMIN_USERS,
         'month':           now_local().strftime('%Y-%m'),
         'budget_summary':  budget,
         'budget_limits':   limits,
@@ -5370,8 +5871,8 @@ def _process_apple_pay_background(user_id_raw: str, account_id: str, amount: flo
         }, account_id)
 
         msg = f"🍏 *Apple Pay (אוטומ):*\n\n{reply}"
-        if not is_opted_out(user_id_raw):
-            send_whatsapp_message(user_id_raw, msg)
+        send_whatsapp_proactive_template(
+            user_id_raw, PAYMENT_TEMPLATE_NAME, PAYMENT_TEMPLATE_LANGUAGE, msg)
         
     except Exception:
         logger.exception('Critical error in background Apple Pay processing for %s', user_id_raw)
@@ -5384,18 +5885,16 @@ def api_apple_pay():
     מקבל את הנתונים, מאמת אבטחה, מחזיר 200 OK מיידית לאייפון, 
     ומשגר את העיבוד המורכב ל-ThreadPool קיים.
     """
-    if not VERIFY_TOKEN:
-        return jsonify({'error': 'VERIFY_TOKEN not configured'}), 503
-
     data = request.get_json(silent=True) or {}
-    
-    user_id_raw = str(data.get('user_id', '')).strip()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'invalid JSON body'}), 400
+
     secret      = str(data.get('secret', '')).strip()
+    user_id_raw = _payment_automation_user(secret, 'ios')
     merchant    = str(data.get('merchant', '')).strip()
 
-    # 1. אימות אבטחה מחמיר כנגד מתקפות תזמון
-    if not user_id_raw or not secret or not hmac.compare_digest(VERIFY_TOKEN, secret):
-        logger.warning('Unauthorized Apple Pay webhook attempt for user %s', user_id_raw)
+    if not user_id_raw:
+        logger.warning('Unauthorized Apple Pay webhook attempt')
         return jsonify({'error': 'unauthorized'}), 401
 
     # 2. ניקוי מחרוזת הסכום מכל סימן מטבע/פסיק/אות, זיהוי מטבע (USD/ILS) והמרה לשקלים
@@ -5443,18 +5942,16 @@ def api_android_pay():
     מקבל את כל הטקסט של התראת התשלום (Google Wallet / חברת אשראי), 
     ונותן ל-Gemini לפענח אותו ולרשום הוצאה.
     """
-    if not VERIFY_TOKEN:
-        return jsonify({'error': 'VERIFY_TOKEN not configured'}), 503
-
     data = request.get_json(silent=True) or {}
-    
-    user_id_raw = str(data.get('user_id', '')).strip()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'invalid JSON body'}), 400
+
     secret      = str(data.get('secret', '')).strip()
+    user_id_raw = _payment_automation_user(secret, 'android')
     raw_text    = str(data.get('raw_text', '')).strip()
 
-    # 1. אימות אבטחה מחמיר
-    if not user_id_raw or not secret or not hmac.compare_digest(VERIFY_TOKEN, secret):
-        logger.warning('Unauthorized Android webhook attempt for user %s', user_id_raw)
+    if not user_id_raw:
+        logger.warning('Unauthorized Android payment webhook attempt')
         return jsonify({'error': 'unauthorized'}), 401
 
     if not raw_text:
@@ -5518,8 +6015,8 @@ def api_android_pay():
                 }, aid)
 
                 msg = f"🤖 *אנדרואיד (אוטומ):*\n\n{reply}"
-                if not is_opted_out(uid):
-                    send_whatsapp_message(uid, msg)
+                send_whatsapp_proactive_template(
+                    uid, PAYMENT_TEMPLATE_NAME, PAYMENT_TEMPLATE_LANGUAGE, msg)
 
         except Exception:
             logger.exception('Critical error in Android Pay processing for %s', uid)

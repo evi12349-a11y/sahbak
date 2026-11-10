@@ -19,7 +19,11 @@ class RegressionTests(unittest.TestCase):
         with main._connect() as conn:
             for table in ('budget', 'budget_limits', 'allowed_users', 'known_users',
                           'contexts', 'notification_runs', 'feedback',
-                          'user_consent', 'notification_deliveries'):
+                          'user_consent', 'notification_deliveries',
+                          'whatsapp_customer_service_windows',
+                          'dashboard_credentials', 'dashboard_invites',
+                          'dashboard_login_attempts',
+                          'payment_automation_tokens'):
                 conn.execute(f'DELETE FROM {table}')
             conn.commit()
         main.ALLOWED_USERS = set()
@@ -61,6 +65,244 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {'reply': 'הנה התשובה', 'actions': []})
         process.assert_called_once_with('שלום', user_id, admin_phone='web-dashboard')
+
+    def test_dashboard_invite_activates_password_login_and_scopes_session(self):
+        admin_id = '972501234567'
+        customer_id = '972521234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, 'ADMIN_USERS', {admin_id}):
+            invite = client.post('/api/dashboard/invites', json={
+                'user_id': admin_id,
+                'target_user_id': '+972 52-123-4567',
+            }, headers={'X-Dash-Token': main._dash_token(admin_id)})
+
+            self.assertEqual(invite.status_code, 201)
+            activation_url = invite.get_json()['activation_url']
+            self.assertIn('/dashboard/activate#token=', activation_url)
+            activation_token = activation_url.split('#token=', 1)[1]
+            weak_password = client.post('/api/dashboard/activate', json={
+                'token': activation_token,
+                'password': '1234',
+            })
+            self.assertEqual(weak_password.status_code, 400)
+
+            password = 'correct horse battery staple'
+            activated = client.post('/api/dashboard/activate', json={
+                'token': activation_token,
+                'password': password,
+            })
+            self.assertEqual(activated.status_code, 200)
+            self.assertEqual(activated.get_json()['user_id'], customer_id)
+
+            own_dashboard = client.get(
+                f'/api/dashboard?user_id={customer_id}')
+            another_dashboard = client.get(
+                f'/api/dashboard?user_id={admin_id}')
+            reused_invite = client.post('/api/dashboard/activate', json={
+                'token': activation_token,
+                'password': password,
+            })
+
+        self.assertEqual(own_dashboard.status_code, 200)
+        self.assertFalse(own_dashboard.get_json()['is_admin'])
+        self.assertEqual(another_dashboard.status_code, 401)
+        self.assertEqual(reused_invite.status_code, 400)
+
+        login_client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, 'ADMIN_USERS', {admin_id}):
+            failed_login = login_client.post('/api/dashboard/login', json={
+                'user_id': customer_id,
+                'password': 'not the password',
+            })
+            successful_login = login_client.post('/api/dashboard/login', json={
+                'user_id': customer_id,
+                'password': password,
+            })
+            dashboard = login_client.get(
+                f'/api/dashboard?user_id={customer_id}')
+            logged_out = login_client.post('/api/dashboard/logout', json={})
+            denied_after_logout = login_client.get(
+                f'/api/dashboard?user_id={customer_id}')
+
+        self.assertEqual(failed_login.status_code, 401)
+        self.assertEqual(successful_login.status_code, 200)
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(logged_out.status_code, 200)
+        self.assertEqual(denied_after_logout.status_code, 401)
+
+    def test_dashboard_invites_are_admin_only(self):
+        user_id = '972521234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'), \
+             patch.object(main, 'ADMIN_USERS', {'972501234567'}):
+            response = client.post('/api/dashboard/invites', json={
+                'user_id': user_id,
+                'target_user_id': '972531234567',
+            }, headers={'X-Dash-Token': main._dash_token(user_id)})
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_dashboard_login_rate_limits_failed_passwords(self):
+        user_id = '972521234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'):
+            responses = [client.post('/api/dashboard/login', json={
+                'user_id': user_id,
+                'password': 'incorrect password',
+            }) for _ in range(6)]
+
+        self.assertEqual([response.status_code for response in responses[:5]],
+                         [401] * 5)
+        self.assertEqual(responses[5].status_code, 429)
+
+    def test_payment_automation_tokens_require_login_are_hashed_and_revocable(self):
+        user_id = '972521234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'):
+            self.assertEqual(
+                client.get('/api/dashboard/payment-automation').status_code, 401)
+            self.assertEqual(
+                client.post('/api/dashboard/payment-automation',
+                            json={'platform': 'ios'}).status_code, 401)
+
+            with main._connect() as conn:
+                conn.execute(
+                    'INSERT INTO dashboard_credentials '
+                    '(user_id, password_hash, session_version) VALUES (?, ?, ?)',
+                    (user_id, main.generate_password_hash(
+                        'dashboard-password', method='pbkdf2:sha256:600000'), 1),
+                )
+                conn.commit()
+
+            login = client.post('/api/dashboard/login', json={
+                'user_id': user_id,
+                'password': 'dashboard-password',
+            })
+            self.assertEqual(login.status_code, 200)
+
+            created = client.post('/api/dashboard/payment-automation',
+                                  json={'platform': 'ios'})
+            self.assertEqual(created.status_code, 201)
+            token = created.get_json()['token']
+            status = client.get('/api/dashboard/payment-automation')
+            self.assertTrue(status.get_json()['ios']['connected'])
+            self.assertFalse(status.get_json()['android']['connected'])
+
+            with main._connect() as conn:
+                stored = conn.execute(
+                    'SELECT token_hash, user_id, platform, revoked_at '
+                    'FROM payment_automation_tokens'
+                ).fetchone()
+            self.assertEqual(stored[0], main.hashlib.sha256(
+                token.encode('utf-8')).hexdigest())
+            self.assertNotEqual(stored[0], token)
+            self.assertEqual(stored[1:3], (user_id, 'ios'))
+            self.assertIsNone(stored[3])
+
+            rotated = client.post('/api/dashboard/payment-automation',
+                                  json={'platform': 'ios'})
+            self.assertEqual(rotated.status_code, 201)
+            self.assertNotEqual(rotated.get_json()['token'], token)
+
+            revoked = client.delete('/api/dashboard/payment-automation',
+                                    json={'platform': 'ios'})
+            self.assertEqual(revoked.status_code, 200)
+            self.assertFalse(client.get(
+                '/api/dashboard/payment-automation').get_json()['ios']['connected'])
+
+            invalid_platform = client.post('/api/dashboard/payment-automation',
+                                            json={'platform': 'windows'})
+            self.assertEqual(invalid_platform.status_code, 400)
+
+    def test_payment_webhooks_derive_user_from_platform_token(self):
+        user_id = '972521234567'
+        other_user_id = '972531234567'
+        client = main.app.test_client()
+        with patch.object(main, 'DASHBOARD_API_KEY', 'master-key'):
+            with main._connect() as conn:
+                conn.execute(
+                    'INSERT INTO dashboard_credentials '
+                    '(user_id, password_hash, session_version) VALUES (?, ?, ?)',
+                    (user_id, main.generate_password_hash(
+                        'dashboard-password', method='pbkdf2:sha256:600000'), 1),
+                )
+                conn.commit()
+
+            login = client.post('/api/dashboard/login', json={
+                'user_id': user_id,
+                'password': 'dashboard-password',
+            })
+            self.assertEqual(login.status_code, 200)
+            ios_token = client.post('/api/dashboard/payment-automation',
+                                    json={'platform': 'ios'}).get_json()['token']
+            android_token = client.post('/api/dashboard/payment-automation',
+                                        json={'platform': 'android'}).get_json()['token']
+
+        with patch.object(main, 'VERIFY_TOKEN', 'legacy-shared-secret'), \
+             patch.object(main._executor, 'submit') as submit:
+            apple = client.post('/api/apple-pay', json={
+                'secret': ios_token,
+                'user_id': other_user_id,
+                'amount': '25.50',
+                'merchant': 'Test shop',
+            })
+            self.assertEqual(apple.status_code, 200)
+            self.assertEqual(submit.call_args.args[1], user_id)
+
+            wrong_platform = client.post('/api/android-pay', json={
+                'secret': ios_token,
+                'user_id': other_user_id,
+                'raw_text': 'Test shop charged 25.50 ILS',
+            })
+            self.assertEqual(wrong_platform.status_code, 401)
+
+            android = client.post('/api/android-pay', json={
+                'secret': android_token,
+                'user_id': other_user_id,
+                'raw_text': 'Test shop charged 25.50 ILS',
+            })
+            self.assertEqual(android.status_code, 200)
+            self.assertEqual(submit.call_args.args[1], user_id)
+
+            legacy = client.post('/api/apple-pay', json={
+                'secret': 'legacy-shared-secret',
+                'user_id': user_id,
+                'amount': '25.50',
+                'merchant': 'Test shop',
+            })
+            self.assertEqual(legacy.status_code, 401)
+
+    def test_direct_calendar_event_request_routes_to_schedule_agent(self):
+        tool_call = ('create_calendar_event', {
+            'title': 'מעבר על אוסילטורים',
+            'start_time': '2026-10-24T20:00:00+03:00',
+            'duration_minutes': 60,
+        })
+        with patch.object(main, 'get_genai_client', return_value=object()), \
+             patch.object(main, '_generate_with_fallback',
+                          side_effect=[object(), object()]), \
+             patch.object(main, '_extract_calls_and_text',
+                          side_effect=[
+                              ([('route_to_agent', {'agent_name': 'general'})], ''),
+                              ([tool_call], ''),
+                          ]), \
+             patch.object(main, '_get_agent_prompt', return_value='prompt') as prompt, \
+             patch.object(main, 'get_upcoming_calendar_state', return_value='calendar'), \
+             patch.object(main, 'get_task_status', return_value='tasks'):
+            result = main.get_ai_tool_calls(
+                 'תוסיף ליומן בשבת בשעה 20:00 מעבר על אוסילטורים',
+                 '972501234567')
+
+        self.assertEqual(result, ([tool_call], ''))
+        prompt.assert_called_once_with('schedule')
+
+    def test_schedule_prompt_allows_explicit_events_on_shabbat(self):
+        prompt = main._get_agent_prompt('schedule')
+
+        self.assertIn('אל תסרב ואל תשנה את הזמן בגלל שבת', prompt)
+        self.assertIn('מגבלות שבת ושעות העבודה שלהלן חלות רק על תכנון יזום', prompt)
 
     def test_dashboard_chat_accepts_admin_image_upload(self):
         user_id = '972501234567'
@@ -166,6 +408,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('972521234567', listing)
         self.assertIn('אושר', listing)
         self.assertFalse(main.is_opted_out('972521234567'))
+        self.assertFalse(main.has_active_proactive_consent('972521234567'))
 
         reply = main.process_message('הפסק', '972521234567')
         self.assertIn('הפסקתי', reply)
@@ -174,11 +417,65 @@ class RegressionTests(unittest.TestCase):
 
         main.process_message('חזור', '972521234567')
         self.assertFalse(main.is_opted_out('972521234567'))
+        self.assertTrue(main.has_active_proactive_consent('972521234567'))
+
+    def test_proactive_template_requires_direct_opt_in(self):
+        phone = '972521234567'
+        main.record_consent(phone, approved_by='972501234567')
+
+        with patch.object(main, 'send_whatsapp_template_message', return_value=True) as send:
+            self.assertFalse(main.send_whatsapp_proactive_template(
+                phone, 'approved_utility', 'he', 'תשלום נרשם'))
+            send.assert_not_called()
+
+            main.set_opted_out(phone, False)
+            self.assertFalse(main.send_whatsapp_proactive_template(
+                phone, '', 'he', 'תשלום נרשם'))
+            send.assert_not_called()
+
+            self.assertTrue(main.send_whatsapp_proactive_template(
+                phone, 'approved_utility', 'he', 'תשלום נרשם'))
+            send.assert_called_once_with(
+                phone, 'approved_utility', 'he', 'תשלום נרשם')
+
+    def test_customer_service_window_uses_recent_inbound_timestamp(self):
+        phone = '972521234567'
+        now = int(main.time.time())
+        self.assertTrue(main.record_whatsapp_inbound(phone, str(now - 60)))
+        self.assertTrue(main.has_open_customer_service_window(phone, now))
+        self.assertFalse(main.has_open_customer_service_window(
+            phone, now + main.CUSTOMER_SERVICE_WINDOW_SECONDS))
+
+    def test_free_form_send_is_blocked_outside_customer_service_window(self):
+        with patch.object(main, 'has_open_customer_service_window', return_value=False), \
+             patch.object(main.http_requests, 'post') as post:
+            self.assertFalse(main._post_whatsapp({
+                'messaging_product': 'whatsapp',
+                'to': '972521234567',
+                'type': 'text',
+                'text': {'body': 'test'},
+            }))
+        post.assert_not_called()
+
+    def test_template_send_does_not_require_customer_service_window(self):
+        class Response:
+            status_code = 200
+            text = ''
+
+        with patch.object(main, 'has_open_customer_service_window', return_value=False), \
+             patch.object(main.http_requests, 'post', return_value=Response()) as post:
+            self.assertTrue(main._post_whatsapp({
+                'messaging_product': 'whatsapp',
+                'to': '972521234567',
+                'type': 'template',
+                'template': {'name': 'approved_utility'},
+            }))
+        post.assert_called_once()
 
     def test_shabbat_partial_failure_does_not_resend_to_successes(self):
         main.ALLOWED_USERS = {'972521111111', '972522222222'}
-        main.record_consent('972521111111')
-        main.record_consent('972522222222')
+        main.set_opted_out('972521111111', False)
+        main.set_opted_out('972522222222', False)
         sent = []
 
         def fake_send(user, *_args):
@@ -195,8 +492,8 @@ class RegressionTests(unittest.TestCase):
 
     def test_shabbat_skips_opted_out_users(self):
         main.ALLOWED_USERS = {'972521111111', '972522222222'}
-        main.record_consent('972521111111')
-        main.record_consent('972522222222')
+        main.set_opted_out('972521111111', False)
+        main.set_opted_out('972522222222', False)
         main.set_opted_out('972522222222', True)
         sent = []
         with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
@@ -208,7 +505,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_shabbat_requires_an_approved_template(self):
         main.ALLOWED_USERS = {'972521111111'}
-        main.record_consent('972521111111')
+        main.set_opted_out('972521111111', False)
         with patch.object(main, '_claim_notification_run') as claim, \
              patch.object(main, 'send_whatsapp_message') as text_send, \
              patch.object(main, 'send_whatsapp_template_message') as template_send, \
@@ -223,8 +520,8 @@ class RegressionTests(unittest.TestCase):
         main.ALLOWED_USERS = {
             '972521111111', '972522222222', '972523333333'
         }
-        main.record_consent('972521111111')
-        main.record_consent('972522222222')
+        main.set_opted_out('972521111111', False)
+        main.set_opted_out('972522222222', False)
         main.set_opted_out('972522222222', True)
         sent = []
         with patch.object(main, '_shabbat_notification_for_date', return_value='שבת שלום'), \
@@ -247,21 +544,41 @@ class RegressionTests(unittest.TestCase):
         main._try_admin_command('הסר משתמש 0521234567', '972501234567')
         self.assertFalse(main.is_user_allowed('972521234567'))
 
+    def test_missing_allowlist_denies_inbound_users(self):
+        main.ALLOWED_USERS = set()
+        self.assertFalse(main.is_user_allowed('972501234567'))
+
     def test_db_approved_user_passes_webhook_allowlist_gate(self):
         main.ALLOWED_USERS = {'972501234567'}
         main.add_allowed_user('972585231231')
         queued = []
         payload = {
             'entry': [{'changes': [{'value': {'messages': [
-                {'from': '972585231231', 'id': 'approved-message-1', 'type': 'text'}
+                {'from': '972585231231', 'id': 'approved-message-1', 'type': 'text',
+                 'timestamp': str(int(main.time.time()))}
             ]}}]}]
         }
-        with patch.object(main, '_enqueue_account_message',
+        with patch.object(main, 'APP_SECRET', 'test-app-secret'), \
+             patch.object(main, 'verify_meta_signature', return_value=True), \
+             patch.object(main, '_enqueue_account_message',
                           side_effect=lambda message, phone: queued.append(phone)):
             response = main.app.test_client().post('/webhook', json=payload)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(queued, ['972585231231'])
+        self.assertTrue(main.has_open_customer_service_window(
+            '972585231231', int(main.time.time())))
+
+    def test_webhook_rejects_requests_without_app_secret(self):
+        with patch.object(main, 'APP_SECRET', ''):
+            response = main.app.test_client().post('/webhook', json={})
+        self.assertEqual(response.status_code, 503)
+
+    def test_webhook_verification_fails_closed_without_verify_token(self):
+        with patch.object(main, 'VERIFY_TOKEN', ''):
+            response = main.app.test_client().get(
+                '/webhook?hub.mode=subscribe&hub.verify_token=&hub.challenge=123')
+        self.assertEqual(response.status_code, 503)
 
     def test_account_update_webhook_logs_meta_violation_details(self):
         payload = {
@@ -281,7 +598,9 @@ class RegressionTests(unittest.TestCase):
             }],
         }
 
-        with self.assertLogs(main.logger, level='WARNING') as logs:
+        with self.assertLogs(main.logger, level='WARNING') as logs, \
+             patch.object(main, 'APP_SECRET', 'test-app-secret'), \
+             patch.object(main, 'verify_meta_signature', return_value=True):
             response = main.app.test_client().post('/webhook', json=payload)
 
         self.assertEqual(response.status_code, 200)
@@ -327,8 +646,8 @@ class RegressionTests(unittest.TestCase):
     def test_shabbat_notification_includes_allowed_people_not_in_known_users(self):
         main.ALLOWED_USERS = {'972501234567'}
         main.add_allowed_user('972585231231')
-        main.record_consent('972501234567')
-        main.record_consent('972585231231')
+        main.set_opted_out('972501234567', False)
+        main.set_opted_out('972585231231', False)
         with main._connect() as conn:
             conn.execute(
                 'INSERT INTO known_users (user_id, first_seen) VALUES (?, ?)',
@@ -470,17 +789,19 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(cta_payload['interactive']['type'], 'cta_url')
         self.assertEqual(cta_payload['interactive']['action']['name'], 'cta_url')
 
-    def test_calendar_link_returns_forwardable_fallback_when_direct_send_fails(self):
+    def test_calendar_link_does_not_send_unsolicited_message_to_target(self):
         with patch.object(main, '_service_account_email',
                           return_value='bot@example.iam.gserviceaccount.com'), \
-             patch.object(main, 'send_whatsapp_cta_url', return_value=False), \
-             patch.object(main, 'send_whatsapp_message', return_value=False):
+             patch.object(main, 'send_whatsapp_cta_url') as cta_send, \
+             patch.object(main, 'send_whatsapp_message') as message_send:
             reply = main._try_admin_command(
                 'חבר יומן 972500000000 friend@gmail.com', '972501234567')
 
-        self.assertIn('לא הצלחתי לשלוח', reply)
+        self.assertIn('לא שלחתי הודעה יזומה למספר אחר', reply)
         self.assertIn('calendar.google.com', reply)
         self.assertIn('bot@example.iam.gserviceaccount.com', reply)
+        cta_send.assert_not_called()
+        message_send.assert_not_called()
 
 
 if __name__ == '__main__':
